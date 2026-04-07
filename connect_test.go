@@ -1,4 +1,4 @@
-package sdk_test
+package siastorage_test
 
 import (
 	"bytes"
@@ -8,9 +8,9 @@ import (
 
 	"go.sia.tech/indexd/accounts"
 	"go.sia.tech/indexd/api/app"
-	"go.sia.tech/indexd/sdk"
 	"go.sia.tech/indexd/slabs"
 	"go.sia.tech/indexd/testutils"
+	"go.sia.tech/siastorage"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -54,8 +54,8 @@ func TestConnect(t *testing.T) {
 		t.Fatal("failed to add app connect key:", err)
 	}
 
-	appID := sdk.GenerateAppID()
-	builder := sdk.NewBuilder(cluster.Indexer.AppURL, sdk.AppMetadata{
+	appID := siastorage.GenerateAppID()
+	builder := siastorage.NewBuilder(cluster.Indexer.AppURL, siastorage.AppMetadata{
 		ID:          appID,
 		Name:        "Test App",
 		Description: "An app for testing",
@@ -94,7 +94,7 @@ func TestConnect(t *testing.T) {
 		t.Fatal("expected connection to be approved")
 	}
 
-	mnemonic := sdk.NewSeedPhrase()
+	mnemonic := siastorage.NewSeedPhrase()
 	client, err := builder.Register(t.Context(), mnemonic)
 	if err != nil {
 		t.Fatal("failed to generate app key after approval:", err)
@@ -112,7 +112,7 @@ func TestConnect(t *testing.T) {
 
 	// go through the connection flow again to verify multiple connections generate
 	// the same app key
-	builder = sdk.NewBuilder(cluster.Indexer.AppURL, sdk.AppMetadata{
+	builder = siastorage.NewBuilder(cluster.Indexer.AppURL, siastorage.AppMetadata{
 		ID:          appID,
 		Name:        "Test App",
 		Description: "An app for testing",

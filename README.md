@@ -2,7 +2,7 @@
 
 The official Go SDK for storing and retrieving data on the Sia network.
 
-For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/sia-storage).
+For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/siastorage).
 
 ## Connecting to the Indexer
 
@@ -11,7 +11,7 @@ indexer. First, create a `Builder` with your application metadata, then walk
 the user through the approval flow:
 
 ```go
-builder := sdk.NewBuilder("https://sia.storage", sdk.AppMetadata{
+builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
 	ID:          appID,                          // a persistent, randomly-generated 32-byte app ID
 	Name:        "MyApp",                        // display name
 	Description: "My first Sia application",     // short description
@@ -35,7 +35,7 @@ if err != nil {
 }
 
 // derive an app key from a BIP-39 seed phrase and register it
-mnemonic := sdk.NewSeedPhrase() // generate once — store securely
+mnemonic := siastorage.NewSeedPhrase() // generate once — store securely
 client, err := builder.Register(ctx, mnemonic)
 if err != nil {
 	log.Fatal("failed to register:", err)
@@ -47,7 +47,7 @@ On subsequent launches, skip the approval flow and create the SDK directly
 with the previously derived app key:
 
 ```go
-builder := sdk.NewBuilder("https://sia.storage", sdk.AppMetadata{ID: appID})
+builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{ID: appID})
 client, err := builder.SDK(appKey)
 if err != nil {
 	log.Fatal("failed to create SDK:", err)
@@ -61,7 +61,7 @@ Once connected, you can upload and download files using the SDK:
 
 ```go
 // upload
-obj := sdk.NewEmptyObject()
+obj := siastorage.NewEmptyObject()
 f, _ := os.Open("path/to/src.dat")
 defer f.Close()
 
