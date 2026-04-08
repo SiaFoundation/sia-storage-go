@@ -85,7 +85,6 @@ var (
 	// ErrNoMoreHosts is returned when there are no more hosts
 	// available to attempt to upload a shard
 	ErrNoMoreHosts = errors.New("no more hosts available")
-
 )
 
 type sectorDownload struct {
