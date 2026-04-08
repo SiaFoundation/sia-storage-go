@@ -92,7 +92,39 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout time.Duration) ([][]byte, error) {
+// slowHostTracker records hosts observed to be slow so subsequent
+// downloads from the same slab can deprioritize them.
+type slowHostTracker struct {
+	mu    sync.Mutex
+	hosts map[types.PublicKey]struct{}
+}
+
+func newSlowHostTracker() *slowHostTracker {
+	return &slowHostTracker{hosts: make(map[types.PublicKey]struct{})}
+}
+
+func (t *slowHostTracker) markSlow(key types.PublicKey) {
+	t.mu.Lock()
+	t.hosts[key] = struct{}{}
+	t.mu.Unlock()
+}
+
+// deprioritize reorders hosts so that known-slow hosts are at the end,
+// preserving relative order among non-slow hosts.
+func (t *slowHostTracker) deprioritize(hosts []types.PublicKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.hosts) == 0 {
+		return
+	}
+	sort.SliceStable(hosts, func(i, j int) bool {
+		_, iSlow := t.hosts[hosts[i]]
+		_, jSlow := t.hosts[hosts[j]]
+		return !iSlow && jSlow
+	})
+}
+
+func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout time.Duration, slow *slowHostTracker) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -123,19 +155,23 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 	// the data referenced by the slab slice
 	offset, length := sectorRegion(slab)
 
-	// prioritize hosts
+	// prioritize hosts, deprioritizing known-slow hosts
 	slabHosts = s.hosts.Prioritize(slabHosts)
+	slow.deprioritize(slabHosts)
 
 	// helper to launch download
 	type result struct {
-		index int
-		buf   []byte
-		err   error
+		index   int
+		hostKey types.PublicKey
+		buf     []byte
+		err     error
 	}
 	responseCh := make(chan result, len(slab.Sectors))
+	outstandingHosts := make(map[types.PublicKey]struct{})
 	var outstanding int
 	tryDownloadSector := func(d sectorDownload) {
 		outstanding++
+		outstandingHosts[d.sector.HostKey] = struct{}{}
 		wg.Go(func() {
 			dlCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -144,7 +180,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 			select {
 			case <-ctx.Done():
 				return
-			case responseCh <- result{index: d.index, buf: buf.Bytes(), err: err}:
+			case responseCh <- result{index: d.index, hostKey: d.sector.HostKey, buf: buf.Bytes(), err: err}:
 			}
 		})
 	}
@@ -165,6 +201,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 		select {
 		case res := <-responseCh:
 			outstanding--
+			delete(outstandingHosts, res.hostKey)
 			if res.err == nil {
 				// successful download
 				shards[res.index] = res.buf
@@ -184,7 +221,11 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 				slabHosts = slabHosts[1:]
 			}
 		case <-timer.C:
-			// periodically launch an extra download to race slow hosts
+			// mark outstanding hosts as slow for future chunks
+			for hk := range outstandingHosts {
+				slow.markSlow(hk)
+			}
+			// launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
 				tryDownloadSector(slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
@@ -462,8 +503,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, hostTimeout time.Duration) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, hostTimeout)
+func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, hostTimeout time.Duration, slow *slowHostTracker) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, chunk, hostTimeout, slow)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -506,13 +547,14 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 
 	chunks := newChunkIter(ss, offset, length)
 	bw := bufio.NewWriterSize(w, 1<<16)
+	slow := newSlowHostTracker()
 
 	// recover first chunk synchronously for fast TTFB
 	chunk, ok := chunks.next()
 	if !ok {
 		return bw.Flush()
 	}
-	rc, err := s.recoverChunk(ctx, chunk, hostTimeout)
+	rc, err := s.recoverChunk(ctx, chunk, hostTimeout, slow)
 	if err != nil {
 		return err
 	}
@@ -538,7 +580,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	for range maxInflight {
 		wg.Go(func() {
 			for w := range workCh {
-				rc, err := s.recoverChunk(ctx, w.chunk, hostTimeout)
+				rc, err := s.recoverChunk(ctx, w.chunk, hostTimeout, slow)
 				select {
 				case resultCh <- chunkResult{index: w.index, recoveredChunk: rc, err: err}:
 				case <-ctx.Done():
