@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -103,23 +105,25 @@ func newSlowHostTracker() *slowHostTracker {
 	return &slowHostTracker{hosts: make(map[types.PublicKey]struct{})}
 }
 
-func (t *slowHostTracker) markSlow(key types.PublicKey) {
+func (t *slowHostTracker) markSlow(pks []types.PublicKey) {
 	t.mu.Lock()
-	t.hosts[key] = struct{}{}
+	for _, pk := range pks {
+		t.hosts[pk] = struct{}{}
+	}
 	t.mu.Unlock()
 }
 
 // deprioritize reorders hosts so that known-slow hosts are at the end,
 // preserving relative order among non-slow hosts.
-func (t *slowHostTracker) deprioritize(hosts []types.PublicKey) {
+func (t *slowHostTracker) deprioritize(pks []types.PublicKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.hosts) == 0 {
 		return
 	}
-	sort.SliceStable(hosts, func(i, j int) bool {
-		_, iSlow := t.hosts[hosts[i]]
-		_, jSlow := t.hosts[hosts[j]]
+	sort.SliceStable(pks, func(i, j int) bool {
+		_, iSlow := t.hosts[pks[i]]
+		_, jSlow := t.hosts[pks[j]]
 		return !iSlow && jSlow
 	})
 }
@@ -222,9 +226,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 			}
 		case <-timer.C:
 			// mark outstanding hosts as slow for future chunks
-			for hk := range outstandingHosts {
-				slow.markSlow(hk)
-			}
+			slow.markSlow(slices.Collect(maps.Keys(outstandingHosts)))
 			// launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
 				tryDownloadSector(slabSectors[slabHosts[0]])
