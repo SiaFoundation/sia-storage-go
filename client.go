@@ -310,7 +310,7 @@ top:
 	return nil
 }
 
-// Download downloads object metadata
+// Download downloads object data.
 func (s *SDK) Download(ctx context.Context, w io.Writer, obj Object, opts ...DownloadOption) error {
 	do := defaultDownloadOption(obj.Size())
 	for _, opt := range opts {
