@@ -720,7 +720,10 @@ func WithDownloadInflight(maxInflight int) DownloadOption {
 	}
 }
 
-// WithDownloadRange sets the byte range to download from the object.
+// WithDownloadRange sets the byte range to download from the object. The range
+// is clamped to the object size: if offset+length exceeds the object size, only
+// the available bytes are returned. If offset is at or beyond the end, or
+// length is zero, no data is written and Download returns nil.
 func WithDownloadRange(offset, length uint64) DownloadOption {
 	return func(do *downloadOption) {
 		do.offset = offset
