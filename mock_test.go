@@ -110,7 +110,7 @@ func (m *mockHostDialer) sectorDelay(ctx context.Context, root types.Hash256) er
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return ctx.Err()
+	return context.Cause(ctx)
 }
 
 // WriteSector implements the [hostClient] interface.
