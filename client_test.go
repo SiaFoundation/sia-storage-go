@@ -82,7 +82,7 @@ func TestUpload(t *testing.T) {
 		dialer.ResetSlowHosts()
 		// make most of the hosts slow, but not enough to fail.
 		// progressive timeout starts at 15s so 1s delay succeeds.
-		dialer.SetSlowHosts(20, time.Second)
+		dialer.SetSlowHosts(t, 20, time.Second)
 		obj := NewEmptyObject()
 		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err != nil {
@@ -94,7 +94,7 @@ func TestUpload(t *testing.T) {
 
 	t.Run("all slow", func(t *testing.T) {
 		dialer := newMockDialer(50)
-		dialer.SetSlowHosts(50, 2*time.Second)
+		dialer.SetSlowHosts(t, 50, 2*time.Second)
 		s := newTestSDK(t, appKey, newMockAppClient(), dialer)
 		defer s.Close()
 
@@ -274,7 +274,7 @@ func TestDownload(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		dialer.ResetSlowHosts()
 		// make enough hosts timeout to fail to download
-		dialer.SetSlowHosts(21, time.Second)
+		dialer.SetSlowHosts(t, 21, time.Second)
 		buf := bytes.NewBuffer(nil)
 		err = s.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
 		if !errors.Is(err, ErrNotEnoughShards) {
@@ -285,7 +285,7 @@ func TestDownload(t *testing.T) {
 	t.Run("slow", func(t *testing.T) {
 		dialer.ResetSlowHosts()
 		// make most of the hosts timeout
-		dialer.SetSlowHosts(20, time.Second)
+		dialer.SetSlowHosts(t, 20, time.Second)
 		buf := bytes.NewBuffer(nil)
 		err = s.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
 		if err != nil {
@@ -404,8 +404,8 @@ func BenchmarkUpload(b *testing.B) {
 		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
 			dialer := newMockDialer(30 + timeout) // increase the chance that a timeout will affect us without failing the test
 			dialer.ResetSlowHosts()
-			dialer.SetSlowHosts(slow, time.Second)       // slow, but not too slow
-			dialer.SetSlowHosts(timeout, 30*time.Second) // longer than the default timeout
+			dialer.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
+			dialer.SetSlowHosts(b, timeout, 30*time.Second) // longer than the default timeout
 
 			s := newTestSDK(b, appKey, newMockAppClient(), dialer)
 			defer s.Close()
@@ -455,7 +455,8 @@ func BenchmarkDownload(b *testing.B) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d inflight %d", slow, inflight), func(b *testing.B) {
 			// needs to be longer than the default timeout
-			dialer.SetSlowHosts(slow, 30*time.Second)
+			dialer.ResetSlowHosts()
+			dialer.SetSlowHosts(b, slow, 30*time.Second)
 
 			buf := bytes.NewBuffer(nil)
 			b.SetBytes(benchmarkSize)
