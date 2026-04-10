@@ -212,7 +212,9 @@ func (m *mockHostDialer) SetSlowHosts(tb testing.TB, n int, d time.Duration) {
 		set++
 		m.slowHosts[hostKey] = d
 	}
-	tb.Fatalf("not enough hosts to set as slow: only %d hosts available", len(m.hosts))
+	if set < n {
+		tb.Fatalf("not enough hosts to set as slow: only %d hosts available", len(m.hosts))
+	}
 }
 
 func (m *mockHostDialer) SetSectorReadDelay(root types.Hash256, d time.Duration) {
