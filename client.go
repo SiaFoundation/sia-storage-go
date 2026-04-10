@@ -113,9 +113,11 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 	}
 
 	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(ctx)
+	initialCtx, initialCancel := context.WithCancel(ctx)
+	overdriveCtx, overdriveCancel := context.WithCancelCause(ctx)
 	defer func() {
-		cancel()
+		initialCancel()
+		overdriveCancel(client.ErrAbortedRPC)
 		wg.Wait()
 	}()
 
@@ -134,7 +136,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 	}
 	responseCh := make(chan result, len(slab.Sectors))
 	var outstanding int
-	tryDownloadSector := func(d sectorDownload) {
+	tryDownloadSector := func(ctx context.Context, d sectorDownload) {
 		outstanding++
 		wg.Go(func() {
 			dlCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -151,7 +153,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 
 	// launch minShards downloads right away
 	for range slab.MinShards {
-		tryDownloadSector(slabSectors[slabHosts[0]])
+		tryDownloadSector(initialCtx, slabSectors[slabHosts[0]])
 		slabHosts = slabHosts[1:]
 	}
 
@@ -180,13 +182,13 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 				return nil, ErrNotEnoughShards
 			}
 			if res.err != nil && len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]])
+				tryDownloadSector(overdriveCtx, slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
 		case <-timer.C:
 			// periodically launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]])
+				tryDownloadSector(overdriveCtx, slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
 		case <-ctx.Done():
