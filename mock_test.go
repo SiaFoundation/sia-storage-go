@@ -193,6 +193,11 @@ func (m *mockHostDialer) SetFlakyHosts(t *testing.T, n, failCount int) {
 	}
 }
 
+// WarmConnections implements the hostClient interface.
+func (m *mockHostDialer) WarmConnections(_ context.Context) error {
+	return nil
+}
+
 func newMockDialer(hosts int) *mockHostDialer {
 	m := &mockHostDialer{
 		hosts:        make(map[types.PublicKey]struct{}),

@@ -30,6 +30,7 @@ type (
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
 
+		WarmConnections(ctx context.Context) error
 		UploadQueue() (*client.HostQueue, error)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
 		Close() error
@@ -752,6 +753,12 @@ func initSDK(appKey types.PrivateKey, app appClient, provider *client.Provider, 
 	for _, opt := range opts {
 		opt(sdk)
 	}
+
 	sdk.hosts = client.New(provider, sdk.log.Named("client"))
+	err := sdk.hosts.WarmConnections(context.Background())
+	if err != nil {
+		sdk.log.Warn("failed to warm connections", zap.Error(err))
+	}
+
 	return sdk
 }
