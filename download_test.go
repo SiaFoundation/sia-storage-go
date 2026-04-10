@@ -6,21 +6,19 @@ import (
 	"time"
 
 	proto "go.sia.tech/core/rhp/v4"
-	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
+	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
 
 func TestOutOfOrderDownload(t *testing.T) {
-	dialer := newMockDialer(30)
-	appKey := types.GeneratePrivateKey()
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	slabSize := uint64(proto.SectorSize) * 10
 	data := frand.Bytes(int(slabSize))
 	obj := NewEmptyObject()
-	if err := s.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -28,12 +26,12 @@ func TestOutOfOrderDownload(t *testing.T) {
 	// first, which exercises ordered output.
 	for _, slab := range obj.Slabs() {
 		for _, sector := range slab.Sectors {
-			dialer.SetSectorReadDelay(sector.Root, 500*time.Millisecond)
+			hosts.SetSectorReadDelay(sector.Root, 500*time.Millisecond)
 		}
 	}
 
 	buf := bytes.NewBuffer(nil)
-	if err := s.Download(t.Context(), buf, obj, WithDownloadInflight(40)); err != nil {
+	if err := sdk.Download(t.Context(), buf, obj, WithDownloadInflight(40)); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(buf.Bytes(), data) {
 		t.Fatal("data mismatch")
@@ -130,15 +128,13 @@ func TestChunkIter(t *testing.T) {
 }
 
 func TestSlabRecovery(t *testing.T) {
-	dialer := newMockDialer(30)
-	appKey := types.GeneratePrivateKey()
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, _ := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	slabSize := int(proto.SectorSize) * 10
 	data := frand.Bytes(slabSize)
 	obj := NewEmptyObject()
-	if err := s.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -161,7 +157,7 @@ func TestSlabRecovery(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := bytes.NewBuffer(nil)
-			if err := s.Download(t.Context(), buf, obj, WithDownloadRange(tt.offset, tt.length)); err != nil {
+			if err := sdk.Download(t.Context(), buf, obj, WithDownloadRange(tt.offset, tt.length)); err != nil {
 				t.Fatalf("download failed: %v", err)
 			}
 			expected := data[tt.offset : tt.offset+tt.length]

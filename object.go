@@ -121,7 +121,7 @@ func NewEmptyObject() Object {
 
 // Object retrieves the object with the given key.
 func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, error) {
-	lo, err := s.client.Object(ctx, s.appKey, objectKey)
+	lo, err := s.app.Object(ctx, s.appKey, objectKey)
 	if err != nil {
 		return Object{}, fmt.Errorf("failed to get locked object: %w", err)
 	}
@@ -131,7 +131,7 @@ func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, erro
 
 // ListObjects lists objects, starting from the given cursor, up to the given limit.
 func (s *SDK) ListObjects(ctx context.Context, cursor slabs.Cursor, limit int) ([]Object, error) {
-	los, err := s.client.ListObjects(ctx, s.appKey, cursor, limit)
+	los, err := s.app.ListObjects(ctx, s.appKey, cursor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list locked objects: %w", err)
 	}
@@ -162,7 +162,7 @@ func (s *SDK) CreateSharedObjectURL(ctx context.Context, objectKey types.Hash256
 	if err != nil {
 		return "", fmt.Errorf("failed to get object: %w", err)
 	}
-	return s.client.CreateSharedObjectURL(ctx, s.appKey, obj.ID(), obj.dataKey, validUntil)
+	return s.app.CreateSharedObjectURL(ctx, s.appKey, obj.ID(), obj.dataKey, validUntil)
 }
 
 // dataKeyCipher derives the data key cipher from the app key and object ID.

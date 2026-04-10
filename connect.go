@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"go.sia.tech/core/types"
+	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/coreutils/wallet"
 	"go.sia.tech/indexd/api/app"
-	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/keys"
 	"go.uber.org/zap"
 	"lukechampine.com/frand"
@@ -53,8 +53,9 @@ type Builder struct {
 
 	// mock overrides — when set, SDK() bypasses auth and host
 	// discovery and uses these directly.
-	mockApp  appClient
-	mockHost hostClient
+	mockApp       appClient
+	mockHost      hostClient
+	mockHostCache *hostCache
 }
 
 // consume marks the builder as consumed, preventing further use. It panics if the builder has already been consumed.
@@ -159,10 +160,12 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 	if b.mockApp != nil {
 		b.consume()
 		sdk := &SDK{
-			appKey: appKey,
-			log:    zap.NewNop(),
-			client: b.mockApp,
-			hosts:  b.mockHost,
+			appKey:     appKey,
+			app:        b.mockApp,
+			hosts:      b.mockHost,
+			hostsCache: b.mockHostCache,
+			tg:         threadgroup.New(),
+			log:        zap.NewNop(),
 		}
 		for _, opt := range opts {
 			opt(sdk)
@@ -175,12 +178,13 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 	} else if !ok {
 		return nil, fmt.Errorf("app key is not authorized")
 	}
-	hostStore, err := newCachedHostStore(b.client, appKey)
+	sdk, err := initSDK(appKey, b.client, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create host store: %w", err)
+		return nil, fmt.Errorf("failed to initialize SDK: %w", err)
 	}
+
 	b.consume()
-	return initSDK(appKey, b.client, client.NewProvider(hostStore), opts...), nil
+	return sdk, nil
 }
 
 func deriveAppKey(mnemonic string, appID types.Hash256, sharedSecret types.Hash256) (types.PrivateKey, error) {
