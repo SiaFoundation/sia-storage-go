@@ -150,7 +150,7 @@ func (u *PackedUpload) Finalize(ctx context.Context) ([]Object, error) {
 	}
 
 	// build objects
-	slabSize := u.slabSize()
+	slabSize := u.SlabSize()
 	objects := make([]Object, len(u.objects))
 	for i, o := range u.objects {
 		// sanity check slab range to avoid panics
@@ -194,12 +194,17 @@ func (u *PackedUpload) Length() int64 {
 // packed size. Adding objects larger than this will span multiple slabs. To
 // minimize padding, prioritize objects that fit within the remaining size.
 func (u *PackedUpload) Remaining() int64 {
-	slabSize := u.slabSize()
+	slabSize := u.SlabSize()
 	length := u.Length()
 	if length == 0 {
 		return slabSize
 	}
 	return (slabSize - (length % slabSize)) % slabSize
+}
+
+// SlabSize returns the size of a slab based on the number of data shards.
+func (u *PackedUpload) SlabSize() int64 {
+	return int64(u.dataShards) * proto4.SectorSize
 }
 
 // finish sets the result of the upload exactly once
@@ -216,11 +221,6 @@ func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
 	start = o.offset / slabSize
 	end = (o.offset + o.length + slabSize - 1) / slabSize
 	return
-}
-
-// slabSize returns the size of a slab based on the number of data shards.
-func (u *PackedUpload) slabSize() int64 {
-	return int64(u.dataShards) * proto4.SectorSize
 }
 
 // UploadPacked creates a new packed upload. This allows multiple objects to be

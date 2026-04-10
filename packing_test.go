@@ -27,8 +27,8 @@ func TestUploadPacked(t *testing.T) {
 
 	// assert remaining length
 	remaining := u.Remaining()
-	if remaining != u.slabSize() {
-		t.Fatalf("expected remaining %d, got %d", u.slabSize(), remaining)
+	if remaining != u.SlabSize() {
+		t.Fatalf("expected remaining %d, got %d", u.SlabSize(), remaining)
 	}
 
 	// prepare 3 objects
@@ -52,8 +52,8 @@ func TestUploadPacked(t *testing.T) {
 	// assert total and remaining length
 	if u.Length() != int64(total) {
 		t.Fatalf("expected total length %d, got %d", total, u.Length())
-	} else if rem := u.Remaining(); rem != u.slabSize()-int64(total) {
-		t.Fatalf("expected remaining %d, got %d", u.slabSize()-int64(total), rem)
+	} else if rem := u.Remaining(); rem != u.SlabSize()-int64(total) {
+		t.Fatalf("expected remaining %d, got %d", u.SlabSize()-int64(total), rem)
 	}
 
 	// finalize the upload
@@ -103,7 +103,7 @@ func TestUploadPacked(t *testing.T) {
 	defer u.Close()
 
 	// add objects that span multiple slabs
-	dataL := frand.Bytes(int(u.slabSize()) + 1024)
+	dataL := frand.Bytes(int(u.SlabSize()) + 1024)
 	dataS := frand.Bytes(512)
 	if _, err := u.Add(context.Background(), bytes.NewReader(dataL)); err != nil {
 		t.Fatalf("failed to add large object: %v", err)
@@ -130,7 +130,7 @@ func TestUploadPacked(t *testing.T) {
 	// assert second object has one slab with offset
 	if slabs := objects[1].Slabs(); len(slabs) != 1 {
 		t.Fatalf("expected 1 slab, got %d", len(objects[1].Slabs()))
-	} else if expectedOffset := uint32(len(dataL) % int(u.slabSize())); slabs[0].Offset != expectedOffset {
+	} else if expectedOffset := uint32(len(dataL) % int(u.SlabSize())); slabs[0].Offset != expectedOffset {
 		t.Fatalf("expected offset %d, got %d", expectedOffset, slabs[0].Offset)
 	}
 
