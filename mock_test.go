@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"maps"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,20 +13,32 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
-	"go.sia.tech/coreutils/chain"
 	"go.sia.tech/coreutils/rhp/v4"
-	"go.sia.tech/coreutils/rhp/v4/siamux"
 	"go.sia.tech/indexd/api"
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
-	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap"
 )
 
-type mockHostDialer struct {
+func newMockHostStore(n int) *hostCache {
+	var update []hosts.HostInfo
+	for range n {
+		hk := types.GeneratePrivateKey().PublicKey()
+		update = append(update, hosts.HostInfo{
+			PublicKey:     hk,
+			GoodForUpload: true,
+		})
+	}
+	store := newHostCache()
+	store.updateHosts(update)
+	return store
+}
+
+type mockHostClient struct {
 	provider *client.Provider
-	hosts    map[types.PublicKey]struct{}
+	hosts    *hostCache
 
 	delayMu   sync.Mutex
 	slowHosts map[types.PublicKey]time.Duration
@@ -40,47 +51,27 @@ type mockHostDialer struct {
 
 	sectorsMu   sync.Mutex
 	hostSectors map[types.PublicKey]map[types.Hash256][]byte
-}
 
-func (m *mockHostDialer) UsableHosts() ([]hosts.HostInfo, error) {
-	var hostInfos []hosts.HostInfo
-	for hostKey := range m.hosts {
-		hostInfos = append(hostInfos, hosts.HostInfo{
-			PublicKey:     hostKey,
-			GoodForUpload: true,
-		})
-	}
-	return hostInfos, nil
-}
-
-func (m *mockHostDialer) Addresses(types.PublicKey) ([]chain.NetAddress, error) {
-	return []chain.NetAddress{{
-		Protocol: siamux.Protocol,
-		Address:  "example.com:1234",
-	}}, nil
-}
-
-func (m *mockHostDialer) Usable(hostKey types.PublicKey) (bool, error) {
-	_, usable := m.hosts[hostKey]
-	return usable, nil
+	pricesMu    sync.Mutex
+	pricesCalls map[types.PublicKey]int
 }
 
 // Close implements the [hostClient] interface.
-func (m *mockHostDialer) Close() error {
+func (m *mockHostClient) Close() error {
 	return nil
 }
 
 // UploadQueue implements the [hostClient] interface.
-func (m *mockHostDialer) UploadQueue() (*client.HostQueue, error) {
-	return client.NewHostQueue(slices.Collect(maps.Keys(m.hosts))), nil
+func (m *mockHostClient) UploadQueue() (*client.HostQueue, error) {
+	return m.provider.UploadQueue()
 }
 
 // Prioritize implements the [hostClient] interface.
-func (m *mockHostDialer) Prioritize(hosts []types.PublicKey) []types.PublicKey {
+func (m *mockHostClient) Prioritize(hosts []types.PublicKey) []types.PublicKey {
 	return m.provider.Prioritize(hosts)
 }
 
-func (m *mockHostDialer) delay(ctx context.Context, hostKey types.PublicKey) error {
+func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]
 	m.delayMu.Unlock()
@@ -95,7 +86,7 @@ func (m *mockHostDialer) delay(ctx context.Context, hostKey types.PublicKey) err
 	return context.Cause(ctx)
 }
 
-func (m *mockHostDialer) sectorDelay(ctx context.Context, root types.Hash256) error {
+func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) error {
 	m.sectorDelayMu.Lock()
 	delay, ok := m.sectorDelays[root]
 	if ok {
@@ -114,8 +105,8 @@ func (m *mockHostDialer) sectorDelay(ctx context.Context, root types.Hash256) er
 }
 
 // WriteSector implements the [hostClient] interface.
-func (m *mockHostDialer) WriteSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, data []byte) (_ rhp.RPCWriteSectorResult, err error) {
-	if _, ok := m.hosts[hostKey]; !ok {
+func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, data []byte) (_ rhp.RPCWriteSectorResult, err error) {
+	if ok, _ := m.hosts.Usable(hostKey); !ok {
 		panic("host not found: " + hostKey.String()) // developer error
 	}
 
@@ -157,7 +148,7 @@ func (m *mockHostDialer) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 }
 
 // ReadSector implements the [hostClient] interface.
-func (m *mockHostDialer) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
+func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
 	start := time.Now()
 	defer func() {
 		if err != nil {
@@ -191,33 +182,72 @@ func (m *mockHostDialer) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 	return rhp.RPCReadSectorResult{}, nil
 }
 
-func (m *mockHostDialer) ResetSlowHosts() {
+// Prices implements the [hostClient] interface.
+func (m *mockHostClient) Prices(_ context.Context, hostKey types.PublicKey) (prices proto.HostPrices, err error) {
+	m.pricesMu.Lock()
+	m.pricesCalls[hostKey]++
+	m.pricesMu.Unlock()
+
+	m.delayMu.Lock()
+	delay, ok := m.slowHosts[hostKey]
+	m.delayMu.Unlock()
+
+	// NOTE: we don't simulate a delay here but record a sample so the provider can deprioritize slow hosts
+	if ok && delay > 0 {
+		m.provider.AddSettingsSample(hostKey, delay)
+	}
+
+	return proto.HostPrices{}, nil
+}
+
+// PricesCalls returns the number of Prices calls per host.
+func (m *mockHostClient) PricesCalls() map[types.PublicKey]int {
+	m.pricesMu.Lock()
+	defer m.pricesMu.Unlock()
+	calls := make(map[types.PublicKey]int, len(m.pricesCalls))
+	maps.Copy(calls, m.pricesCalls)
+	return calls
+}
+
+// ResetPricesCalls clears the Prices call counters.
+func (m *mockHostClient) ResetPricesCalls() {
+	m.pricesMu.Lock()
+	defer m.pricesMu.Unlock()
+	m.pricesCalls = make(map[types.PublicKey]int)
+}
+
+func (m *mockHostClient) ResetSlowHosts() {
 	m.delayMu.Lock()
 	defer m.delayMu.Unlock()
 	m.slowHosts = make(map[types.PublicKey]time.Duration)
-	m.provider = client.NewProvider(m) // reset provider to clear host performance metrics
+	m.provider = client.NewProvider(m.hosts) // reset provider to clear host performance metrics
 }
 
-func (m *mockHostDialer) SetSlowHosts(tb testing.TB, n int, d time.Duration) {
+func (m *mockHostClient) SetSlowHosts(tb testing.TB, n int, d time.Duration) {
 	tb.Helper()
+
+	hosts, _ := m.hosts.UsableHosts()
+	if n > len(hosts) {
+		tb.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
+	}
 
 	m.delayMu.Lock()
 	defer m.delayMu.Unlock()
 
 	var set int
-	for hostKey := range m.hosts {
+	for _, hi := range hosts {
 		if set >= n {
 			return // already set enough hosts
 		}
 		set++
-		m.slowHosts[hostKey] = d
+		m.slowHosts[hi.PublicKey] = d
 	}
 	if set < n {
-		tb.Fatalf("not enough hosts to set as slow: only %d hosts available", len(m.hosts))
+		tb.Fatalf("not enough hosts to set as slow: only %d hosts available", len(hosts))
 	}
 }
 
-func (m *mockHostDialer) SetSectorReadDelay(root types.Hash256, d time.Duration) {
+func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration) {
 	m.sectorDelayMu.Lock()
 	defer m.sectorDelayMu.Unlock()
 	m.sectorDelays[root] = d
@@ -225,44 +255,55 @@ func (m *mockHostDialer) SetSectorReadDelay(root types.Hash256, d time.Duration)
 
 // SetFlakyHosts marks the first n hosts as flaky: each will fail its
 // first failCount write attempts before succeeding.
-func (m *mockHostDialer) SetFlakyHosts(t *testing.T, n, failCount int) {
-	if n > len(m.hosts) {
-		t.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(m.hosts))
+func (m *mockHostClient) SetFlakyHosts(t *testing.T, n, failCount int) {
+	t.Helper()
+
+	hosts, _ := m.hosts.UsableHosts()
+	if n > len(hosts) {
+		t.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
 	}
 
 	m.flakyMu.Lock()
 	defer m.flakyMu.Unlock()
 
 	var set int
-	for hostKey := range maps.Keys(m.hosts) {
+	for _, hi := range hosts {
 		if set >= n {
 			break
 		}
 		set++
-		m.flakyHosts[hostKey] = failCount
+		m.flakyHosts[hi.PublicKey] = failCount
 	}
 }
 
-func newMockDialer(hosts int) *mockHostDialer {
-	m := &mockHostDialer{
-		hosts:        make(map[types.PublicKey]struct{}),
+func newMockHostClient(hosts *hostCache) *mockHostClient {
+	m := &mockHostClient{
+		hosts:        hosts,
+		provider:     client.NewProvider(hosts),
 		slowHosts:    make(map[types.PublicKey]time.Duration),
 		sectorDelays: make(map[types.Hash256]time.Duration),
 		flakyHosts:   make(map[types.PublicKey]int),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
-	}
-	m.provider = client.NewProvider(m)
-	for range hosts {
-		sk := types.GeneratePrivateKey()
-		m.hosts[sk.PublicKey()] = struct{}{}
+		pricesCalls:  make(map[types.PublicKey]int),
 	}
 	return m
 }
 
 type mockAppClient struct {
-	mu      sync.Mutex
-	pinned  map[slabs.SlabID]slabs.PinnedSlab
-	objects map[types.Hash256]slabs.SealedObject
+	hosts *hostCache
+
+	mu            sync.Mutex
+	pinned        map[slabs.SlabID]slabs.PinnedSlab
+	objects       map[types.Hash256]slabs.SealedObject
+	hostsOverride []hosts.HostInfo
+}
+
+func newMockAppClient(hosts *hostCache) *mockAppClient {
+	return &mockAppClient{
+		hosts:   hosts,
+		objects: make(map[types.Hash256]slabs.SealedObject),
+		pinned:  make(map[slabs.SlabID]slabs.PinnedSlab),
+	}
 }
 
 // Account implements the [appClient] interface.
@@ -317,7 +358,20 @@ func (mc *mockAppClient) UnpinSlab(_ context.Context, _ types.PrivateKey, id sla
 
 // Hosts implements the [appClient] interface.
 func (mc *mockAppClient) Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error) {
-	return nil, nil
+	mc.mu.Lock()
+	override := mc.hostsOverride
+	mc.mu.Unlock()
+	if override != nil {
+		return override, nil
+	}
+	return mc.hosts.UsableHosts()
+}
+
+// SetHosts overrides the host list returned by Hosts.
+func (mc *mockAppClient) SetHosts(hi []hosts.HostInfo) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.hostsOverride = hi
 }
 
 func (mc *mockAppClient) Object(_ context.Context, _ types.PrivateKey, objectKey types.Hash256) (slabs.SealedObject, error) {
@@ -435,29 +489,30 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey) error
 	return nil
 }
 
-func newMockAppClient() *mockAppClient {
-	return &mockAppClient{
-		objects: make(map[types.Hash256]slabs.SealedObject),
-		pinned:  make(map[slabs.SlabID]slabs.PinnedSlab),
-	}
-}
-
 // newMockBuilder creates a Builder backed by mock implementations.
-func newMockBuilder(app appClient, hosts hostClient) *Builder {
+func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Builder {
 	return &Builder{
-		mockApp:  app,
-		mockHost: hosts,
-		consumed: &atomic.Bool{},
+		mockApp:       app,
+		mockHost:      hosts,
+		mockHostCache: hostStore,
+		consumed:      &atomic.Bool{},
 	}
 }
 
 // newTestSDK creates an SDK with mock clients for testing.
-func newTestSDK(t testing.TB, appKey types.PrivateKey, app appClient, hosts hostClient) *SDK {
+func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient) {
 	t.Helper()
-	b := newMockBuilder(app, hosts)
-	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(hosts)
+	appClient := newMockAppClient(hostStore)
+	hostClient := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appClient, hostClient, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(log))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sdk
+
+	return sdk, hostClient
 }

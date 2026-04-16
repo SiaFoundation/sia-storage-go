@@ -9,12 +9,14 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/rhp/v4"
+	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/indexd/api"
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
@@ -27,11 +29,12 @@ import (
 type (
 	// A hostClient is an interface for interacting with hosts.
 	hostClient interface {
-		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
+		Prices(ctx context.Context, hostKey types.PublicKey) (prices proto4.HostPrices, err error)
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
+		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 
-		UploadQueue() (*client.HostQueue, error)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
+		UploadQueue() (*client.HostQueue, error)
 		Close() error
 	}
 
@@ -70,10 +73,14 @@ type (
 
 	// An SDK is a client for the indexd service.
 	SDK struct {
-		log    *zap.Logger
+		app        appClient
+		hosts      hostClient
+		hostsCache *hostCache
+
 		appKey types.PrivateKey
-		client appClient
-		hosts  hostClient
+
+		tg  *threadgroup.ThreadGroup
+		log *zap.Logger
 	}
 )
 
@@ -210,18 +217,18 @@ func (s *SDK) AppKey() types.PrivateKey {
 
 // Account retrieves account information for the current app key.
 func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
-	return s.client.Account(ctx, s.appKey)
+	return s.app.Account(ctx, s.appKey)
 }
 
 // PruneSlabs removes all slabs on the account that are not associated with
 // an object.
 func (s *SDK) PruneSlabs(ctx context.Context) error {
-	return s.client.PruneSlabs(ctx, s.appKey)
+	return s.app.PruneSlabs(ctx, s.appKey)
 }
 
 // DeleteObject deletes the object with the given key from the indexer.
 func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
-	return s.client.DeleteObject(ctx, s.appKey, key)
+	return s.app.DeleteObject(ctx, s.appKey, key)
 }
 
 // Upload uploads the data to hosts.
@@ -335,7 +342,7 @@ func (s *SDK) Download(ctx context.Context, w io.Writer, obj Object, opts ...Dow
 // DownloadSharedObject downloads a shared object from a shared URL
 func (s *SDK) DownloadSharedObject(ctx context.Context, w io.Writer, sharedURL string, opts ...DownloadOption) error {
 	// retrieve shared object metadata
-	obj, encryptionKey, err := s.client.SharedObject(ctx, sharedURL)
+	obj, encryptionKey, err := s.app.SharedObject(ctx, sharedURL)
 	if err != nil {
 		return err
 	}
@@ -376,6 +383,7 @@ func (do *downloadOption) normalizeRange(maxLength uint64) bool {
 
 // Close closes the SDK and releases all resources.
 func (s *SDK) Close() error {
+	s.tg.Stop()
 	return s.hosts.Close()
 }
 
@@ -391,7 +399,7 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 		}
 	}
 
-	slabIDs, err := s.client.PinSlabs(ctx, s.appKey, params...)
+	slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params...)
 	if err != nil {
 		return fmt.Errorf("failed to pin slabs: %w", err)
 	}
@@ -402,7 +410,7 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 		}
 	}
 
-	return s.client.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
+	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
 const chunkSize = 1 << 18 // 256 KiB
@@ -606,6 +614,111 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	return bw.Flush()
 }
 
+func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
+	const batchSize = 100
+
+	var exhausted bool
+	for offset := 0; !exhausted; offset += batchSize {
+		batch, err := s.app.Hosts(ctx, s.appKey, api.WithOffset(offset), api.WithLimit(batchSize))
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch hosts from indexer: %w", err)
+		} else if len(batch) < batchSize {
+			exhausted = true
+		}
+		all = append(all, batch...)
+	}
+
+	return all, nil
+}
+
+func (s *SDK) refreshHosts(ctx context.Context, forceWarmup bool) error {
+	// fetch all hosts
+	allHosts, err := s.fetchHosts(ctx)
+	if err != nil {
+		return err
+	} else if len(allHosts) == 0 {
+		s.log.Debug("no hosts found in indexer")
+		return nil
+	}
+
+	// count GFU hosts for logging
+	var gfuCount int
+	for _, host := range allHosts {
+		if host.GoodForUpload {
+			gfuCount++
+		}
+	}
+
+	// update the hosts cache
+	added := s.hostsCache.updateHosts(allHosts)
+	s.log.Debug("hosts refreshed", zap.Int("hosts", len(allHosts)), zap.Int("new", len(added)), zap.Int("goodForUpload", gfuCount))
+
+	// warmup all hosts if force is set
+	if forceWarmup {
+		hks := make([]types.PublicKey, len(allHosts))
+		for i, host := range allHosts {
+			hks[i] = host.PublicKey
+		}
+		return s.warmupHosts(ctx, hks)
+	}
+
+	// otherwise warm up newly added GFU hosts if there are any
+	if len(added) > 0 {
+		gfu := make([]types.PublicKey, 0, len(added))
+		for _, host := range added {
+			if host.GoodForUpload {
+				gfu = append(gfu, host.PublicKey)
+			}
+		}
+		if len(gfu) > 0 {
+			return s.warmupHosts(ctx, gfu)
+		}
+	}
+
+	return nil
+}
+
+func (s *SDK) warmupHosts(ctx context.Context, hks []types.PublicKey) error {
+	var warmed atomic.Uint64
+
+	var wg sync.WaitGroup
+	sema := make(chan struct{}, 15)
+	for _, hk := range hks {
+		select {
+		case <-ctx.Done():
+			return nil
+		case sema <- struct{}{}:
+		}
+
+		tCtx, tCancel, err := s.tg.AddContext(ctx)
+		if err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		go func(ctx context.Context, hk types.PublicKey) {
+			defer func() {
+				tCancel()
+				wg.Done()
+				<-sema
+			}()
+			pCtx, pCancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err := s.hosts.Prices(pCtx, hk)
+			pCancel()
+
+			if err == nil {
+				warmed.Add(1)
+			}
+		}(tCtx, hk)
+	}
+
+	// wait for all warmups to complete
+	wg.Wait()
+
+	s.log.Debug("warmed up hosts", zap.Uint64("n", warmed.Load()))
+	return nil
+}
+
 // stripedSplit splits data into striped data shards, which must have sufficient
 // capacity.
 func stripedSplit(data []byte, dataShards [][]byte) {
@@ -744,16 +857,51 @@ func WithLogger(log *zap.Logger) Option {
 	}
 }
 
-func initSDK(appKey types.PrivateKey, app appClient, provider *client.Provider, opts ...Option) *SDK {
+func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
 	sdk := &SDK{
-		appKey: appKey,
+		appKey:     appKey,
+		app:        app,
+		hostsCache: newHostCache(),
 
-		log:    zap.NewNop(), // no logging by default
-		client: app,
+		tg:  threadgroup.New(),
+		log: zap.NewNop(), // no logging by default
 	}
 	for _, opt := range opts {
 		opt(sdk)
 	}
-	sdk.hosts = client.New(provider, sdk.log.Named("client"))
-	return sdk
+
+	// create the host client
+	sdk.hosts = client.New(client.NewProvider(sdk.hostsCache), sdk.log.Named("client"))
+
+	// update hosts and warm connections on init
+	err := sdk.refreshHosts(context.Background(), true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh hosts: %w", err)
+	}
+
+	// refresh hosts every 10 minutes in the background
+	ctx, cancel, err := sdk.tg.AddContext(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		defer cancel()
+
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+
+			err := sdk.refreshHosts(ctx, false)
+			if err != nil {
+				sdk.log.Warn("failed to refresh hosts", zap.Error(err))
+			}
+		}
+	}()
+
+	return sdk, nil
 }

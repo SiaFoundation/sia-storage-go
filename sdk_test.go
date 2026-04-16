@@ -13,7 +13,10 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
 
@@ -29,15 +32,13 @@ func (c *countWriter) Write(p []byte) (int, error) {
 }
 
 func TestRoundtripCount(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(50)
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	// 1 MB
 	data := frand.Bytes(1 << 20)
 	obj := NewEmptyObject()
-	err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+	err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to upload: %v", err)
 	} else if len(obj.Slabs()) != 1 {
@@ -48,7 +49,7 @@ func TestRoundtripCount(t *testing.T) {
 
 	buf := bytes.NewBuffer(nil)
 	cw := &countWriter{w: buf}
-	if err := s.Download(context.Background(), cw, obj); err != nil {
+	if err := sdk.Download(context.Background(), cw, obj); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,32 +60,29 @@ func TestRoundtripCount(t *testing.T) {
 }
 
 func TestUpload(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(50)
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
 	data := frand.Bytes(4096)
 
 	t.Run("timeout", func(t *testing.T) {
 		// use only 25 hosts so there are not enough for a full slab
-		dialer := newMockDialer(25)
-		s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-		defer s.Close()
+		sdk, _ := newTestSDK(t, 25, zaptest.NewLogger(t))
+		defer sdk.Close()
 
 		obj := NewEmptyObject()
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
 
 	t.Run("slow", func(t *testing.T) {
-		dialer.ResetSlowHosts()
+		sdk, hosts := newTestSDK(t, 50, zaptest.NewLogger(t))
+		defer sdk.Close()
+
 		// make most of the hosts slow, but not enough to fail.
 		// progressive timeout starts at 15s so 1s delay succeeds.
-		dialer.SetSlowHosts(t, 20, time.Second)
+		hosts.SetSlowHosts(t, 20, time.Second)
 		obj := NewEmptyObject()
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err != nil {
 			t.Fatal(err)
 		} else if len(obj.Slabs()) != 1 {
@@ -93,13 +91,13 @@ func TestUpload(t *testing.T) {
 	})
 
 	t.Run("all slow", func(t *testing.T) {
-		dialer := newMockDialer(50)
-		dialer.SetSlowHosts(t, 50, 2*time.Second)
-		s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-		defer s.Close()
+		sdk, hosts := newTestSDK(t, 50, zaptest.NewLogger(t))
+		defer sdk.Close()
+
+		hosts.SetSlowHosts(t, 50, 2*time.Second)
 
 		obj := NewEmptyObject()
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err != nil {
 			t.Fatal(err)
 		} else if len(obj.Slabs()) != 1 {
@@ -108,16 +106,16 @@ func TestUpload(t *testing.T) {
 	})
 
 	t.Run("flaky hosts", func(t *testing.T) {
+		sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
+		defer sdk.Close()
+
 		// 10 of 30 hosts fail their first write but succeed on retry.
 		// the upload should complete because failed hosts are requeued
 		// for other shards via Retry.
-		dialer := newMockDialer(30)
-		dialer.SetFlakyHosts(t, 10, 1)
-		s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-		defer s.Close()
+		hosts.SetFlakyHosts(t, 10, 1)
 
 		obj := NewEmptyObject()
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err != nil {
 			t.Fatal(err)
 		} else if len(obj.Slabs()) != 1 {
@@ -126,12 +124,11 @@ func TestUpload(t *testing.T) {
 	})
 
 	t.Run("no hosts", func(t *testing.T) {
-		dialer := newMockDialer(0)
-		s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-		defer s.Close()
+		sdk, _ := newTestSDK(t, 0, zaptest.NewLogger(t))
+		defer sdk.Close()
 
 		obj := NewEmptyObject()
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -139,23 +136,21 @@ func TestUpload(t *testing.T) {
 }
 
 func TestResumableUpload(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(50)
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	obj := NewEmptyObject()
 	data := frand.Bytes(5000)
 
 	for _, part := range [][]byte{data[:100], data[100:3000], data[3000:]} {
-		err := s.Upload(context.Background(), &obj, bytes.NewReader(part))
+		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(part))
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	buf := bytes.NewBuffer(nil)
-	if err := s.Download(t.Context(), buf, obj); err != nil {
+	if err := sdk.Download(t.Context(), buf, obj); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(buf.Bytes(), data) {
 		t.Fatal("data mismatch")
@@ -163,41 +158,39 @@ func TestResumableUpload(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	dialer := newMockDialer(30)
-	appKey := types.GeneratePrivateKey()
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	slabSize := uint64(proto.SectorSize) * 10
 	dataSize := slabSize * 3 // 3 slabs
 	data := frand.Bytes(int(dataSize))
 
 	obj := NewEmptyObject()
-	err := s.Upload(context.Background(), &obj, bytes.NewReader(data))
+	err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to upload: %v", err)
 	}
 
-	err = s.PinObject(t.Context(), obj)
+	err = sdk.PinObject(t.Context(), obj)
 	if err != nil {
 		t.Fatalf("failed to pin object: %v", err)
 	}
 
-	sharedURL, err := s.CreateSharedObjectURL(t.Context(), obj.ID(), time.Now().Add(time.Hour))
+	sharedURL, err := sdk.CreateSharedObjectURL(t.Context(), obj.ID(), time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatalf("failed to create shared object URL: %v", err)
 	}
 
 	t.Run("full", func(t *testing.T) {
 		buf := bytes.NewBuffer(nil)
-		if err = s.Download(context.Background(), buf, obj); err != nil {
+		if err = sdk.Download(context.Background(), buf, obj); err != nil {
 			t.Fatalf("failed to download: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
 			t.Fatal("data mismatch")
 		}
 
 		buf.Reset()
-		if err := s.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
+		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
 			t.Fatalf("failed to download shared object: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
 			t.Fatal("data mismatch")
@@ -228,14 +221,14 @@ func TestDownload(t *testing.T) {
 
 		for _, c := range cases {
 			buf := bytes.NewBuffer(nil)
-			if err = s.Download(context.Background(), buf, obj, WithDownloadRange(c[0], c[1])); err != nil {
+			if err = sdk.Download(context.Background(), buf, obj, WithDownloadRange(c[0], c[1])); err != nil {
 				t.Fatalf("failed to download: %v", err)
 			} else if !bytes.Equal(buf.Bytes(), data[c[0]:c[0]+c[1]]) {
 				t.Fatal("data mismatch")
 			}
 
 			buf.Reset()
-			if err := s.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(c[0], c[1])); err != nil {
+			if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(c[0], c[1])); err != nil {
 				t.Fatalf("failed to download shared object: %v", err)
 			} else if !bytes.Equal(buf.Bytes(), data[c[0]:c[0]+c[1]]) {
 				t.Fatal("data mismatch")
@@ -244,13 +237,13 @@ func TestDownload(t *testing.T) {
 
 		// ranges that extend past EOF should be clamped.
 		buf := bytes.NewBuffer(nil)
-		if err := s.Download(context.Background(), buf, obj, WithDownloadRange(dataSize-10, 100)); err != nil {
+		if err := sdk.Download(context.Background(), buf, obj, WithDownloadRange(dataSize-10, 100)); err != nil {
 			t.Fatalf("failed to clamp range to EOF: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data[dataSize-10:]) {
 			t.Fatal("data mismatch")
 		}
 		buf.Reset()
-		if err := s.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize-10, 100)); err != nil {
+		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize-10, 100)); err != nil {
 			t.Fatalf("failed to clamp shared range to EOF: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data[dataSize-10:]) {
 			t.Fatal("data mismatch")
@@ -258,13 +251,13 @@ func TestDownload(t *testing.T) {
 
 		// offsets at or beyond EOF should return no data.
 		buf.Reset()
-		if err := s.Download(context.Background(), buf, obj, WithDownloadRange(dataSize, 1)); err != nil {
+		if err := sdk.Download(context.Background(), buf, obj, WithDownloadRange(dataSize, 1)); err != nil {
 			t.Fatalf("expected empty EOF download, got %v", err)
 		} else if buf.Len() != 0 {
 			t.Fatalf("expected empty EOF download, got %d bytes", buf.Len())
 		}
 		buf.Reset()
-		if err := s.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize+1, 1)); err != nil {
+		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize+1, 1)); err != nil {
 			t.Fatalf("expected empty shared EOF download, got %v", err)
 		} else if buf.Len() != 0 {
 			t.Fatalf("expected empty shared EOF download, got %d bytes", buf.Len())
@@ -272,22 +265,22 @@ func TestDownload(t *testing.T) {
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		dialer.ResetSlowHosts()
+		hosts.ResetSlowHosts()
 		// make enough hosts timeout to fail to download
-		dialer.SetSlowHosts(t, 21, time.Second)
+		hosts.SetSlowHosts(t, 21, time.Second)
 		buf := bytes.NewBuffer(nil)
-		err = s.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
+		err = sdk.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
 		if !errors.Is(err, ErrNotEnoughShards) {
 			t.Fatalf("expected ErrNotEnoughShards, got %v", err)
 		}
 	})
 
 	t.Run("slow", func(t *testing.T) {
-		dialer.ResetSlowHosts()
+		hosts.ResetSlowHosts()
 		// make most of the hosts timeout
-		dialer.SetSlowHosts(t, 20, time.Second)
+		hosts.SetSlowHosts(t, 20, time.Second)
 		buf := bytes.NewBuffer(nil)
-		err = s.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
+		err = sdk.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
 		if err != nil {
 			t.Fatal(err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
@@ -297,33 +290,31 @@ func TestDownload(t *testing.T) {
 }
 
 func TestE2E(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(30)
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, _ := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	assertShareable := func(obj Object, data []byte) {
 		t.Helper()
 
 		// assert we can download the object
 		buf := bytes.NewBuffer(nil)
-		if err := s.PinObject(t.Context(), obj); err != nil {
+		if err := sdk.PinObject(t.Context(), obj); err != nil {
 			t.Fatalf("failed to pin object: %v", err)
-		} else if _, err := s.Object(t.Context(), obj.ID()); err != nil {
+		} else if _, err := sdk.Object(t.Context(), obj.ID()); err != nil {
 			t.Fatalf("failed to get object: %v", err)
-		} else if err := s.Download(t.Context(), buf, obj); err != nil {
+		} else if err := sdk.Download(t.Context(), buf, obj); err != nil {
 			t.Fatalf("failed to download: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
 			t.Fatal("data mismatch")
 		}
 
 		// assert we can share the object
-		sharedURL, err := s.CreateSharedObjectURL(t.Context(), obj.ID(), time.Now().Add(time.Hour))
+		sharedURL, err := sdk.CreateSharedObjectURL(t.Context(), obj.ID(), time.Now().Add(time.Hour))
 		if err != nil {
 			t.Fatalf("failed to create shared object URL: %v", err)
 		}
 		buf.Reset()
-		if err := s.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
+		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
 			t.Fatalf("failed to download shared object: %v", err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
 			t.Fatal("data mismatch")
@@ -333,16 +324,16 @@ func TestE2E(t *testing.T) {
 	// regular object upload
 	data := frand.Bytes(4096)
 	obj := NewEmptyObject()
-	err := s.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(4, 11))
+	err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(4, 11))
 	if err != nil {
 		t.Fatalf("failed to upload: %v", err)
-	} else if _, err := s.Object(t.Context(), obj.ID()); err == nil || !strings.Contains(err.Error(), slabs.ErrObjectNotFound.Error()) {
+	} else if _, err := sdk.Object(t.Context(), obj.ID()); err == nil || !strings.Contains(err.Error(), slabs.ErrObjectNotFound.Error()) {
 		t.Fatal("object should not be pinned yet")
 	}
 	assertShareable(obj, data)
 
 	// packed upload
-	packed, err := s.UploadPacked(WithRedundancy(4, 11))
+	packed, err := sdk.UploadPacked(WithRedundancy(4, 11))
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -368,7 +359,7 @@ func TestE2E(t *testing.T) {
 	assertShareable(objects[1], data2)
 
 	// packed upload spanning multiple slabs
-	packedL, err := s.UploadPacked(WithRedundancy(4, 11))
+	packedL, err := sdk.UploadPacked(WithRedundancy(4, 11))
 	if err != nil {
 		t.Fatalf("failed to create multi-slab packed upload: %v", err)
 	}
@@ -394,21 +385,77 @@ func TestE2E(t *testing.T) {
 	assertShareable(objects2[1], data4)
 }
 
-func BenchmarkUpload(b *testing.B) {
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
+func TestRefreshHosts(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(30)
+	appMock := newMockAppClient(hostStore)
+	hostMock := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appMock, hostMock, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sdk.Close()
+
+	// build the initial host list from the cache
+	initial, _ := hostStore.UsableHosts()
+
+	// refresh without force on unchanged hosts
+	if err := sdk.refreshHosts(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert no warmup
+	if len(hostMock.PricesCalls()) != 0 {
+		t.Fatalf("expected 0 warmup calls, got %d", len(hostMock.PricesCalls()))
+	}
+
+	// add a new GFU host to the app client response
+	newHK := types.GeneratePrivateKey().PublicKey()
+	updated := append([]hosts.HostInfo{}, initial...)
+	updated = append(updated, hosts.HostInfo{PublicKey: newHK, GoodForUpload: true})
+	appMock.SetHosts(updated)
+
+	// refresh without force
+	if err := sdk.refreshHosts(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert only the new host was warmed up
+	calls := hostMock.PricesCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 warmup call, got %d", len(calls))
+	} else if calls[newHK] != 1 {
+		t.Fatal("expected warmup for new host")
+	}
+
+	// refresh with force
+	hostMock.ResetPricesCalls()
+	if err := sdk.refreshHosts(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert all 31 hosts were warmed up
+	calls = hostMock.PricesCalls()
+	if len(calls) != 31 {
+		t.Fatalf("expected 31 warmup calls, got %d", len(calls))
+	}
+}
+
+func BenchmarkUpload(b *testing.B) {
+	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	defer sdk.Close()
+
+	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
 	data := frand.Bytes(benchmarkSize)
 
 	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
-			dialer := newMockDialer(30 + timeout) // increase the chance that a timeout will affect us without failing the test
-			dialer.ResetSlowHosts()
-			dialer.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
-			dialer.SetSlowHosts(b, timeout, 30*time.Second) // longer than the default timeout
-
-			s := newTestSDK(b, appKey, newMockAppClient(), dialer)
-			defer s.Close()
+			hosts.ResetSlowHosts()
+			hosts.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
+			hosts.SetSlowHosts(b, timeout, 30*time.Second) // longer than the default timeout
 
 			r := bytes.NewReader(data)
 			b.SetBytes(benchmarkSize)
@@ -416,7 +463,7 @@ func BenchmarkUpload(b *testing.B) {
 			for b.Loop() {
 				r.Reset(data)
 				obj := NewEmptyObject()
-				if err := s.Upload(context.Background(), &obj, r, WithUploadInflight(inflight)); err != nil {
+				if err := sdk.Upload(context.Background(), &obj, r, WithUploadInflight(inflight)); err != nil {
 					b.Fatalf("failed to upload: %v", err)
 				}
 			}
@@ -437,16 +484,13 @@ func BenchmarkUpload(b *testing.B) {
 }
 
 func BenchmarkDownload(b *testing.B) {
+	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	defer sdk.Close()
+
 	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(30)
-	s := newTestSDK(b, appKey, newMockAppClient(), dialer)
-	defer s.Close()
-
 	data := frand.Bytes(benchmarkSize)
 	obj := NewEmptyObject()
-	err := s.Upload(b.Context(), &obj, bytes.NewReader(data))
+	err := sdk.Upload(b.Context(), &obj, bytes.NewReader(data))
 	if err != nil {
 		b.Fatalf("failed to upload: %v", err)
 	}
@@ -455,15 +499,18 @@ func BenchmarkDownload(b *testing.B) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d inflight %d", slow, inflight), func(b *testing.B) {
 			// needs to be longer than the default timeout
-			dialer.ResetSlowHosts()
-			dialer.SetSlowHosts(b, slow, 30*time.Second)
+			hosts.ResetSlowHosts()
+			hosts.SetSlowHosts(b, slow, 30*time.Second)
+
+			// NOTE: refreshing hosts before the benchmark makes all downloads fast because of warmup
+			// sdk.refreshHosts(b.Context(), true)
 
 			buf := bytes.NewBuffer(nil)
 			b.SetBytes(benchmarkSize)
 			b.ResetTimer()
 			for b.Loop() {
 				buf.Reset()
-				err = s.Download(context.Background(), buf, obj, WithDownloadInflight(inflight))
+				err = sdk.Download(context.Background(), buf, obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}

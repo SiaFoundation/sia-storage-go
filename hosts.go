@@ -1,58 +1,43 @@
 package siastorage
 
 import (
-	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/chain"
-	"go.sia.tech/coreutils/threadgroup"
-	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/hosts"
 )
 
-type cachedHostStore struct {
-	tg     *threadgroup.ThreadGroup
-	appKey types.PrivateKey
-	client *app.Client
-
+type hostCache struct {
 	mu    sync.Mutex
 	hosts map[types.PublicKey]hosts.HostInfo
 }
 
-// UsableHosts returns all cached hosts.
-func (chs *cachedHostStore) UsableHosts() ([]hosts.HostInfo, error) {
-	done, err := chs.tg.Add()
-	if err != nil {
-		return nil, err
+func newHostCache() *hostCache {
+	return &hostCache{
+		hosts: make(map[types.PublicKey]hosts.HostInfo),
 	}
-	defer done()
+}
 
-	chs.mu.Lock()
-	defer chs.mu.Unlock()
+// UsableHosts returns all cached hosts.
+func (s *hostCache) UsableHosts() ([]hosts.HostInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	hosts := make([]hosts.HostInfo, 0, len(chs.hosts))
-	for _, host := range chs.hosts {
+	hosts := make([]hosts.HostInfo, 0, len(s.hosts))
+	for _, host := range s.hosts {
 		hosts = append(hosts, host)
 	}
 	return hosts, nil
 }
 
 // Addresses returns the network addresses for the specified host.
-func (chs *cachedHostStore) Addresses(hostKey types.PublicKey) ([]chain.NetAddress, error) {
-	done, err := chs.tg.Add()
-	if err != nil {
-		return nil, err
-	}
-	defer done()
+func (s *hostCache) Addresses(hk types.PublicKey) ([]chain.NetAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	chs.mu.Lock()
-	defer chs.mu.Unlock()
-
-	host, exists := chs.hosts[hostKey]
+	host, exists := s.hosts[hk]
 	if !exists {
 		return nil, errors.New("unknown host")
 	}
@@ -60,70 +45,42 @@ func (chs *cachedHostStore) Addresses(hostKey types.PublicKey) ([]chain.NetAddre
 }
 
 // Usable returns whether the host is usable (i.e. cached).
-func (chs *cachedHostStore) Usable(hostKey types.PublicKey) (bool, error) {
-	done, err := chs.tg.Add()
-	if err != nil {
-		return false, err
-	}
-	defer done()
+func (s *hostCache) Usable(hk types.PublicKey) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	chs.mu.Lock()
-	defer chs.mu.Unlock()
-
-	_, exists := chs.hosts[hostKey]
+	_, exists := s.hosts[hk]
 	return exists, nil
 }
 
-func (chs *cachedHostStore) updateHosts(ctx context.Context) error {
-	const pageSize = 100
-	hosts := make(map[types.PublicKey]hosts.HostInfo)
-	for offset := 0; ; offset += pageSize {
-		hostInfos, err := chs.client.Hosts(ctx, chs.appKey, api.WithOffset(offset), api.WithLimit(pageSize))
-		if err != nil {
-			return err
-		}
-		for _, host := range hostInfos {
-			hosts[host.PublicKey] = host
-		}
-		if len(hostInfos) < pageSize {
-			break
-		}
+// updateHosts replaces the cached hosts with the provided update and
+// returns hosts that should be warmed up, those hosts are new and good
+// for upload, or became good for upload.
+func (s *hostCache) updateHosts(update []hosts.HostInfo) []hosts.HostInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// collect existing hosts
+	existing := make(map[types.PublicKey]bool)
+	for hk, hi := range s.hosts {
+		existing[hk] = hi.GoodForUpload
 	}
 
-	chs.mu.Lock()
-	chs.hosts = hosts
-	chs.mu.Unlock()
-	return nil
-}
+	// clear hosts
+	s.hosts = make(map[types.PublicKey]hosts.HostInfo)
 
-func newCachedHostStore(client *app.Client, appKey types.PrivateKey) (*cachedHostStore, error) {
-	chs := &cachedHostStore{
-		tg:     threadgroup.New(),
-		appKey: appKey,
-		client: client,
-		hosts:  make(map[types.PublicKey]hosts.HostInfo),
-	}
-	if err := chs.updateHosts(context.Background()); err != nil {
-		return nil, err
-	}
-	ctx, cancel, err := chs.tg.AddContext(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		defer cancel()
-
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-
-			chs.updateHosts(ctx)
+	// add new hosts and track which
+	var warmup []hosts.HostInfo
+	for _, hi := range update {
+		gfu, exists := existing[hi.PublicKey]
+		turnedGFU := exists && !gfu && hi.GoodForUpload
+		addedGFU := !exists && hi.GoodForUpload
+		if turnedGFU || addedGFU {
+			warmup = append(warmup, hi)
 		}
-	}()
-	return chs, nil
+
+		s.hosts[hi.PublicKey] = hi
+	}
+
+	return warmup
 }
