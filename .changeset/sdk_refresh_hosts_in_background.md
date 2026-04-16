@@ -2,4 +2,4 @@
 default: minor
 ---
 
-# Refresh hosts in background and warmup their connections.
+# Periodically refresh hosts in the background and warmup their connections.
