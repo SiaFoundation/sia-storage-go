@@ -12,6 +12,8 @@ import (
 	"time"
 
 	proto "go.sia.tech/core/rhp/v4"
+	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
@@ -381,6 +383,64 @@ func TestE2E(t *testing.T) {
 
 	assertShareable(objects2[0], data3)
 	assertShareable(objects2[1], data4)
+}
+
+func TestRefreshHosts(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(30)
+	appMock := newMockAppClient(hostStore)
+	hostMock := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appMock, hostMock, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sdk.Close()
+
+	// build the initial host list from the cache
+	initial, _ := hostStore.UsableHosts()
+
+	// refresh without force on unchanged hosts
+	if err := sdk.refreshHosts(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert no warmup
+	if len(hostMock.PricesCalls()) != 0 {
+		t.Fatalf("expected 0 warmup calls, got %d", len(hostMock.PricesCalls()))
+	}
+
+	// add a new GFU host to the app client response
+	newHK := types.GeneratePrivateKey().PublicKey()
+	updated := append([]hosts.HostInfo{}, initial...)
+	updated = append(updated, hosts.HostInfo{PublicKey: newHK, GoodForUpload: true})
+	appMock.SetHosts(updated)
+
+	// refresh without force
+	if err := sdk.refreshHosts(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert only the new host was warmed up
+	calls := hostMock.PricesCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 warmup call, got %d", len(calls))
+	} else if calls[newHK] != 1 {
+		t.Fatal("expected warmup for new host")
+	}
+
+	// refresh with force
+	hostMock.ResetPricesCalls()
+	if err := sdk.refreshHosts(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert all 31 hosts were warmed up
+	calls = hostMock.PricesCalls()
+	if len(calls) != 31 {
+		t.Fatalf("expected 31 warmup calls, got %d", len(calls))
+	}
 }
 
 func BenchmarkUpload(b *testing.B) {

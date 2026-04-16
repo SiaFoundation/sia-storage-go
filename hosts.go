@@ -53,24 +53,34 @@ func (s *hostCache) Usable(hk types.PublicKey) (bool, error) {
 	return exists, nil
 }
 
-// updateHosts replaces the cached hosts with the provided update and returns any newly added hosts.
+// updateHosts replaces the cached hosts with the provided update and
+// returns hosts that should be warmed up, those hosts are new and good
+// for upload, or became good for upload.
 func (s *hostCache) updateHosts(update []hosts.HostInfo) []hosts.HostInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existing := make(map[types.PublicKey]struct{})
-	for hk := range s.hosts {
-		existing[hk] = struct{}{}
+	// collect existing hosts
+	existing := make(map[types.PublicKey]bool)
+	for hk, hi := range s.hosts {
+		existing[hk] = hi.GoodForUpload
 	}
+
+	// clear hosts
 	s.hosts = make(map[types.PublicKey]hosts.HostInfo)
 
-	var added []hosts.HostInfo
+	// add new hosts and track which
+	var warmup []hosts.HostInfo
 	for _, hi := range update {
-		if _, exists := existing[hi.PublicKey]; !exists {
-			added = append(added, hi)
+		gfu, exists := existing[hi.PublicKey]
+		turnedGFU := exists && !gfu && hi.GoodForUpload
+		addedGFU := !exists && hi.GoodForUpload
+		if turnedGFU || addedGFU {
+			warmup = append(warmup, hi)
 		}
+
 		s.hosts[hi.PublicKey] = hi
 	}
 
-	return added
+	return warmup
 }

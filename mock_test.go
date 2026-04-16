@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,6 +51,9 @@ type mockHostClient struct {
 
 	sectorsMu   sync.Mutex
 	hostSectors map[types.PublicKey]map[types.Hash256][]byte
+
+	pricesMu    sync.Mutex
+	pricesCalls map[types.PublicKey]int
 }
 
 // Close implements the [hostClient] interface.
@@ -180,6 +184,10 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 
 // Prices implements the [hostClient] interface.
 func (m *mockHostClient) Prices(_ context.Context, hostKey types.PublicKey) (prices proto.HostPrices, err error) {
+	m.pricesMu.Lock()
+	m.pricesCalls[hostKey]++
+	m.pricesMu.Unlock()
+
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]
 	m.delayMu.Unlock()
@@ -190,6 +198,22 @@ func (m *mockHostClient) Prices(_ context.Context, hostKey types.PublicKey) (pri
 	}
 
 	return proto.HostPrices{}, nil
+}
+
+// PricesCalls returns the number of Prices calls per host.
+func (m *mockHostClient) PricesCalls() map[types.PublicKey]int {
+	m.pricesMu.Lock()
+	defer m.pricesMu.Unlock()
+	calls := make(map[types.PublicKey]int, len(m.pricesCalls))
+	maps.Copy(calls, m.pricesCalls)
+	return calls
+}
+
+// ResetPricesCalls clears the Prices call counters.
+func (m *mockHostClient) ResetPricesCalls() {
+	m.pricesMu.Lock()
+	defer m.pricesMu.Unlock()
+	m.pricesCalls = make(map[types.PublicKey]int)
 }
 
 func (m *mockHostClient) ResetSlowHosts() {
@@ -260,6 +284,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		sectorDelays: make(map[types.Hash256]time.Duration),
 		flakyHosts:   make(map[types.PublicKey]int),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
+		pricesCalls:  make(map[types.PublicKey]int),
 	}
 	return m
 }
@@ -267,9 +292,10 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 type mockAppClient struct {
 	hosts *hostCache
 
-	mu      sync.Mutex
-	pinned  map[slabs.SlabID]slabs.PinnedSlab
-	objects map[types.Hash256]slabs.SealedObject
+	mu            sync.Mutex
+	pinned        map[slabs.SlabID]slabs.PinnedSlab
+	objects       map[types.Hash256]slabs.SealedObject
+	hostsOverride []hosts.HostInfo
 }
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
@@ -332,7 +358,20 @@ func (mc *mockAppClient) UnpinSlab(_ context.Context, _ types.PrivateKey, id sla
 
 // Hosts implements the [appClient] interface.
 func (mc *mockAppClient) Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error) {
+	mc.mu.Lock()
+	override := mc.hostsOverride
+	mc.mu.Unlock()
+	if override != nil {
+		return override, nil
+	}
 	return mc.hosts.UsableHosts()
+}
+
+// SetHosts overrides the host list returned by Hosts.
+func (mc *mockAppClient) SetHosts(hi []hosts.HostInfo) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.hostsOverride = hi
 }
 
 func (mc *mockAppClient) Object(_ context.Context, _ types.PrivateKey, objectKey types.Hash256) (slabs.SealedObject, error) {
