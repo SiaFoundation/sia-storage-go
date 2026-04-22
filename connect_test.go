@@ -8,7 +8,6 @@ import (
 
 	"go.sia.tech/indexd/accounts"
 	"go.sia.tech/indexd/api/app"
-	"go.sia.tech/indexd/slabs"
 	"go.sia.tech/indexd/testutils"
 	"go.sia.tech/siastorage"
 	"go.uber.org/zap/zaptest"
@@ -104,8 +103,8 @@ func TestConnect(t *testing.T) {
 	appKey1 := client.AppKey()
 
 	// verify the key can be used to access resources owned by the app
-	if _, err := client.ListObjects(t.Context(), slabs.Cursor{}, 10); err != nil {
-		t.Fatal("failed to list objects with connected SDK:", err)
+	if _, err := client.ObjectEvents(t.Context(), siastorage.ObjectsCursor{}, 10); err != nil {
+		t.Fatal("failed to fetch object events with connected SDK:", err)
 	} else if err := client.Close(); err != nil {
 		t.Fatal("failed to close SDK client:", err)
 	}
