@@ -1,6 +1,7 @@
 package siastorage
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"reflect"
@@ -77,6 +78,53 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	obj2.updatedAt = obj.updatedAt
 	if !reflect.DeepEqual(obj, obj2) {
 		t.Fatalf("object mismatch: expected %+v, got %+v", obj, obj2)
+	}
+}
+
+func TestObjectEvents(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	mock := newMockAppClient()
+	dialer := newMockDialer(50)
+	s := newTestSDK(t, appKey, mock, dialer)
+	defer s.Close()
+
+	// no events initially
+	events, err := s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(events) != 0 {
+		t.Fatalf("expected 0 events, got %d", len(events))
+	}
+
+	// upload an object
+	obj := NewEmptyObject()
+	obj.UpdateMetadata(json.RawMessage(`{"foo":"bar"}`))
+	if err := s.Upload(t.Context(), &obj, bytes.NewReader(frand.Bytes(4096))); err != nil {
+		t.Fatal(err)
+	}
+
+	// pin it so it shows up in the mock
+	if err := s.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	}
+
+	// fetch events
+	events, err = s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if ev.Deleted {
+		t.Fatal("expected event not to be deleted")
+	} else if ev.Object == nil {
+		t.Fatal("expected event to contain an object")
+	} else if ev.Key != obj.ID() {
+		t.Fatalf("expected key %v, got %v", obj.ID(), ev.Key)
+	} else if string(ev.Object.Metadata()) != `{"foo":"bar"}` {
+		t.Fatalf("unexpected metadata: %s", ev.Object.Metadata())
 	}
 }
 
