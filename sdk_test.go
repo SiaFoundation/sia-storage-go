@@ -505,7 +505,7 @@ func BenchmarkDownload(b *testing.B) {
 			hosts.SetSlowHosts(b, slow, 30*time.Second)
 
 			// NOTE: refreshing hosts makes all benchmarks roughly equal
-			// sdk.refreshHosts(b.Context(), true)
+			sdk.refreshHosts(b.Context(), true)
 
 			buf := bytes.NewBuffer(nil)
 			b.SetBytes(benchmarkSize)
