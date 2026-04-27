@@ -3,6 +3,7 @@ package siastorage_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -71,11 +72,8 @@ func TestConnect(t *testing.T) {
 	// simulate user rejecting the connection
 	respondToAppConnection(t, responseURL, connectKey.Key, false)
 
-	approved, err := builder.WaitForApproval(t.Context())
-	if err != nil {
-		t.Fatal("failed to wait for approval:", err)
-	} else if approved {
-		t.Fatal("expected connection to be rejected")
+	if err := builder.WaitForApproval(t.Context()); !errors.Is(err, siastorage.ErrUserRejected) {
+		t.Fatalf("expected ErrUserRejected, got %v", err)
 	}
 
 	// request connection again
@@ -87,11 +85,8 @@ func TestConnect(t *testing.T) {
 	// simulate user approving the connection
 	respondToAppConnection(t, responseURL, connectKey.Key, true)
 
-	approved, err = builder.WaitForApproval(t.Context())
-	if err != nil {
+	if err := builder.WaitForApproval(t.Context()); err != nil {
 		t.Fatal("failed to wait for approval:", err)
-	} else if !approved {
-		t.Fatal("expected connection to be approved")
 	}
 
 	mnemonic := siastorage.NewSeedPhrase()
@@ -129,11 +124,8 @@ func TestConnect(t *testing.T) {
 	// simulate user approving the connection
 	respondToAppConnection(t, responseURL, connectKey.Key, true)
 
-	approved, err = builder.WaitForApproval(t.Context())
-	if err != nil {
+	if err := builder.WaitForApproval(t.Context()); err != nil {
 		t.Fatal("failed to wait for approval:", err)
-	} else if !approved {
-		t.Fatal("expected connection to be approved")
 	}
 
 	client2, err := builder.Register(t.Context(), mnemonic)
