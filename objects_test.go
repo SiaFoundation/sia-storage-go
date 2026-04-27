@@ -126,6 +126,29 @@ func TestObjectEvents(t *testing.T) {
 	} else if string(ev.Object.Metadata()) != `{"foo":"bar"}` {
 		t.Fatalf("unexpected metadata: %s", ev.Object.Metadata())
 	}
+
+	// delete the object
+	objID := obj.ID()
+	if err := s.DeleteObject(t.Context(), objID); err != nil {
+		t.Fatal(err)
+	}
+
+	// fetch events again, should contain a deletion event
+	events, err = s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev = events[0]
+	if !ev.Deleted {
+		t.Fatal("expected event to be deleted")
+	} else if ev.Object != nil {
+		t.Fatal("expected event not to contain an object")
+	} else if ev.Key != objID {
+		t.Fatalf("expected key %v, got %v", objID, ev.Key)
+	}
 }
 
 func TestObjectEquivalency(t *testing.T) {

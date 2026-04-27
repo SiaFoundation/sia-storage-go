@@ -1,5 +1,5 @@
 ---
-default: minor
+default: major
 ---
 
 # SDK: Add ObjectEvents
