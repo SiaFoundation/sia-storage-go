@@ -263,6 +263,7 @@ type mockAppClient struct {
 	mu      sync.Mutex
 	pinned  map[slabs.SlabID]slabs.PinnedSlab
 	objects map[types.Hash256]slabs.SealedObject
+	deleted map[types.Hash256]time.Time
 }
 
 // Account implements the [appClient] interface.
@@ -342,6 +343,16 @@ func (mc *mockAppClient) ListObjects(_ context.Context, _ types.PrivateKey, _ sl
 			Object:    &obj,
 		})
 	}
+	for key, deletedAt := range mc.deleted {
+		objs = append(objs, slabs.ObjectEvent{
+			Key:       key,
+			Deleted:   true,
+			UpdatedAt: deletedAt,
+		})
+	}
+	slices.SortFunc(objs, func(a, b slabs.ObjectEvent) int {
+		return a.UpdatedAt.Compare(b.UpdatedAt)
+	})
 	return objs, nil
 }
 
@@ -412,6 +423,7 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 		return slabs.ErrObjectNotFound
 	}
 	delete(mc.objects, key)
+	mc.deleted[key] = time.Now()
 	return nil
 }
 
@@ -439,6 +451,7 @@ func newMockAppClient() *mockAppClient {
 	return &mockAppClient{
 		objects: make(map[types.Hash256]slabs.SealedObject),
 		pinned:  make(map[slabs.SlabID]slabs.PinnedSlab),
+		deleted: make(map[types.Hash256]time.Time),
 	}
 }
 
