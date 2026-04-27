@@ -183,21 +183,23 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 }
 
 // Prices implements the [hostClient] interface.
-func (m *mockHostClient) Prices(_ context.Context, hostKey types.PublicKey) (prices proto.HostPrices, err error) {
+func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_ proto.HostPrices, err error) {
+	start := time.Now()
+	defer func() {
+		if err != nil {
+			m.provider.AddFailedRPC(hostKey, err)
+		} else {
+			m.provider.AddSettingsSample(hostKey, time.Since(start))
+		}
+	}()
+
 	m.pricesMu.Lock()
 	m.pricesCalls[hostKey]++
 	m.pricesMu.Unlock()
 
-	m.delayMu.Lock()
-	delay, ok := m.slowHosts[hostKey]
-	m.delayMu.Unlock()
-
-	// NOTE: we don't simulate a delay here but record a sample so the provider can deprioritize slow hosts
-	if ok && delay > 0 {
-		m.provider.AddSettingsSample(hostKey, delay)
-	}
-
-	return proto.HostPrices{}, nil
+	// simulate delay
+	err = m.delay(ctx, hostKey)
+	return
 }
 
 // PricesCalls returns the number of Prices calls per host.

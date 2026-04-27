@@ -659,7 +659,7 @@ func (s *SDK) refreshHosts(ctx context.Context, forceWarmup bool) error {
 		for i, host := range allHosts {
 			hks[i] = host.PublicKey
 		}
-		return s.warmupHosts(ctx, hks)
+		return s.warmConnections(ctx, hks)
 	}
 
 	// otherwise warm up newly added GFU hosts if there are any
@@ -671,14 +671,14 @@ func (s *SDK) refreshHosts(ctx context.Context, forceWarmup bool) error {
 			}
 		}
 		if len(gfu) > 0 {
-			return s.warmupHosts(ctx, gfu)
+			return s.warmConnections(ctx, gfu)
 		}
 	}
 
 	return nil
 }
 
-func (s *SDK) warmupHosts(ctx context.Context, hks []types.PublicKey) error {
+func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error {
 	var warmed atomic.Uint64
 
 	var wg sync.WaitGroup
@@ -702,7 +702,7 @@ func (s *SDK) warmupHosts(ctx context.Context, hks []types.PublicKey) error {
 				wg.Done()
 				<-sema
 			}()
-			pCtx, pCancel := context.WithTimeout(ctx, 5*time.Second)
+			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
 			_, err := s.hosts.Prices(pCtx, hk)
 			pCancel()
 

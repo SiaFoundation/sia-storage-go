@@ -444,18 +444,20 @@ func TestRefreshHosts(t *testing.T) {
 }
 
 func BenchmarkUpload(b *testing.B) {
-	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
-	defer sdk.Close()
-
 	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
 	data := frand.Bytes(benchmarkSize)
 
 	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
-			hosts.ResetSlowHosts()
+			sdk, hosts := newTestSDK(b, 30+timeout, zap.NewNop())
+			defer sdk.Close()
+
 			hosts.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
 			hosts.SetSlowHosts(b, timeout, 30*time.Second) // longer than the default timeout
+
+			// NOTE: refreshing hosts makes all benchmarks roughly equal
+			sdk.refreshHosts(b.Context(), true)
 
 			r := bytes.NewReader(data)
 			b.SetBytes(benchmarkSize)
@@ -502,7 +504,7 @@ func BenchmarkDownload(b *testing.B) {
 			hosts.ResetSlowHosts()
 			hosts.SetSlowHosts(b, slow, 30*time.Second)
 
-			// NOTE: refreshing hosts before the benchmark makes all downloads fast because of warmup
+			// NOTE: refreshing hosts makes all benchmarks roughly equal
 			// sdk.refreshHosts(b.Context(), true)
 
 			buf := bytes.NewBuffer(nil)
