@@ -27,11 +27,10 @@ if err != nil {
 fmt.Println("Approve the connection:", responseURL)
 
 // block until the user approves or rejects
-approved, err := builder.WaitForApproval(ctx)
-if err != nil {
-	log.Fatal("failed to wait for approval:", err)
-} else if !approved {
+if err := builder.WaitForApproval(ctx); errors.Is(err, siastorage.ErrUserRejected) {
 	log.Fatal("user denied the connection")
+} else if err != nil {
+	log.Fatal("failed to wait for approval:", err)
 }
 
 // derive an app key from a BIP-39 seed phrase and register it
