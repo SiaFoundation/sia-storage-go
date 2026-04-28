@@ -119,9 +119,6 @@ func NewEmptyObject() Object {
 	}
 }
 
-// ObjectsCursor is a cursor for paginating through object events.
-type ObjectsCursor = slabs.Cursor
-
 // ObjectEvent represents a change to an object. If the object was deleted,
 // Deleted is true and Object is nil.
 type ObjectEvent struct {
@@ -134,7 +131,7 @@ type ObjectEvent struct {
 // ObjectEvents returns object events from the indexer, starting from the
 // given cursor, up to the given limit. Unlike ListObjects, it preserves
 // deletion events.
-func (s *SDK) ObjectEvents(ctx context.Context, cursor ObjectsCursor, limit int) ([]ObjectEvent, error) {
+func (s *SDK) ObjectEvents(ctx context.Context, cursor slabs.Cursor, limit int) ([]ObjectEvent, error) {
 	raw, err := s.client.ListObjects(ctx, s.appKey, cursor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list object events: %w", err)
