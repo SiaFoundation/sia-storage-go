@@ -82,6 +82,8 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 }
 
 func TestObjectEvents(t *testing.T) {
+	const metadata = `{"foo":"bar"}`
+
 	appKey := types.GeneratePrivateKey()
 	mock := newMockAppClient()
 	dialer := newMockDialer(50)
@@ -98,7 +100,7 @@ func TestObjectEvents(t *testing.T) {
 
 	// upload an object
 	obj := NewEmptyObject()
-	obj.UpdateMetadata(json.RawMessage(`{"foo":"bar"}`))
+	obj.UpdateMetadata(json.RawMessage(metadata))
 	if err := s.Upload(t.Context(), &obj, bytes.NewReader(frand.Bytes(4096))); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +125,7 @@ func TestObjectEvents(t *testing.T) {
 		t.Fatal("expected event to contain an object")
 	} else if ev.Key != obj.ID() {
 		t.Fatalf("expected key %v, got %v", obj.ID(), ev.Key)
-	} else if string(ev.Object.Metadata()) != `{"foo":"bar"}` {
+	} else if string(ev.Object.Metadata()) != metadata {
 		t.Fatalf("unexpected metadata: %s", ev.Object.Metadata())
 	}
 
