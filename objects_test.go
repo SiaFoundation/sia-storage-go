@@ -91,7 +91,7 @@ func TestObjectEvents(t *testing.T) {
 	defer s.Close()
 
 	// no events initially
-	events, err := s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	events, err := s.ObjectEvents(t.Context(), slabs.Cursor{}, 10)
 	if err != nil {
 		t.Fatal(err)
 	} else if len(events) != 0 {
@@ -111,7 +111,7 @@ func TestObjectEvents(t *testing.T) {
 	}
 
 	// fetch events
-	events, err = s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	events, err = s.ObjectEvents(t.Context(), slabs.Cursor{}, 10)
 	if err != nil {
 		t.Fatal(err)
 	} else if len(events) != 1 {
@@ -136,7 +136,7 @@ func TestObjectEvents(t *testing.T) {
 	}
 
 	// fetch events again, should contain a deletion event
-	events, err = s.ObjectEvents(t.Context(), ObjectsCursor{}, 10)
+	events, err = s.ObjectEvents(t.Context(), slabs.Cursor{}, 10)
 	if err != nil {
 		t.Fatal(err)
 	} else if len(events) != 1 {
