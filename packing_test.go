@@ -86,11 +86,11 @@ func TestUploadPacked(t *testing.T) {
 		seen[objects[i].ID()] = true
 
 		// assert download works
-		buf := bytes.NewBuffer(nil)
-		if err := s.Download(context.Background(), buf, obj); err != nil {
+		got, err := readAll(s.Download(context.Background(), obj))
+		if err != nil {
 			t.Fatalf("object %d: failed to download: %v", i, err)
 		}
-		if !bytes.Equal(buf.Bytes(), datas[i]) {
+		if !bytes.Equal(got, datas[i]) {
 			t.Fatalf("object %d: data mismatch", i)
 		}
 	}
@@ -135,16 +135,16 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	buf := bytes.NewBuffer(nil)
-	if err := s.Download(context.Background(), buf, objects[0]); err != nil {
+	got, err := readAll(s.Download(context.Background(), objects[0]))
+	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), dataL) {
+	} else if !bytes.Equal(got, dataL) {
 		t.Fatal("large object: data mismatch")
 	}
-	buf.Reset()
-	if err := s.Download(context.Background(), buf, objects[1]); err != nil {
+	got, err = readAll(s.Download(context.Background(), objects[1]))
+	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), dataS) {
+	} else if !bytes.Equal(got, dataS) {
 		t.Fatal("small object: data mismatch")
 	}
 
@@ -188,16 +188,16 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	buf.Reset()
-	if err := s.Download(context.Background(), buf, objects[0]); err != nil {
+	got, err = readAll(s.Download(context.Background(), objects[0]))
+	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), dataS) {
+	} else if !bytes.Equal(got, dataS) {
 		t.Fatal("small object: data mismatch")
 	}
-	buf.Reset()
-	if err := s.Download(context.Background(), buf, objects[1]); err != nil {
+	got, err = readAll(s.Download(context.Background(), objects[1]))
+	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), dataL) {
+	} else if !bytes.Equal(got, dataL) {
 		t.Fatal("large object: data mismatch")
 	}
 

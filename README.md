@@ -78,7 +78,13 @@ if err := client.PinObject(ctx, obj); err != nil {
 out, _ := os.Create("path/to/dst.dat")
 defer out.Close()
 
-if err := client.Download(ctx, out, obj); err != nil {
+rc, err := client.Download(ctx, obj)
+if err != nil {
+	log.Fatal("download failed:", err)
+}
+defer rc.Close()
+
+if _, err := io.Copy(out, rc); err != nil {
 	log.Fatal("download failed:", err)
 }
 ```
@@ -175,7 +181,13 @@ if err != nil {
 
 // anyone with the URL can download the object
 var buf bytes.Buffer
-if err := client.DownloadSharedObject(ctx, &buf, url); err != nil {
+rc, err := client.DownloadSharedObject(ctx, url)
+if err != nil {
+	log.Fatal("failed to download shared object:", err)
+}
+defer rc.Close()
+
+if _, err := io.Copy(&buf, rc); err != nil {
 	log.Fatal("failed to download shared object:", err)
 }
 ```
