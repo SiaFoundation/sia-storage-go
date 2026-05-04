@@ -755,7 +755,7 @@ func WithDownloadInflight(maxInflight int) DownloadOption {
 
 // WithUploadProgress sets a callback that is invoked for each shard that
 // completes uploading successfully. Callers should keep the callback short or
-// hand off work to a goroutine.
+// hand off work to a goroutine. The callback may be called concurrently.
 func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 	return func(uo *uploadOption) {
 		uo.onProgress = fn
@@ -764,7 +764,7 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 
 // WithDownloadProgress sets a callback that is invoked for each shard that
 // completes downloading successfully. Callers should keep the callback short or
-// hand off work to a goroutine.
+// hand off work to a goroutine. The callback may be called concurrently.
 func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
 	return func(do *downloadOption) {
 		do.onProgress = fn
