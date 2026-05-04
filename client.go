@@ -762,9 +762,11 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 	}
 }
 
-// WithDownloadProgress sets a callback that is invoked for each shard that
-// completes downloading successfully. Callers should keep the callback short or
-// hand off work to a goroutine. The callback may be called concurrently.
+// WithDownloadProgress sets a callback that is invoked for shard downloads
+// that complete successfully before the chunk download finishes, i.e. for up
+// to MinShards successful shard downloads per chunk. Callers should keep the
+// callback short or hand off work to a goroutine. The callback may be called
+// concurrently.
 func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
 	return func(do *downloadOption) {
 		do.onProgress = fn
