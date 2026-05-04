@@ -121,7 +121,7 @@ func TestChunkIter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ci := newChunkIter(tt.slabs, tt.offset, tt.length)
 			var chunks []slabs.SlabSlice
-			for c, ok := ci.next(); ok; c, ok = ci.next() {
+			for c, _, ok := ci.next(); ok; c, _, ok = ci.next() {
 				chunks = append(chunks, c)
 			}
 			check(t, chunks, tt.length)

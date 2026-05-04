@@ -60,6 +60,17 @@ type (
 		maxInflight int
 		offset      uint64
 		length      uint64
+		onProgress  func(ShardProgress)
+	}
+
+	// A ShardProgress reports the result of a successfully completed
+	// shard upload or download.
+	ShardProgress struct {
+		HostKey    types.PublicKey
+		SlabIndex  int
+		ShardIndex int
+		ShardSize  uint64
+		Elapsed    time.Duration
 	}
 
 	// An UploadOption configures the upload behavior
@@ -92,7 +103,7 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout time.Duration) ([][]byte, error) {
+func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex int, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -130,9 +141,11 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 
 	// helper to launch download
 	type result struct {
-		index int
-		buf   []byte
-		err   error
+		index   int
+		buf     []byte
+		err     error
+		hostKey types.PublicKey
+		elapsed time.Duration
 	}
 	responseCh := make(chan result, len(slab.Sectors))
 	var outstanding int
@@ -142,11 +155,18 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 			dlCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
+			start := time.Now()
 			_, err := s.hosts.ReadSector(dlCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
 			select {
 			case <-ctx.Done():
 				return
-			case responseCh <- result{index: d.index, buf: buf.Bytes(), err: err}:
+			case responseCh <- result{
+				index:   d.index,
+				buf:     buf.Bytes(),
+				err:     err,
+				hostKey: d.sector.HostKey,
+				elapsed: time.Since(start),
+			}:
 			}
 		})
 	}
@@ -171,6 +191,15 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, timeout ti
 				// successful download
 				shards[res.index] = res.buf
 				successful++
+				if successful <= int(slab.MinShards) && onProgress != nil {
+					onProgress(ShardProgress{
+						HostKey:    res.hostKey,
+						SlabIndex:  slabIndex,
+						ShardIndex: res.index,
+						ShardSize:  uint64(len(res.buf)),
+						Elapsed:    res.elapsed,
+					})
+				}
 				if successful >= int(slab.MinShards) {
 					// enough shards downloaded
 					return shards, nil
@@ -257,7 +286,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 
 	// start uploading slabs
 	slabsCh := make(chan slabUpload, concurrentSlabUploads)
-	go s.uploadSlabs(ctx, slabsCh, r, enc, int(uo.dataShards), int(uo.parityShards), uo.maxInflight)
+	go s.uploadSlabs(ctx, slabsCh, r, enc, int(uo.dataShards), int(uo.parityShards), uo.maxInflight, uo.onProgress)
 
 	// collect uploaded slabs in a temporary variable to avoid modifying the
 	// object on error and to sort the slabs by index
@@ -329,7 +358,7 @@ func (s *SDK) Download(ctx context.Context, w io.Writer, obj Object, opts ...Dow
 	}
 	w = decrypt((*[32]byte)(obj.dataKey), w, uint64(do.offset))
 
-	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.slabs, do.offset, do.length)
+	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.slabs, do.offset, do.length, do.onProgress)
 }
 
 // DownloadSharedObject downloads a shared object from a shared URL
@@ -352,7 +381,7 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, w io.Writer, sharedURL s
 	// decrypt stream using the object's master key
 	w = decrypt((*[32]byte)(encryptionKey), w, uint64(do.offset))
 
-	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.Slabs, do.offset, do.length)
+	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.Slabs, do.offset, do.length, do.onProgress)
 }
 
 func defaultDownloadOption(maxLength uint64) downloadOption {
@@ -434,7 +463,7 @@ func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	return ci
 }
 
-func (ci *chunkIter) next() (slabs.SlabSlice, bool) {
+func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 	for ci.remaining > 0 && ci.slabIdx < len(ci.slabs) {
 		slab := ci.slabs[ci.slabIdx]
 		available := uint64(slab.Length) - ci.offset
@@ -447,15 +476,16 @@ func (ci *chunkIter) next() (slabs.SlabSlice, bool) {
 		chunk := slab
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
+		slabIdx := ci.slabIdx
 		ci.offset += chunkLen
 		if ci.offset >= uint64(slab.Length) {
 			ci.offset = 0
 			ci.slabIdx++
 		}
 		ci.remaining -= chunkLen
-		return chunk, true
+		return chunk, slabIdx, true
 	}
-	return slabs.SlabSlice{}, false
+	return slabs.SlabSlice{}, 0, false
 }
 
 type recoveredChunk struct {
@@ -464,8 +494,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, hostTimeout time.Duration) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, hostTimeout)
+func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex int, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, chunk, slabIndex, hostTimeout, onProgress)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -499,7 +529,7 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, hostTimeo
 	}, nil
 }
 
-func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64) error {
+func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if maxInflight <= 0 {
@@ -510,11 +540,11 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	bw := bufio.NewWriterSize(w, 1<<16)
 
 	// recover first chunk synchronously for fast TTFB
-	chunk, ok := chunks.next()
+	chunk, slabIdx, ok := chunks.next()
 	if !ok {
 		return bw.Flush()
 	}
-	rc, err := s.recoverChunk(ctx, chunk, hostTimeout)
+	rc, err := s.recoverChunk(ctx, chunk, slabIdx, hostTimeout, onProgress)
 	if err != nil {
 		return err
 	}
@@ -523,8 +553,9 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	}
 
 	type chunkWork struct {
-		index int
-		chunk slabs.SlabSlice
+		index     int
+		slabIndex int
+		chunk     slabs.SlabSlice
 	}
 	type chunkResult struct {
 		index int
@@ -540,7 +571,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	for range maxInflight {
 		wg.Go(func() {
 			for w := range workCh {
-				rc, err := s.recoverChunk(ctx, w.chunk, hostTimeout)
+				rc, err := s.recoverChunk(ctx, w.chunk, w.slabIndex, hostTimeout, onProgress)
 				select {
 				case resultCh <- chunkResult{index: w.index, recoveredChunk: rc, err: err}:
 				case <-ctx.Done():
@@ -558,12 +589,12 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			close(resultCh)
 		}()
 		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, ok := chunks.next()
+			chunk, slabIdx, ok := chunks.next()
 			if !ok {
 				return
 			}
 			select {
-			case workCh <- chunkWork{index: chunkIdx, chunk: chunk}:
+			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, chunk: chunk}:
 			case <-ctx.Done():
 				return
 			}
@@ -719,6 +750,24 @@ func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 func WithDownloadInflight(maxInflight int) DownloadOption {
 	return func(do *downloadOption) {
 		do.maxInflight = maxInflight
+	}
+}
+
+// WithUploadProgress sets a callback that is invoked for each shard that
+// completes uploading successfully. Callers should keep the callback short or
+// hand off work to a goroutine.
+func WithUploadProgress(fn func(ShardProgress)) UploadOption {
+	return func(uo *uploadOption) {
+		uo.onProgress = fn
+	}
+}
+
+// WithDownloadProgress sets a callback that is invoked for each shard that
+// completes downloading successfully. Callers should keep the callback short or
+// hand off work to a goroutine.
+func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
+	return func(do *downloadOption) {
+		do.onProgress = fn
 	}
 }
 
