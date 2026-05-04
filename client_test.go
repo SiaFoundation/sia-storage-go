@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -292,6 +293,68 @@ func TestDownload(t *testing.T) {
 			t.Fatal(err)
 		} else if !bytes.Equal(buf.Bytes(), data) {
 			t.Fatal("data mismatch")
+		}
+	})
+}
+
+func TestProgressCallbacks(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	dialer := newMockDialer(30)
+	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
+	defer s.Close()
+
+	const dataShards, parityShards = 10, 20
+	totalShards := dataShards + parityShards
+	slabSize := uint64(proto.SectorSize) * dataShards
+	numSlabs := 3
+	data := frand.Bytes(int(slabSize) * numSlabs)
+	obj := NewEmptyObject()
+
+	t.Run("upload", func(t *testing.T) {
+		var mu sync.Mutex
+		seen := make(map[[2]int]bool)
+		cb := func(p ShardProgress) {
+			mu.Lock()
+			defer mu.Unlock()
+			key := [2]int{p.SlabIndex, p.ShardIndex}
+			if seen[key] {
+				t.Errorf("duplicate upload callback for slab %d, shard %d", p.SlabIndex, p.ShardIndex)
+			}
+			if p.ShardSize != proto.SectorSize {
+				t.Errorf("expected ShardSize %d, got %d", proto.SectorSize, p.ShardSize)
+			}
+			seen[key] = true
+		}
+		if err := s.Upload(t.Context(), &obj, bytes.NewReader(data), WithUploadProgress(cb)); err != nil {
+			t.Fatal(err)
+		}
+		if expected := totalShards * numSlabs; len(seen) != expected {
+			t.Fatalf("expected %d upload callbacks, got %d", expected, len(seen))
+		}
+	})
+
+	t.Run("download", func(t *testing.T) {
+		var mu sync.Mutex
+		var count int
+		cb := func(p ShardProgress) {
+			mu.Lock()
+			defer mu.Unlock()
+			if p.SlabIndex >= numSlabs {
+				t.Errorf("invalid slab index %d", p.SlabIndex)
+			}
+			if p.ShardIndex >= totalShards {
+				t.Errorf("invalid shard index %d", p.ShardIndex)
+			}
+			count++
+		}
+		buf := bytes.NewBuffer(nil)
+		if err := s.Download(t.Context(), buf, obj, WithDownloadProgress(cb)); err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(buf.Bytes(), data) {
+			t.Fatal("data mismatch")
+		}
+		if expected := int(slabSize) / chunkSize * dataShards * numSlabs; count != expected {
+			t.Fatalf("expected %d download callbacks, got %d", expected, count)
 		}
 	})
 }
