@@ -737,6 +737,15 @@ func WithUploadInflight(maxInflight int) UploadOption {
 	}
 }
 
+// WithUploadProgress sets a callback that is invoked for each shard that
+// completes uploading successfully. Callers should keep the callback short or
+// hand off work to a goroutine. The callback may be called concurrently.
+func WithUploadProgress(fn func(ShardProgress)) UploadOption {
+	return func(uo *uploadOption) {
+		uo.onProgress = fn
+	}
+}
+
 // WithDownloadHostTimeout sets the timeout for reading sectors
 // from individual hosts. The default is 60 seconds.
 func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
@@ -750,15 +759,6 @@ func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 func WithDownloadInflight(maxInflight int) DownloadOption {
 	return func(do *downloadOption) {
 		do.maxInflight = maxInflight
-	}
-}
-
-// WithUploadProgress sets a callback that is invoked for each shard that
-// completes uploading successfully. Callers should keep the callback short or
-// hand off work to a goroutine. The callback may be called concurrently.
-func WithUploadProgress(fn func(ShardProgress)) UploadOption {
-	return func(uo *uploadOption) {
-		uo.onProgress = fn
 	}
 }
 
