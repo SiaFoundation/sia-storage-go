@@ -119,6 +119,42 @@ func NewEmptyObject() Object {
 	}
 }
 
+// ObjectEvent represents a change to an object. If the object was deleted,
+// Deleted is true and Object is nil.
+type ObjectEvent struct {
+	Key       types.Hash256
+	Deleted   bool
+	UpdatedAt time.Time
+	Object    *Object
+}
+
+// ObjectEvents returns object events from the indexer, starting from the
+// given cursor, up to the given limit. Unlike ListObjects, it preserves
+// deletion events.
+func (s *SDK) ObjectEvents(ctx context.Context, cursor slabs.Cursor, limit int) ([]ObjectEvent, error) {
+	raw, err := s.app.ListObjects(ctx, s.appKey, cursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list object events: %w", err)
+	}
+	events := make([]ObjectEvent, len(raw))
+	for i, ev := range raw {
+		events[i] = ObjectEvent{
+			Key:       ev.Key,
+			Deleted:   ev.Deleted,
+			UpdatedAt: ev.UpdatedAt,
+		}
+		if ev.Object != nil {
+			so := SealedObject{*ev.Object}
+			obj, err := so.Open(s.appKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unseal object: %w", err)
+			}
+			events[i].Object = &obj
+		}
+	}
+	return events, nil
+}
+
 // Object retrieves the object with the given key.
 func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, error) {
 	lo, err := s.app.Object(ctx, s.appKey, objectKey)
@@ -127,27 +163,6 @@ func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, erro
 	}
 	so := SealedObject{lo}
 	return so.Open(s.appKey)
-}
-
-// ListObjects lists objects, starting from the given cursor, up to the given limit.
-func (s *SDK) ListObjects(ctx context.Context, cursor slabs.Cursor, limit int) ([]Object, error) {
-	los, err := s.app.ListObjects(ctx, s.appKey, cursor, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list locked objects: %w", err)
-	}
-	objs := make([]Object, 0, len(los))
-	for _, lo := range los {
-		if lo.Deleted {
-			continue
-		}
-		so := SealedObject{*lo.Object}
-		obj, err := so.Open(s.appKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unlock object: %w", err)
-		}
-		objs = append(objs, obj)
-	}
-	return objs, nil
 }
 
 // CreateSharedObjectURL creates a URL that can be used to share the object

@@ -104,8 +104,8 @@ func TestConnect(t *testing.T) {
 	appKey1 := client.AppKey()
 
 	// verify the key can be used to access resources owned by the app
-	if _, err := client.ListObjects(t.Context(), slabs.Cursor{}, 10); err != nil {
-		t.Fatal("failed to list objects with connected SDK:", err)
+	if _, err := client.ObjectEvents(t.Context(), slabs.Cursor{}, 10); err != nil {
+		t.Fatal("failed to fetch object events with connected SDK:", err)
 	} else if err := client.Close(); err != nil {
 		t.Fatal("failed to close SDK client:", err)
 	}
