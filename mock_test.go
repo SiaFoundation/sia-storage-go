@@ -25,6 +25,11 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
+type hostErr struct {
+	remaining int
+	err       error
+}
+
 type mockHostDialer struct {
 	provider *client.Provider
 	hosts    map[types.PublicKey]struct{}
@@ -35,8 +40,8 @@ type mockHostDialer struct {
 	sectorDelayMu sync.Mutex
 	sectorDelays  map[types.Hash256]time.Duration
 
-	flakyMu    sync.Mutex
-	flakyHosts map[types.PublicKey]int // fail first N writes
+	errHostsMu sync.Mutex
+	errHosts   map[types.PublicKey]hostErr
 
 	sectorsMu   sync.Mutex
 	hostSectors map[types.PublicKey]map[types.Hash256][]byte
@@ -113,6 +118,18 @@ func (m *mockHostDialer) sectorDelay(ctx context.Context, root types.Hash256) er
 	return context.Cause(ctx)
 }
 
+func (m *mockHostDialer) hostError(hostKey types.PublicKey) error {
+	m.errHostsMu.Lock()
+	defer m.errHostsMu.Unlock()
+
+	errs := m.errHosts[hostKey]
+	if errs.remaining <= 0 {
+		return nil
+	}
+	m.errHosts[hostKey] = hostErr{remaining: errs.remaining - 1, err: errs.err}
+	return errs.err
+}
+
 // WriteSector implements the [hostClient] interface.
 func (m *mockHostDialer) WriteSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, data []byte) (_ rhp.RPCWriteSectorResult, err error) {
 	if _, ok := m.hosts[hostKey]; !ok {
@@ -128,14 +145,10 @@ func (m *mockHostDialer) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 		}
 	}()
 
-	// simulate flaky hosts that fail their first N writes
-	m.flakyMu.Lock()
-	if m.flakyHosts[hostKey] > 0 {
-		m.flakyHosts[hostKey]--
-		m.flakyMu.Unlock()
-		return rhp.RPCWriteSectorResult{}, context.DeadlineExceeded
+	// simulate RPC error
+	if err := m.hostError(hostKey); err != nil {
+		return rhp.RPCWriteSectorResult{}, err
 	}
-	m.flakyMu.Unlock()
 
 	// simulate i/o
 	if err := m.delay(ctx, hostKey); err != nil {
@@ -223,23 +236,24 @@ func (m *mockHostDialer) SetSectorReadDelay(root types.Hash256, d time.Duration)
 	m.sectorDelays[root] = d
 }
 
-// SetFlakyHosts marks the first n hosts as flaky: each will fail its
-// first failCount write attempts before succeeding.
-func (m *mockHostDialer) SetFlakyHosts(t *testing.T, n, failCount int) {
+// SetErrHosts marks the first n hosts as failing: each will return
+// the given error for its first failCount write attempts.
+func (m *mockHostDialer) SetErrHosts(tb testing.TB, n, failCount int, err error) {
+	tb.Helper()
 	if n > len(m.hosts) {
-		t.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(m.hosts))
+		tb.Fatalf("cannot set %d error hosts: only %d hosts available", n, len(m.hosts))
 	}
 
-	m.flakyMu.Lock()
-	defer m.flakyMu.Unlock()
+	m.errHostsMu.Lock()
+	defer m.errHostsMu.Unlock()
 
 	var set int
-	for hostKey := range maps.Keys(m.hosts) {
+	for hostKey := range m.hosts {
 		if set >= n {
 			break
 		}
 		set++
-		m.flakyHosts[hostKey] = failCount
+		m.errHosts[hostKey] = hostErr{remaining: failCount, err: err}
 	}
 }
 
@@ -248,7 +262,7 @@ func newMockDialer(hosts int) *mockHostDialer {
 		hosts:        make(map[types.PublicKey]struct{}),
 		slowHosts:    make(map[types.PublicKey]time.Duration),
 		sectorDelays: make(map[types.Hash256]time.Duration),
-		flakyHosts:   make(map[types.PublicKey]int),
+		errHosts:     make(map[types.PublicKey]hostErr),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
 	}
 	m.provider = client.NewProvider(m)

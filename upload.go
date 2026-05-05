@@ -20,6 +20,16 @@ const (
 	// same time. If one slow host is holding up the upload of a slab, we read
 	// the next slab and start uploading that set of shards.
 	concurrentSlabUploads = 4
+
+	// maxHostAttempts is the maximum number of upload attempts per host
+	// before it is permanently removed from the upload queue. The attempt
+	// counter is tracked by the shared HostQueue across all shards, not
+	// per shard.
+	maxHostAttempts = 3
+
+	// uploadTimeout is the per-attempt timeout for uploading a single
+	// sector to a host.
+	uploadTimeout = 90 * time.Second
 )
 
 type (
@@ -156,14 +166,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	}
 }
 
-// uploadTimeout returns a progressive timeout based on the 1-based
-// attempt count from HostQueue.Next. The timeout starts at 15s and
-// increases by 5s per retry, capped at 120s.
-func uploadTimeout(attempts int) time.Duration {
-	seconds := min(10+5*max(attempts, 1), 120)
-	return time.Duration(seconds) * time.Second
-}
-
 func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.PrivateKey, queue chan shardUpload, maxInflight int) {
 	sema := make(chan struct{}, maxInflight)
 	for job := range queue {
@@ -183,8 +185,7 @@ func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.P
 					return
 				}
 
-				timeout := uploadTimeout(attempts)
-				root, err := uploadShard(ctx, client, accountKey, host, job.sector, timeout)
+				root, err := uploadShard(ctx, client, accountKey, host, job.sector, uploadTimeout)
 				if err == nil {
 					job.shards <- shard{
 						index: job.index,
@@ -194,8 +195,8 @@ func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.P
 					return
 				}
 
-				// requeue timed out hosts so other shards can use them
-				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				// requeue failed hosts so other shards can try them
+				if ctx.Err() == nil && attempts < maxHostAttempts {
 					job.hosts.Retry(host)
 				}
 			}
