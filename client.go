@@ -329,7 +329,7 @@ func (s *SDK) Download(ctx context.Context, obj Object, opts ...DownloadOption) 
 		return nil, fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
 	}
 
-	return s.downloadReader(ctx, (*[32]byte)(obj.dataKey), obj.slabs, do), nil
+	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do), nil
 }
 
 // DownloadSharedObject returns an [io.ReadCloser] streaming a shared object's
@@ -350,35 +350,37 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	return s.downloadReader(ctx, (*[32]byte)(encryptionKey), obj.Slabs, do), nil
+	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do), nil
 }
 
 // downloadReader spawns a goroutine that runs downloadSlabs into the write end
 // of a pipe, decrypting on the fly. The returned reader, when closed, cancels
 // the download and unblocks the goroutine.
-func (s *SDK) downloadReader(ctx context.Context, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
-	ctx, cancel := context.WithCancel(ctx)
+func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
 	pr, pw := io.Pipe()
 	sw := decrypt(key, pw, uint64(do.offset))
 
+	done := make(chan struct{})
 	go func() {
-		err := s.downloadSlabs(ctx, sw, do.maxInflight, do.hostTimeout, ss, do.offset, do.length)
+		defer close(done)
+		err := s.downloadSlabs(context.Background(), sw, do.maxInflight, do.hostTimeout, ss, do.offset, do.length)
 		pw.CloseWithError(err)
 	}()
 
-	return &downloadStream{pr: pr, cancel: cancel}
+	return &downloadStream{pr: pr, done: done}
 }
 
 type downloadStream struct {
-	pr     *io.PipeReader
-	cancel context.CancelFunc
+	pr   *io.PipeReader
+	done chan struct{}
 }
 
 func (d *downloadStream) Read(p []byte) (int, error) { return d.pr.Read(p) }
 
 func (d *downloadStream) Close() error {
-	d.cancel()
-	return d.pr.Close()
+	err := d.pr.Close()
+	<-d.done
+	return err
 }
 
 func defaultDownloadOption(maxLength uint64) downloadOption {
