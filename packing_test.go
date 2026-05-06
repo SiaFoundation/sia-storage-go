@@ -86,7 +86,7 @@ func TestUploadPacked(t *testing.T) {
 		seen[objects[i].ID()] = true
 
 		// assert download works
-		got, err := readAll(s.Download(context.Background(), obj))
+		got, err := readAll(s.Download(obj))
 		if err != nil {
 			t.Fatalf("object %d: failed to download: %v", i, err)
 		}
@@ -135,13 +135,13 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	got, err := readAll(s.Download(context.Background(), objects[0]))
+	got, err := readAll(s.Download(objects[0]))
 	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataL) {
 		t.Fatal("large object: data mismatch")
 	}
-	got, err = readAll(s.Download(context.Background(), objects[1]))
+	got, err = readAll(s.Download(objects[1]))
 	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataS) {
@@ -188,13 +188,13 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	got, err = readAll(s.Download(context.Background(), objects[0]))
+	got, err = readAll(s.Download(objects[0]))
 	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataS) {
 		t.Fatal("small object: data mismatch")
 	}
-	got, err = readAll(s.Download(context.Background(), objects[1]))
+	got, err = readAll(s.Download(objects[1]))
 	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataL) {

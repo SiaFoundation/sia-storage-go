@@ -315,7 +315,7 @@ top:
 // Download returns an [io.ReadCloser] streaming the object's data. Closing the
 // reader cancels the underlying download. Callers must always Close the
 // returned reader to release resources.
-func (s *SDK) Download(ctx context.Context, obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
+func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do := defaultDownloadOption(obj.Size())
 	for _, opt := range opts {
 		opt(&do)

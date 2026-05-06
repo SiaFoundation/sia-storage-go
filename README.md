@@ -78,7 +78,7 @@ if err := client.PinObject(ctx, obj); err != nil {
 out, _ := os.Create("path/to/dst.dat")
 defer out.Close()
 
-rc, err := client.Download(ctx, obj)
+rc, err := client.Download(obj)
 if err != nil {
 	log.Fatal("download failed:", err)
 }

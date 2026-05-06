@@ -58,7 +58,7 @@ func TestRoundtripCount(t *testing.T) {
 
 	buf := bytes.NewBuffer(nil)
 	cw := &countWriter{w: buf}
-	rc, err := s.Download(context.Background(), obj)
+	rc, err := s.Download(obj)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestResumableUpload(t *testing.T) {
 		}
 	}
 
-	got, err := readAll(s.Download(t.Context(), obj))
+	got, err := readAll(s.Download(obj))
 	if err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, data) {
@@ -202,7 +202,7 @@ func TestDownload(t *testing.T) {
 	}
 
 	t.Run("full", func(t *testing.T) {
-		got, err := readAll(s.Download(context.Background(), obj))
+		got, err := readAll(s.Download(obj))
 		if err != nil {
 			t.Fatalf("failed to download: %v", err)
 		} else if !bytes.Equal(got, data) {
@@ -240,7 +240,7 @@ func TestDownload(t *testing.T) {
 		}
 
 		for _, c := range cases {
-			got, err := readAll(s.Download(context.Background(), obj, WithDownloadRange(c[0], c[1])))
+			got, err := readAll(s.Download(obj, WithDownloadRange(c[0], c[1])))
 			if err != nil {
 				t.Fatalf("failed to download: %v", err)
 			} else if !bytes.Equal(got, data[c[0]:c[0]+c[1]]) {
@@ -256,7 +256,7 @@ func TestDownload(t *testing.T) {
 		}
 
 		// ranges that extend past EOF should be clamped.
-		got, err := readAll(s.Download(context.Background(), obj, WithDownloadRange(dataSize-10, 100)))
+		got, err := readAll(s.Download(obj, WithDownloadRange(dataSize-10, 100)))
 		if err != nil {
 			t.Fatalf("failed to clamp range to EOF: %v", err)
 		} else if !bytes.Equal(got, data[dataSize-10:]) {
@@ -270,7 +270,7 @@ func TestDownload(t *testing.T) {
 		}
 
 		// offsets at or beyond EOF should return no data.
-		got, err = readAll(s.Download(context.Background(), obj, WithDownloadRange(dataSize, 1)))
+		got, err = readAll(s.Download(obj, WithDownloadRange(dataSize, 1)))
 		if err != nil {
 			t.Fatalf("expected empty EOF download, got %v", err)
 		} else if len(got) != 0 {
@@ -288,7 +288,7 @@ func TestDownload(t *testing.T) {
 		dialer.ResetSlowHosts()
 		// make enough hosts timeout to fail to download
 		dialer.SetSlowHosts(t, 21, time.Second)
-		_, err := readAll(s.Download(context.Background(), obj, WithDownloadHostTimeout(200*time.Millisecond)))
+		_, err := readAll(s.Download(obj, WithDownloadHostTimeout(200*time.Millisecond)))
 		if !errors.Is(err, ErrNotEnoughShards) {
 			t.Fatalf("expected ErrNotEnoughShards, got %v", err)
 		}
@@ -298,7 +298,7 @@ func TestDownload(t *testing.T) {
 		dialer.ResetSlowHosts()
 		// make most of the hosts timeout
 		dialer.SetSlowHosts(t, 20, time.Second)
-		got, err := readAll(s.Download(context.Background(), obj, WithDownloadHostTimeout(200*time.Millisecond)))
+		got, err := readAll(s.Download(obj, WithDownloadHostTimeout(200*time.Millisecond)))
 		if err != nil {
 			t.Fatal(err)
 		} else if !bytes.Equal(got, data) {
@@ -322,7 +322,7 @@ func TestE2E(t *testing.T) {
 		} else if _, err := s.Object(t.Context(), obj.ID()); err != nil {
 			t.Fatalf("failed to get object: %v", err)
 		}
-		got, err := readAll(s.Download(t.Context(), obj))
+		got, err := readAll(s.Download(obj))
 		if err != nil {
 			t.Fatalf("failed to download: %v", err)
 		} else if !bytes.Equal(got, data) {
@@ -475,7 +475,7 @@ func BenchmarkDownload(b *testing.B) {
 			b.ResetTimer()
 			for b.Loop() {
 				buf.Reset()
-				rc, err := s.Download(context.Background(), obj, WithDownloadInflight(inflight))
+				rc, err := s.Download(obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}

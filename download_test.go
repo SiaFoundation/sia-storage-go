@@ -32,7 +32,7 @@ func TestOutOfOrderDownload(t *testing.T) {
 		}
 	}
 
-	got, err := readAll(s.Download(t.Context(), obj, WithDownloadInflight(40)))
+	got, err := readAll(s.Download(obj, WithDownloadInflight(40)))
 	if err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, data) {
@@ -160,7 +160,7 @@ func TestSlabRecovery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := readAll(s.Download(t.Context(), obj, WithDownloadRange(tt.offset, tt.length)))
+			got, err := readAll(s.Download(obj, WithDownloadRange(tt.offset, tt.length)))
 			if err != nil {
 				t.Fatalf("download failed: %v", err)
 			}
