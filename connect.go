@@ -16,6 +16,33 @@ import (
 	"lukechampine.com/frand"
 )
 
+var (
+	// ErrBuilderConsumed is returned when a [Builder] method is called
+	// after the builder has already created an SDK. A builder is
+	// single-use; create a new one to start another connection.
+	ErrBuilderConsumed = errors.New("builder already consumed")
+
+	// ErrNoConnectionRequest is returned by [Builder.WaitForApproval]
+	// when called before [Builder.RequestConnection].
+	ErrNoConnectionRequest = errors.New("no connection request")
+
+	// ErrRequestExpired is returned by [Builder.WaitForApproval]
+	// when the connection request has expired.
+	ErrRequestExpired = errors.New("connection request expired")
+
+	// ErrNotApproved is returned by [Builder.Register] when called
+	// before [Builder.WaitForApproval] has successfully completed.
+	ErrNotApproved = errors.New("connection not approved")
+
+	// ErrUnauthorized is returned by [Builder.SDK] when the supplied
+	// app key is not authorized by the indexer.
+	ErrUnauthorized = errors.New("app key is not authorized")
+
+	// ErrUserRejected is returned by [Builder.WaitForApproval] when
+	// the user rejects the connection request.
+	ErrUserRejected = app.ErrUserRejected
+)
+
 type (
 	// AppMetadata contains metadata about an application.
 	// This metadata is provided during app registration
@@ -41,6 +68,9 @@ type (
 
 // A Builder helps connect an application to an indexer
 // and initialize an SDK instance.
+//
+// A Builder is single-use: once it has created an SDK, any further calls
+// on the same Builder return [ErrBuilderConsumed].
 type Builder struct {
 	ephemeralKey types.PrivateKey
 	client       *app.Client
@@ -58,49 +88,64 @@ type Builder struct {
 	mockHostCache *hostCache
 }
 
-// consume marks the builder as consumed, preventing further use. It panics if the builder has already been consumed.
-func (b *Builder) consume() {
+// consume marks the builder as consumed, preventing further use. It returns
+// [ErrBuilderConsumed] if the builder has already been consumed.
+func (b *Builder) consume() error {
 	if !b.consumed.CompareAndSwap(false, true) {
-		panic("Builder can only be used once")
+		return ErrBuilderConsumed
 	}
+	return nil
 }
 
-// checkConsumed panics if the builder has already been consumed.
-func (b *Builder) checkConsumed() {
+// checkConsumed returns [ErrBuilderConsumed] if the builder has already been consumed.
+func (b *Builder) checkConsumed() error {
 	if b.consumed.Load() {
-		panic("Builder can only be used once")
+		return ErrBuilderConsumed
 	}
+	return nil
 }
 
 // WaitForApproval waits for the user to approve the app connection request.
-// The user must visit the response URL returned by [Builder.Connect] to approve
-// the request. It will block until the request is either approved or denied.
+// The user must visit the response URL returned by [Builder.RequestConnection]
+// to approve the request. It blocks until the request is approved, denied, or
+// the context is cancelled.
 //
-// Panics if the builder has already created an SDK instance.
-func (b *Builder) WaitForApproval(ctx context.Context) (bool, error) {
-	b.checkConsumed()
-
-	if b.registerResp == nil {
-		return false, fmt.Errorf("no connection request to wait for approval")
-	} else if time.Until(b.registerResp.Expiration) <= 0 {
-		return false, fmt.Errorf("request expired")
+// It returns [ErrUserRejected] if the user denied the request and
+// [ErrBuilderConsumed] if the builder has already created an SDK instance.
+// Callers can branch on these using [errors.Is].
+func (b *Builder) WaitForApproval(ctx context.Context) error {
+	if err := b.checkConsumed(); err != nil {
+		return err
 	}
 
-	ctx, cancel := context.WithDeadline(ctx, b.registerResp.Expiration)
+	if b.registerResp == nil {
+		return ErrNoConnectionRequest
+	} else if time.Until(b.registerResp.Expiration) <= 0 {
+		return ErrRequestExpired
+	}
+
+	ctx, cancel := context.WithDeadlineCause(ctx, b.registerResp.Expiration, ErrRequestExpired)
 	defer cancel()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-time.After(time.Second):
-			if status, err := b.client.RequestStatus(ctx, b.ephemeralKey, b.registerResp.StatusURL); errors.Is(err, app.ErrUserRejected) {
-				return false, nil
+			return context.Cause(ctx)
+		case <-ticker.C:
+			status, err := b.client.RequestStatus(ctx, b.ephemeralKey, b.registerResp.StatusURL)
+			if errors.Is(err, ErrUserRejected) {
+				return ErrUserRejected
 			} else if err != nil {
-				return false, fmt.Errorf("failed to check request status: %w", err)
+				if cause := context.Cause(ctx); cause != nil {
+					return cause
+				}
+				return fmt.Errorf("failed to check request status: %w", err)
 			} else if status.Approved {
 				b.sharedSecret = status.UserSecret
-				return true, nil
+				return nil
 			}
 		}
 	}
@@ -113,12 +158,16 @@ func (b *Builder) WaitForApproval(ctx context.Context) (bool, error) {
 // shared with anyone else. It can be regenerated using the same app
 // ID, user account, and seed phrase.
 //
-// Panics if the builder has already created an SDK instance.
+// It returns [ErrBuilderConsumed] if the builder has already created an SDK
+// instance and [ErrNotApproved] if [Builder.WaitForApproval] has not yet
+// returned successfully.
 func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
-	b.checkConsumed()
+	if err := b.checkConsumed(); err != nil {
+		return nil, err
+	}
 
 	if b.sharedSecret == (types.Hash256{}) {
-		return nil, fmt.Errorf("app not connected")
+		return nil, ErrNotApproved
 	}
 
 	appKey, err := deriveAppKey(mnemonic, b.request.AppID, b.sharedSecret)
@@ -139,9 +188,12 @@ func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
 // It returns a response URL that the user must visit to approve the request.
 // The app should display the response URL to the user.
 //
-// // Panics if the builder has already created an SDK instance.
+// It returns [ErrBuilderConsumed] if the builder has already created an SDK
+// instance.
 func (b *Builder) RequestConnection(ctx context.Context) (string, error) {
-	b.checkConsumed()
+	if err := b.checkConsumed(); err != nil {
+		return "", err
+	}
 	resp, err := b.client.RequestAppConnection(ctx, b.ephemeralKey, b.request)
 	if err != nil {
 		return "", fmt.Errorf("failed to request app connection: %w", err)
@@ -153,12 +205,18 @@ func (b *Builder) RequestConnection(ctx context.Context) (string, error) {
 // SDK creates a new SDK instance using the given application key. If the
 // key is not authorized, an error is returned.
 //
-// Panics if the builder has already created an SDK instance.
+// It returns [ErrBuilderConsumed] if the builder has already created an SDK
+// instance and [ErrUnauthorized] if the app key is not authorized by the
+// indexer.
 func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
-	b.checkConsumed()
+	if err := b.checkConsumed(); err != nil {
+		return nil, err
+	}
 
 	if b.mockApp != nil {
-		b.consume()
+		if err := b.consume(); err != nil {
+			return nil, err
+		}
 		sdk := &SDK{
 			appKey:     appKey,
 			app:        b.mockApp,
@@ -176,14 +234,15 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 	if ok, err := b.client.CheckAppAuth(context.Background(), appKey); err != nil {
 		return nil, fmt.Errorf("failed to check app auth: %w", err)
 	} else if !ok {
-		return nil, fmt.Errorf("app key is not authorized")
+		return nil, ErrUnauthorized
 	}
 	sdk, err := initSDK(appKey, b.client, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize SDK: %w", err)
 	}
-
-	b.consume()
+	if err := b.consume(); err != nil {
+		return nil, err
+	}
 	return sdk, nil
 }
 
@@ -201,8 +260,8 @@ func deriveAppKey(mnemonic string, appID types.Hash256, sharedSecret types.Hash2
 
 // NewBuilder creates a new Builder for connecting applications to the indexer.
 //
-// A builder can only be used to create a single SDK instance. Attempting to
-// reuse a builder will result in a panic.
+// A builder can only be used to create a single SDK instance. Methods called
+// on a builder that has already created an SDK return [ErrBuilderConsumed].
 func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 	return &Builder{
 		ephemeralKey: types.GeneratePrivateKey(),
