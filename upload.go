@@ -64,7 +64,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	go runUploadWorkers(ctx, s.hosts, s.appKey, shardsCh, maxInflight)
 
 	// convenience variables
-	slabSize := dataShards * proto4.SectorSize
+	optimalDataSize := dataShards * proto4.SectorSize
 	totalShards := dataShards + parityShards
 
 	sendErr := func(err error) {
@@ -75,7 +75,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	}
 
 	// read slabs in a loop
-	buffer := make([]byte, slabSize)
+	buffer := make([]byte, optimalDataSize)
 	for i := 0; ctx.Err() == nil; i++ {
 		// every shard upload holds a reference to the host queue to
 		// ensure every shard is uploaded to a unique host

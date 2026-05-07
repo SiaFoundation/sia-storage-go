@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -27,8 +28,8 @@ func TestUploadPacked(t *testing.T) {
 
 	// assert remaining length
 	remaining := u.Remaining()
-	if remaining != u.SlabSize() {
-		t.Fatalf("expected remaining %d, got %d", u.SlabSize(), remaining)
+	if remaining != u.OptimalDataSize() {
+		t.Fatalf("expected remaining %d, got %d", u.OptimalDataSize(), remaining)
 	}
 
 	// prepare 3 objects
@@ -52,8 +53,8 @@ func TestUploadPacked(t *testing.T) {
 	// assert total and remaining length
 	if u.Length() != int64(total) {
 		t.Fatalf("expected total length %d, got %d", total, u.Length())
-	} else if rem := u.Remaining(); rem != u.SlabSize()-int64(total) {
-		t.Fatalf("expected remaining %d, got %d", u.SlabSize()-int64(total), rem)
+	} else if rem := u.Remaining(); rem != u.OptimalDataSize()-int64(total) {
+		t.Fatalf("expected remaining %d, got %d", u.OptimalDataSize()-int64(total), rem)
 	}
 
 	// finalize the upload
@@ -103,7 +104,7 @@ func TestUploadPacked(t *testing.T) {
 	defer u.Close()
 
 	// add objects that span multiple slabs
-	dataL := frand.Bytes(int(u.SlabSize()) + 1024)
+	dataL := frand.Bytes(int(u.OptimalDataSize()) + 1024)
 	dataS := frand.Bytes(512)
 	if _, err := u.Add(context.Background(), bytes.NewReader(dataL)); err != nil {
 		t.Fatalf("failed to add large object: %v", err)
@@ -130,7 +131,7 @@ func TestUploadPacked(t *testing.T) {
 	// assert second object has one slab with offset
 	if slabs := objects[1].Slabs(); len(slabs) != 1 {
 		t.Fatalf("expected 1 slab, got %d", len(objects[1].Slabs()))
-	} else if expectedOffset := uint32(len(dataL) % int(u.SlabSize())); slabs[0].Offset != expectedOffset {
+	} else if expectedOffset := uint32(len(dataL) % int(u.OptimalDataSize())); slabs[0].Offset != expectedOffset {
 		t.Fatalf("expected offset %d, got %d", expectedOffset, slabs[0].Offset)
 	}
 
@@ -262,6 +263,79 @@ func TestUploadPacked(t *testing.T) {
 		t.Fatalf("expected 0 objects, got %d", len(objects))
 	}
 
+	// assert packed uploads are recoverable on reader error, even when
+	// the dead padding pushes us across a slab boundary
+	u, err = s.UploadPacked()
+	if err != nil {
+		t.Fatalf("failed to create packed upload: %v", err)
+	}
+	defer u.Close()
+
+	optimalDataSize := u.OptimalDataSize()
+
+	// fill most of the first slab
+	goodData1 := frand.Bytes(int(optimalDataSize) - 1024)
+	if _, err := u.Add(t.Context(), bytes.NewReader(goodData1)); err != nil {
+		t.Fatal(err)
+	}
+	lengthBefore := u.Length()
+
+	// errored read that spills past the slab boundary
+	errRead := errors.New("read error")
+	badData := frand.Bytes(2048)
+	if _, err = u.Add(t.Context(), &errReader{data: badData, err: errRead}); !errors.Is(err, errRead) {
+		t.Fatalf("expected read error, got %v", err)
+	}
+
+	// length should have advanced by the partial bytes
+	if u.Length() != lengthBefore+int64(len(badData)) {
+		t.Fatalf("expected length %d, got %d", lengthBefore+int64(len(badData)), u.Length())
+	}
+
+	// add another good object; it lands in the second slab
+	goodData2 := frand.Bytes(4096)
+	if _, err := u.Add(t.Context(), bytes.NewReader(goodData2)); err != nil {
+		t.Fatalf("add after error: %v", err)
+	}
+
+	// finalize and verify both objects download correctly
+	objects, err = u.Finalize(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	} else if len(objects) != 2 {
+		t.Fatalf("expected 2 objects, got %d", len(objects))
+	}
+
+	buf.Reset()
+	if err := s.Download(t.Context(), buf, objects[0]); err != nil {
+		t.Fatalf("download object 0: %v", err)
+	} else if !bytes.Equal(buf.Bytes(), goodData1) {
+		t.Fatal("object 0: data mismatch")
+	}
+
+	buf.Reset()
+	if err := s.Download(t.Context(), buf, objects[1]); err != nil {
+		t.Fatalf("download object 1: %v", err)
+	} else if !bytes.Equal(buf.Bytes(), goodData2) {
+		t.Fatal("object 1: data mismatch")
+	}
+
+	// assert pipeline errors surface correctly through the closed pipe path
+	s2 := newTestSDK(t, appKey, newMockAppClient(), newMockDialer(5)) // not enough hosts for 30 shards
+	defer s2.Close()
+
+	u, err = s2.UploadPacked()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = u.Add(t.Context(), frand.Reader); err == nil {
+		t.Fatal("expected error")
+	} else if errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("got raw pipe error instead of upload error: %v", err)
+	}
+	u.Close()
+
 	// create a new packed upload
 	u, err = s.UploadPacked()
 	if err != nil {
@@ -274,4 +348,19 @@ func TestUploadPacked(t *testing.T) {
 	// close the upload - the race detector will catch any resource leaks here
 	// should there be any
 	u.Close()
+}
+
+// errReader delivers data on the first Read, then returns err.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
 }
