@@ -350,7 +350,7 @@ func TestUploadPacked(t *testing.T) {
 	u.Close()
 }
 
-// errReader delivers data on the first Read, then returns err.
+// errReader delivers the provided data, then returns err.
 type errReader struct {
 	data []byte
 	err  error

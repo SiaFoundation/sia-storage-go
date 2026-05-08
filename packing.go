@@ -113,7 +113,11 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 		// if the error came from the pipe, the writer was closed by finish
 		// or Finalize/Close; wait for the result which is imminent
 		if errors.Is(err, io.ErrClosedPipe) {
-			<-u.resultAvailCh
+			select {
+			case <-ctx.Done():
+				return 0, context.Cause(ctx)
+			case <-u.resultAvailCh:
+			}
 			if u.result.err != nil {
 				return 0, u.result.err
 			}
