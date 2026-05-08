@@ -636,9 +636,6 @@ func (s *SDK) refreshHosts(ctx context.Context, forceWarmup bool) error {
 	allHosts, err := s.fetchHosts(ctx)
 	if err != nil {
 		return err
-	} else if len(allHosts) == 0 {
-		s.log.Debug("no hosts found in indexer")
-		return nil
 	}
 
 	// count GFU hosts for logging
