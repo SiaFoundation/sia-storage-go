@@ -10,6 +10,7 @@ import (
 
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
+	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
 
@@ -84,10 +85,7 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 func TestObjectEvents(t *testing.T) {
 	const metadata = `{"foo":"bar"}`
 
-	appKey := types.GeneratePrivateKey()
-	mock := newMockAppClient()
-	dialer := newMockDialer(50)
-	s := newTestSDK(t, appKey, mock, dialer)
+	s, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
 	defer s.Close()
 
 	// no events initially

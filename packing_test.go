@@ -8,18 +8,17 @@ import (
 	"time"
 
 	"go.sia.tech/core/types"
+	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
 
 func TestUploadPacked(t *testing.T) {
 	// create SDK
-	appKey := types.GeneratePrivateKey()
-	dialer := newMockDialer(50)
-	s := newTestSDK(t, appKey, newMockAppClient(), dialer)
-	defer s.Close()
+	sdk, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
+	defer sdk.Close()
 
 	// create packed upload
-	u, err := s.UploadPacked()
+	u, err := sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -86,7 +85,7 @@ func TestUploadPacked(t *testing.T) {
 		seen[objects[i].ID()] = true
 
 		// assert download works
-		got, err := readAll(s.Download(obj))
+		got, err := readAll(sdk.Download(obj))
 		if err != nil {
 			t.Fatalf("object %d: failed to download: %v", i, err)
 		}
@@ -96,7 +95,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -135,13 +134,13 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	got, err := readAll(s.Download(objects[0]))
+	got, err := readAll(sdk.Download(objects[0]))
 	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataL) {
 		t.Fatal("large object: data mismatch")
 	}
-	got, err = readAll(s.Download(objects[1]))
+	got, err = readAll(sdk.Download(objects[1]))
 	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataS) {
@@ -149,7 +148,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -188,13 +187,13 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// assert downloads work
-	got, err = readAll(s.Download(objects[0]))
+	got, err = readAll(sdk.Download(objects[0]))
 	if err != nil {
 		t.Fatalf("small object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataS) {
 		t.Fatal("small object: data mismatch")
 	}
-	got, err = readAll(s.Download(objects[1]))
+	got, err = readAll(sdk.Download(objects[1]))
 	if err != nil {
 		t.Fatalf("large object: failed to download: %v", err)
 	} else if !bytes.Equal(got, dataL) {
@@ -202,7 +201,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -218,7 +217,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -248,7 +247,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -263,7 +262,7 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// create a new packed upload
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
