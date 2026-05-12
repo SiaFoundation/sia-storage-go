@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
-	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/client/v2"
 	"golang.org/x/crypto/chacha20"
@@ -98,15 +97,18 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 			return
 		}
 
+		// encode parity shards
+		if err := enc.Encode(slab.Shards); err != nil {
+			sendErr(fmt.Errorf("failed to encode slab %d shards: %w", i, err))
+			return
+		}
+
 		// generate a random encryption key
 		encryptionKey := frand.Entropy256()
 
-		// since data shards do not change during encoding, we can launch
-		// these ahead of time and not wait for encoding to finish first
+		// launch uploads for all shards
 		uploadsCh := make(chan shard, totalShards)
-		for shardIdx, data := range slab.Shards[:dataShards] {
-			sector := make([]byte, proto4.SectorSize)
-			copy(sector, data)
+		for shardIdx, data := range slab.Shards {
 			shardsCh <- shardUpload{
 				hosts:  queue,
 				shards: uploadsCh,
@@ -114,25 +116,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 				encryptionKey: encryptionKey,
 				slabIndex:     i,
 				index:         shardIdx,
-				sector:        sector,
-			}
-		}
-
-		// encode the shards
-		if err := enc.Encode(slab.Shards); err != nil {
-			sendErr(fmt.Errorf("failed to encode slab %d shards: %w", i, err))
-			return
-		}
-
-		// launch uploads for parity shards
-		for shardIdx, data := range slab.Shards[dataShards:] {
-			shardsCh <- shardUpload{
-				hosts:  queue,
-				shards: uploadsCh,
-
-				encryptionKey: encryptionKey,
-				slabIndex:     i,
-				index:         dataShards + shardIdx,
 				sector:        data,
 			}
 		}
