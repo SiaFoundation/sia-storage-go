@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -278,6 +277,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 		opt(&uo)
 	}
 
+	// validate erasure coding params
 	totalShards := int(uo.dataShards) + int(uo.parityShards)
 	if err := slabs.ValidateECParams(int(uo.dataShards), totalShards); err != nil {
 		return err
@@ -292,58 +292,47 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	}
 
 	// start uploading slabs
-	slabsCh := make(chan slabUpload, concurrentSlabUploads)
-	go s.uploadSlabs(ctx, slabsCh, r, enc, int(uo.dataShards), int(uo.parityShards), uo.maxInflight, uo.onProgress)
+	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	go s.uploadSlabs(ctx, slabsCh, r, enc, uo)
 
 	// collect uploaded slabs in a temporary variable to avoid modifying the
-	// object on error and to sort the slabs by index
+	// object on error
 	var uploaded []slabs.SlabSlice
-	var uploadedIndices []int
 
-top:
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case slab := <-slabsCh:
-			if errors.Is(slab.err, io.EOF) {
-				break top
-			} else if slab.err != nil {
-				return slab.err
-			}
+	for slab := range slabsCh {
+		if errors.Is(slab.err, io.EOF) {
+			break
+		} else if slab.err != nil {
+			return slab.err
+		}
 
-			totalShards := uo.dataShards + uo.parityShards
-			sectors := make([]slabs.PinnedSector, totalShards)
+		totalShards := uo.dataShards + uo.parityShards
+		sectors := make([]slabs.PinnedSector, totalShards)
 
-			// collect all shards
-			for n := totalShards; n > 0; n-- {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case shard := <-slab.uploadsCh:
-					if shard.err != nil {
-						return fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
-					}
-					sectors[shard.index] = slabs.PinnedSector{
-						HostKey: shard.host,
-						Root:    shard.root,
-					}
+		// collect all shards
+		for n := totalShards; n > 0; n-- {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case shard := <-slab.uploadsCh:
+				if shard.err != nil {
+					return fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
+				}
+				sectors[shard.index] = slabs.PinnedSector{
+					HostKey: shard.host,
+					Root:    shard.root,
 				}
 			}
-
-			uploaded = append(uploaded, slabs.SlabSlice{
-				EncryptionKey: slab.encryptionKey,
-				MinShards:     uint(uo.dataShards),
-				Sectors:       sectors,
-				Offset:        0,
-				Length:        slab.length,
-			})
-			uploadedIndices = append(uploadedIndices, slab.slabIndex)
 		}
+
+		uploaded = append(uploaded, slabs.SlabSlice{
+			EncryptionKey: slab.encryptionKey,
+			MinShards:     uint(uo.dataShards),
+			Sectors:       sectors,
+			Offset:        0,
+			Length:        slab.length,
+		})
 	}
-	sort.Slice(uploaded, func(i, j int) bool {
-		return uploadedIndices[i] < uploadedIndices[j] //nolint:gocritic
-	})
 	obj.slabs = append(obj.slabs, uploaded...)
 	return nil
 }
@@ -817,8 +806,8 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// uploadShard uploads a shard to a host
-func uploadShard(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
+// writeSector uploads a single sector to a host with the given timeout.
+func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	result, err := client.WriteSector(ctx, accountKey, hostKey, data)

@@ -269,9 +269,9 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	}
 
 	// upload slabs in background
-	slabCh := make(chan slabUpload, concurrentSlabUploads)
+	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
-		s.uploadSlabs(ctx, slabCh, reader, enc, int(u.dataShards), int(u.parityShards), uo.maxInflight, uo.onProgress)
+		s.uploadSlabs(ctx, slabCh, reader, enc, uo)
 		close(slabCh)
 	}()
 
