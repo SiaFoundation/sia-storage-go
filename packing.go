@@ -84,7 +84,6 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 
 	// spawn goroutine to interrupt io.Copy if context is cancelled
 	done := make(chan struct{})
-	defer close(done)
 	addCtx, cancel, err := u.tg.AddContext(ctx)
 	if err != nil {
 		return 0, err
@@ -101,6 +100,7 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 	// pipe data into writer
 	offset := u.totalWritten
 	n, err := io.Copy(u.writer, r)
+	close(done) // stop the cancellation goroutine before processing the result
 	u.totalWritten += n
 	if err != nil {
 		if errors.Is(err, io.ErrClosedPipe) {
