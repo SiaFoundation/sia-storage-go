@@ -775,17 +775,6 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	return nil
 }
 
-// stripedSplit splits data into striped data shards, which must have sufficient
-// capacity.
-func stripedSplit(data []byte, dataShards [][]byte) {
-	buf := bytes.NewBuffer(data)
-	for off := 0; buf.Len() > 0; off += proto4.LeafSize {
-		for _, shard := range dataShards {
-			copy(shard[off:], buf.Next(proto4.LeafSize))
-		}
-	}
-}
-
 // stripedJoin joins the striped data shards, writing them to dst. The first 'skip'
 // bytes of the recovered data are skipped, and 'writeLen' bytes are written in
 // total.
@@ -834,26 +823,6 @@ func uploadShard(ctx context.Context, client hostClient, accountKey types.Privat
 	defer cancel()
 	result, err := client.WriteSector(ctx, accountKey, hostKey, data)
 	return result.Root, err
-}
-
-// readAtMost reads from the reader until the buffer is filled,
-// no data is read, an error is returned, or EOF is reached.
-//
-// It is different from io.ReadFull, which returns [io.ErrUnexpectedEOF]
-// if the reader returns less data than requested. This is so EOF can be
-// used as a signal to gracefully close the slab loop in Upload.
-func readAtMost(r io.Reader, buf []byte) (int, error) {
-	var n int
-	for n < len(buf) {
-		m, err := r.Read(buf[n:])
-		n += m
-		if err != nil {
-			return n, err
-		} else if m == 0 {
-			return n, io.EOF
-		}
-	}
-	return n, nil
 }
 
 // WithRedundancy sets the number of data and parity shards for the upload.

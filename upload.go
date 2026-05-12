@@ -65,8 +65,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	// run 'maxInflight' upload workers that pull shards from the queue
 	go runUploadWorkers(ctx, s.hosts, s.appKey, shardsCh, maxInflight, onProgress)
 
-	// convenience variables
-	slabSize := dataShards * proto4.SectorSize
 	totalShards := dataShards + parityShards
 
 	sendErr := func(err error) {
@@ -77,7 +75,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	}
 
 	// read slabs in a loop
-	buffer := make([]byte, slabSize)
+	sr := NewSlabReader(dataShards, parityShards)
 	for i := 0; ctx.Err() == nil; i++ {
 		// every shard upload holds a reference to the host queue to
 		// ensure every shard is uploaded to a unique host
@@ -91,8 +89,8 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 		}
 
 		// read next slab
-		n, err := readAtMost(r, buffer)
-		if n == 0 && errors.Is(err, io.EOF) {
+		slab, err := sr.ReadSlab(r)
+		if slab.Length == 0 && errors.Is(err, io.EOF) {
 			sendErr(io.EOF) // signal upload is done
 			return
 		} else if err != nil && !errors.Is(err, io.EOF) {
@@ -100,20 +98,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 			return
 		}
 
-		// prepare shards
-		shards := make([][]byte, totalShards)
-		for i := range shards {
-			shards[i] = make([]byte, proto4.SectorSize)
-		}
-		stripedSplit(buffer[:n], shards[:dataShards])
-
 		// generate a random encryption key
 		encryptionKey := frand.Entropy256()
 
 		// since data shards do not change during encoding, we can launch
 		// these ahead of time and not wait for encoding to finish first
 		uploadsCh := make(chan shard, totalShards)
-		for shardIdx, data := range shards[:dataShards] {
+		for shardIdx, data := range slab.Shards[:dataShards] {
 			sector := make([]byte, proto4.SectorSize)
 			copy(sector, data)
 			shardsCh <- shardUpload{
@@ -128,13 +119,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 		}
 
 		// encode the shards
-		if err := enc.Encode(shards); err != nil {
+		if err := enc.Encode(slab.Shards); err != nil {
 			sendErr(fmt.Errorf("failed to encode slab %d shards: %w", i, err))
 			return
 		}
 
 		// launch uploads for parity shards
-		for shardIdx, data := range shards[dataShards:] {
+		for shardIdx, data := range slab.Shards[dataShards:] {
 			shardsCh <- shardUpload{
 				hosts:  queue,
 				shards: uploadsCh,
@@ -152,7 +143,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 			return
 		case slabsCh <- slabUpload{
 			encryptionKey: encryptionKey,
-			length:        uint32(n),
+			length:        uint32(slab.Length),
 			slabIndex:     i,
 			uploadsCh:     uploadsCh,
 		}:
