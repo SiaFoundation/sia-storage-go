@@ -1,8 +1,8 @@
 package siastorage
 
 import (
+	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -10,6 +10,7 @@ import (
 	"github.com/klauspost/reedsolomon"
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/client/v2"
+	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
 	"lukechampine.com/frand"
 )
@@ -30,7 +31,6 @@ type (
 	slabUpload struct {
 		encryptionKey [32]byte
 		length        uint32
-		slabIndex     int
 
 		uploadsCh chan shard
 		err       error
@@ -52,8 +52,76 @@ func (uo uploadOption) maxConcurrentSlabs() int {
 	return (uo.maxInflight+totalShards-1)/totalShards + 1
 }
 
+// newUploadOption creates an uploadOption with defaults, applies the given
+// options, validates the erasure coding params, and creates the encoder.
+func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, error) {
+	uo := uploadOption{
+		dataShards:   10,
+		parityShards: 20,
+		maxInflight:  30,
+	}
+	for _, opt := range opts {
+		opt(&uo)
+	}
+
+	totalShards := int(uo.dataShards) + int(uo.parityShards)
+	if err := slabs.ValidateECParams(int(uo.dataShards), totalShards); err != nil {
+		return uo, nil, err
+	}
+
+	enc, err := reedsolomon.New(int(uo.dataShards), int(uo.parityShards))
+	if err != nil {
+		return uo, nil, fmt.Errorf("failed to create erasure coder: %w", err)
+	}
+
+	return uo, enc, nil
+}
+
+// collectSlabs reads uploaded slabs from the channel and collects their
+// shard results into SlabSlices. It returns when the channel is closed
+// or an error is encountered.
+func collectSlabs(ctx context.Context, ch <-chan slabUpload, uo uploadOption) ([]slabs.SlabSlice, error) {
+	totalShards := uo.dataShards + uo.parityShards
+	var uploaded []slabs.SlabSlice
+
+	for slab := range ch {
+		if slab.err != nil {
+			return nil, slab.err
+		}
+
+		sectors := make([]slabs.PinnedSector, totalShards)
+
+		for n := totalShards; n > 0; n-- {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case shard := <-slab.uploadsCh:
+				if shard.err != nil {
+					return nil, fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
+				}
+				sectors[shard.index] = slabs.PinnedSector{
+					HostKey: shard.host,
+					Root:    shard.root,
+				}
+			}
+		}
+
+		uploaded = append(uploaded, slabs.SlabSlice{
+			EncryptionKey: slab.encryptionKey,
+			MinShards:     uint(uo.dataShards),
+			Sectors:       sectors,
+			Offset:        0,
+			Length:        slab.length,
+		})
+	}
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return uploaded, nil
+}
+
 func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, enc reedsolomon.Encoder, uo uploadOption) {
-	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
 	totalShards := dataShards + parityShards
@@ -61,39 +129,52 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 	// create semaphore to limit concurrent shard uploads
 	shardSema := make(chan struct{}, uo.maxInflight)
 
+	// send guards against blocking on a full channel when the consumer
+	// has stopped reading due to an error or context cancellation
+	send := func(su slabUpload) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case respCh <- su:
+			return true
+		}
+	}
+
+	// buffer the reader since SlabReader reads 64 bytes at a time
+	br := bufio.NewReader(r)
+
 	// read slabs in a loop
 	sr := NewSlabReader(dataShards, parityShards)
 	for i := 0; ctx.Err() == nil; i++ {
 		// fetch hosts for this slab
 		queue, err := s.hosts.UploadQueue()
 		if err != nil {
-			respCh <- slabUpload{err: fmt.Errorf("failed to get upload queue for slab %d: %w", i, err)}
+			send(slabUpload{err: fmt.Errorf("failed to get upload queue for slab %d: %w", i, err)})
 			return
 		} else if queue.Available() < totalShards {
-			respCh <- slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d: %d < %d", i, queue.Available(), totalShards)}
+			send(slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d: %d < %d", i, queue.Available(), totalShards)})
 			return
 		}
 
 		// read next slab
-		slab, err := sr.ReadSlab(r)
-		if slab.Length == 0 && errors.Is(err, io.EOF) {
-			respCh <- slabUpload{err: io.EOF}
+		slab, err := sr.ReadSlab(br)
+		if slab.Length == 0 && err == io.EOF {
 			return
-		} else if err != nil && !errors.Is(err, io.EOF) {
-			respCh <- slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)}
+		} else if err != nil && err != io.EOF {
+			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
 			return
 		}
 
 		// encode parity shards
 		if err := enc.Encode(slab.Shards); err != nil {
-			respCh <- slabUpload{err: fmt.Errorf("failed to encode slab %d shards: %w", i, err)}
+			send(slabUpload{err: fmt.Errorf("failed to encode slab %d shards: %w", i, err)})
 			return
 		}
 
 		// pop initial hosts for all shards
 		initialHosts, ok := popN(queue, totalShards)
 		if !ok {
-			respCh <- slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d", i)}
+			send(slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d", i)})
 			return
 		}
 
@@ -107,12 +188,11 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		}
 
 		// send slab off for collection
-		respCh <- slabUpload{
+		send(slabUpload{
 			encryptionKey: encryptionKey,
 			length:        uint32(slab.Length),
-			slabIndex:     i,
 			uploadsCh:     uploadsCh,
-		}
+		})
 	}
 }
 
@@ -160,6 +240,10 @@ func uploadShard(ctx context.Context, hosts hostClient, accountKey types.Private
 	spawnWrite(initialHost)
 	active := 1
 
+	// race timer scales with active attempts to avoid stampeding
+	raceTimer := time.NewTimer(time.Second)
+	defer raceTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -188,7 +272,7 @@ func uploadShard(ctx context.Context, hosts hostClient, accountKey types.Private
 
 			active--
 
-			// requeue failed host so other shards can use it
+			// requeue failed host so other shards can try it
 			queue.Retry(res.host)
 
 			// if all active writes failed, start a new one
@@ -208,7 +292,9 @@ func uploadShard(ctx context.Context, hosts hostClient, accountKey types.Private
 				active++
 			}
 
-		case <-time.After(time.Duration(max(active, 1)) * time.Second):
+			raceTimer.Reset(time.Duration(max(active, 1)) * time.Second)
+
+		case <-raceTimer.C:
 			// race a slow host
 			select {
 			case sema <- struct{}{}:
@@ -221,11 +307,16 @@ func uploadShard(ctx context.Context, hosts hostClient, accountKey types.Private
 				active++
 			default:
 			}
+
+			raceTimer.Reset(time.Duration(max(active, 1)) * time.Second)
 		}
 	}
 }
 
 // popN pops n hosts from the front of the queue and returns them.
+//
+// TODO: add Pop() and PopN() to HostQueue in indexd so we don't have to
+// discard the attempt count from Next().
 func popN(queue *client.HostQueue, n int) ([]types.PublicKey, bool) {
 	hosts := make([]types.PublicKey, n)
 	for i := range n {

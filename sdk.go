@@ -268,71 +268,28 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	uo := uploadOption{
-		dataShards:   10,
-		parityShards: 20,
-		maxInflight:  30,
-	}
-	for _, opt := range opts {
-		opt(&uo)
-	}
-
-	// validate erasure coding params
-	totalShards := int(uo.dataShards) + int(uo.parityShards)
-	if err := slabs.ValidateECParams(int(uo.dataShards), totalShards); err != nil {
+	// create upload options
+	uo, enc, err := newUploadOption(opts...)
+	if err != nil {
 		return err
 	}
 
+	// encrypt the reader on the fly
 	r = encrypt((*[32]byte)(obj.dataKey), r, obj.Size())
-
-	// create erasure coder
-	enc, err := reedsolomon.New(int(uo.dataShards), int(uo.parityShards))
-	if err != nil {
-		return fmt.Errorf("failed to create erasure coder: %w", err)
-	}
 
 	// start uploading slabs
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
-	go s.uploadSlabs(ctx, slabsCh, r, enc, uo)
+	go func() {
+		defer close(slabsCh)
+		s.uploadSlabs(ctx, slabsCh, r, enc, uo)
+	}()
 
-	// collect uploaded slabs in a temporary variable to avoid modifying the
-	// object on error
-	var uploaded []slabs.SlabSlice
-
-	for slab := range slabsCh {
-		if errors.Is(slab.err, io.EOF) {
-			break
-		} else if slab.err != nil {
-			return slab.err
-		}
-
-		totalShards := uo.dataShards + uo.parityShards
-		sectors := make([]slabs.PinnedSector, totalShards)
-
-		// collect all shards
-		for n := totalShards; n > 0; n-- {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case shard := <-slab.uploadsCh:
-				if shard.err != nil {
-					return fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
-				}
-				sectors[shard.index] = slabs.PinnedSector{
-					HostKey: shard.host,
-					Root:    shard.root,
-				}
-			}
-		}
-
-		uploaded = append(uploaded, slabs.SlabSlice{
-			EncryptionKey: slab.encryptionKey,
-			MinShards:     uint(uo.dataShards),
-			Sectors:       sectors,
-			Offset:        0,
-			Length:        slab.length,
-		})
+	// collect uploaded slabs
+	uploaded, err := collectSlabs(ctx, slabsCh, uo)
+	if err != nil {
+		return err
 	}
+
 	obj.slabs = append(obj.slabs, uploaded...)
 	return nil
 }
