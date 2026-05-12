@@ -94,7 +94,7 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 		select {
 		case <-done:
 		case <-addCtx.Done():
-			u.reader.CloseWithError(context.Cause(addCtx))
+			u.finish(nil, context.Cause(addCtx))
 		}
 	}()
 
@@ -103,27 +103,14 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 	n, err := io.Copy(u.writer, r)
 	u.totalWritten += n
 	if err != nil {
-		// if context was cancelled, either due to caller or threadgroup, the pipe is broken
-		if addCtx.Err() != nil {
-			err = context.Cause(addCtx)
-			u.finish(nil, err)
-			return 0, fmt.Errorf("failed to add object: %w", err)
-		}
-
-		// if the error came from the pipe, the writer was closed by finish
-		// or Finalize/Close; wait for the result which is imminent
 		if errors.Is(err, io.ErrClosedPipe) {
-			select {
-			case <-ctx.Done():
-				return 0, context.Cause(ctx)
-			case <-u.resultAvailCh:
-			}
+			// if the pipe was closed the result is ready
+			<-u.resultAvailCh
 			if u.result.err != nil {
 				return 0, u.result.err
 			}
 			return 0, ErrUploadFinalized
 		}
-
 		// reader error: partial bytes become dead padding, upload stays usable
 		return 0, fmt.Errorf("failed to add object: %w", err)
 	} else if n == 0 {
