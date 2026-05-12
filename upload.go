@@ -46,6 +46,7 @@ type (
 		shards chan shard
 
 		encryptionKey [32]byte
+		slabIndex     int
 		index         int
 		sector        []byte
 	}
@@ -63,15 +64,16 @@ type (
 		dataShards   uint8
 		parityShards uint8
 		maxInflight  int
+		onProgress   func(ShardProgress)
 	}
 )
 
-func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Reader, enc reedsolomon.Encoder, dataShards, parityShards, maxInflight int) {
+func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Reader, enc reedsolomon.Encoder, dataShards, parityShards, maxInflight int, onProgress func(ShardProgress)) {
 	shardsCh := make(chan shardUpload)
 	defer close(shardsCh)
 
 	// run 'maxInflight' upload workers that pull shards from the queue
-	go runUploadWorkers(ctx, s.hosts, s.appKey, shardsCh, maxInflight)
+	go runUploadWorkers(ctx, s.hosts, s.appKey, shardsCh, maxInflight, onProgress)
 
 	// convenience variables
 	slabSize := dataShards * proto4.SectorSize
@@ -121,7 +123,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 		// since data shards do not change during encoding, we can launch
 		// these ahead of time and not wait for encoding to finish first
 		uploadsCh := make(chan shard, totalShards)
-		for i, data := range shards[:dataShards] {
+		for shardIdx, data := range shards[:dataShards] {
 			sector := make([]byte, proto4.SectorSize)
 			copy(sector, data)
 			shardsCh <- shardUpload{
@@ -129,7 +131,8 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 				shards: uploadsCh,
 
 				encryptionKey: encryptionKey,
-				index:         i,
+				slabIndex:     i,
+				index:         shardIdx,
 				sector:        sector,
 			}
 		}
@@ -141,13 +144,14 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 		}
 
 		// launch uploads for parity shards
-		for i, data := range shards[dataShards:] {
+		for shardIdx, data := range shards[dataShards:] {
 			shardsCh <- shardUpload{
 				hosts:  queue,
 				shards: uploadsCh,
 
 				encryptionKey: encryptionKey,
-				index:         dataShards + i,
+				slabIndex:     i,
+				index:         dataShards + shardIdx,
 				sector:        data,
 			}
 		}
@@ -166,7 +170,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, slabsCh chan slabUpload, r io.Rea
 	}
 }
 
-func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.PrivateKey, queue chan shardUpload, maxInflight int) {
+func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.PrivateKey, queue chan shardUpload, maxInflight int, onProgress func(ShardProgress)) {
 	sema := make(chan struct{}, maxInflight)
 	for job := range queue {
 		sema <- struct{}{}
@@ -185,8 +189,18 @@ func runUploadWorkers(ctx context.Context, client hostClient, accountKey types.P
 					return
 				}
 
+				start := time.Now()
 				root, err := uploadShard(ctx, client, accountKey, host, job.sector, uploadTimeout)
 				if err == nil {
+					if onProgress != nil {
+						onProgress(ShardProgress{
+							HostKey:    host,
+							SlabIndex:  job.slabIndex,
+							ShardIndex: job.index,
+							ShardSize:  uint64(len(job.sector)),
+							Elapsed:    time.Since(start),
+						})
+					}
 					job.shards <- shard{
 						index: job.index,
 						host:  host,

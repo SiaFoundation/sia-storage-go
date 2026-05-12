@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,16 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	return c.w.Write(p)
 }
 
+// readAll drains rc, closes it, and returns the bytes read alongside the first
+// error encountered.
+func readAll(rc io.ReadCloser, err error) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
+}
+
 func TestRoundtripCount(t *testing.T) {
 	sdk, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
 	defer sdk.Close()
@@ -49,11 +60,14 @@ func TestRoundtripCount(t *testing.T) {
 
 	buf := bytes.NewBuffer(nil)
 	cw := &countWriter{w: buf}
-	if err := sdk.Download(context.Background(), cw, obj); err != nil {
+	rc, err := sdk.Download(obj)
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	if !bytes.Equal(buf.Bytes(), data) {
+	defer rc.Close()
+	if _, err := io.Copy(cw, rc); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(buf.Bytes(), data) {
 		t.Fatal("data mismatch")
 	}
 	t.Logf("Downloaded: %d bytes, Write calls: %d", buf.Len(), cw.count)
@@ -146,10 +160,10 @@ func TestResumableUpload(t *testing.T) {
 		}
 	}
 
-	buf := bytes.NewBuffer(nil)
-	if err := sdk.Download(t.Context(), buf, obj); err != nil {
+	got, err := readAll(sdk.Download(obj))
+	if err != nil {
 		t.Fatal(err)
-	} else if !bytes.Equal(buf.Bytes(), data) {
+	} else if !bytes.Equal(got, data) {
 		t.Fatal("data mismatch")
 	}
 }
@@ -179,17 +193,17 @@ func TestDownload(t *testing.T) {
 	}
 
 	t.Run("full", func(t *testing.T) {
-		buf := bytes.NewBuffer(nil)
-		if err = sdk.Download(context.Background(), buf, obj); err != nil {
+		got, err := readAll(sdk.Download(obj))
+		if err != nil {
 			t.Fatalf("failed to download: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data) {
+		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
 
-		buf.Reset()
-		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
+		got, err = readAll(sdk.DownloadSharedObject(t.Context(), sharedURL))
+		if err != nil {
 			t.Fatalf("failed to download shared object: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data) {
+		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
 	})
@@ -217,47 +231,47 @@ func TestDownload(t *testing.T) {
 		}
 
 		for _, c := range cases {
-			buf := bytes.NewBuffer(nil)
-			if err = sdk.Download(context.Background(), buf, obj, WithDownloadRange(c[0], c[1])); err != nil {
+			got, err := readAll(sdk.Download(obj, WithDownloadRange(c[0], c[1])))
+			if err != nil {
 				t.Fatalf("failed to download: %v", err)
-			} else if !bytes.Equal(buf.Bytes(), data[c[0]:c[0]+c[1]]) {
+			} else if !bytes.Equal(got, data[c[0]:c[0]+c[1]]) {
 				t.Fatal("data mismatch")
 			}
 
-			buf.Reset()
-			if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(c[0], c[1])); err != nil {
+			got, err = readAll(sdk.DownloadSharedObject(t.Context(), sharedURL, WithDownloadRange(c[0], c[1])))
+			if err != nil {
 				t.Fatalf("failed to download shared object: %v", err)
-			} else if !bytes.Equal(buf.Bytes(), data[c[0]:c[0]+c[1]]) {
+			} else if !bytes.Equal(got, data[c[0]:c[0]+c[1]]) {
 				t.Fatal("data mismatch")
 			}
 		}
 
 		// ranges that extend past EOF should be clamped.
-		buf := bytes.NewBuffer(nil)
-		if err := sdk.Download(context.Background(), buf, obj, WithDownloadRange(dataSize-10, 100)); err != nil {
+		got, err := readAll(sdk.Download(obj, WithDownloadRange(dataSize-10, 100)))
+		if err != nil {
 			t.Fatalf("failed to clamp range to EOF: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data[dataSize-10:]) {
+		} else if !bytes.Equal(got, data[dataSize-10:]) {
 			t.Fatal("data mismatch")
 		}
-		buf.Reset()
-		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize-10, 100)); err != nil {
+		got, err = readAll(sdk.DownloadSharedObject(t.Context(), sharedURL, WithDownloadRange(dataSize-10, 100)))
+		if err != nil {
 			t.Fatalf("failed to clamp shared range to EOF: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data[dataSize-10:]) {
+		} else if !bytes.Equal(got, data[dataSize-10:]) {
 			t.Fatal("data mismatch")
 		}
 
 		// offsets at or beyond EOF should return no data.
-		buf.Reset()
-		if err := sdk.Download(context.Background(), buf, obj, WithDownloadRange(dataSize, 1)); err != nil {
+		got, err = readAll(sdk.Download(obj, WithDownloadRange(dataSize, 1)))
+		if err != nil {
 			t.Fatalf("expected empty EOF download, got %v", err)
-		} else if buf.Len() != 0 {
-			t.Fatalf("expected empty EOF download, got %d bytes", buf.Len())
+		} else if len(got) != 0 {
+			t.Fatalf("expected empty EOF download, got %d bytes", len(got))
 		}
-		buf.Reset()
-		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL, WithDownloadRange(dataSize+1, 1)); err != nil {
+		got, err = readAll(sdk.DownloadSharedObject(t.Context(), sharedURL, WithDownloadRange(dataSize+1, 1)))
+		if err != nil {
 			t.Fatalf("expected empty shared EOF download, got %v", err)
-		} else if buf.Len() != 0 {
-			t.Fatalf("expected empty shared EOF download, got %d bytes", buf.Len())
+		} else if len(got) != 0 {
+			t.Fatalf("expected empty shared EOF download, got %d bytes", len(got))
 		}
 	})
 
@@ -265,8 +279,7 @@ func TestDownload(t *testing.T) {
 		hosts.ResetSlowHosts()
 		// make enough hosts timeout to fail to download
 		hosts.SetSlowHosts(t, 21, time.Second)
-		buf := bytes.NewBuffer(nil)
-		err = sdk.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
+		_, err := readAll(sdk.Download(obj, WithDownloadHostTimeout(200*time.Millisecond)))
 		if !errors.Is(err, ErrNotEnoughShards) {
 			t.Fatalf("expected ErrNotEnoughShards, got %v", err)
 		}
@@ -276,12 +289,71 @@ func TestDownload(t *testing.T) {
 		hosts.ResetSlowHosts()
 		// make most of the hosts timeout
 		hosts.SetSlowHosts(t, 20, time.Second)
-		buf := bytes.NewBuffer(nil)
-		err = sdk.Download(context.Background(), buf, obj, WithDownloadHostTimeout(200*time.Millisecond))
+		got, err := readAll(sdk.Download(obj, WithDownloadHostTimeout(200*time.Millisecond)))
 		if err != nil {
 			t.Fatal(err)
-		} else if !bytes.Equal(buf.Bytes(), data) {
+		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
+		}
+	})
+}
+
+func TestProgressCallbacks(t *testing.T) {
+	s, _ := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer s.Close()
+
+	const dataShards, parityShards = 10, 20
+	totalShards := dataShards + parityShards
+	slabSize := uint64(proto.SectorSize) * dataShards
+	numSlabs := 3
+	data := frand.Bytes(int(slabSize) * numSlabs)
+	obj := NewEmptyObject()
+
+	t.Run("upload", func(t *testing.T) {
+		var mu sync.Mutex
+		seen := make(map[[2]int]bool)
+		cb := func(p ShardProgress) {
+			mu.Lock()
+			defer mu.Unlock()
+			key := [2]int{p.SlabIndex, p.ShardIndex}
+			if seen[key] {
+				t.Errorf("duplicate upload callback for slab %d, shard %d", p.SlabIndex, p.ShardIndex)
+			}
+			if p.ShardSize != proto.SectorSize {
+				t.Errorf("expected ShardSize %d, got %d", proto.SectorSize, p.ShardSize)
+			}
+			seen[key] = true
+		}
+		if err := s.Upload(t.Context(), &obj, bytes.NewReader(data), WithUploadProgress(cb)); err != nil {
+			t.Fatal(err)
+		}
+		if expected := totalShards * numSlabs; len(seen) != expected {
+			t.Fatalf("expected %d upload callbacks, got %d", expected, len(seen))
+		}
+	})
+
+	t.Run("download", func(t *testing.T) {
+		var mu sync.Mutex
+		var count int
+		cb := func(p ShardProgress) {
+			mu.Lock()
+			defer mu.Unlock()
+			if p.SlabIndex >= numSlabs {
+				t.Errorf("invalid slab index %d", p.SlabIndex)
+			}
+			if p.ShardIndex >= totalShards {
+				t.Errorf("invalid shard index %d", p.ShardIndex)
+			}
+			count++
+		}
+		got, err := readAll(s.Download(obj, WithDownloadProgress(cb)))
+		if err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(got, data) {
+			t.Fatal("data mismatch")
+		}
+		if expected := int(slabSize) / chunkSize * dataShards * numSlabs; count != expected {
+			t.Fatalf("expected %d download callbacks, got %d", expected, count)
 		}
 	})
 }
@@ -294,14 +366,15 @@ func TestE2E(t *testing.T) {
 		t.Helper()
 
 		// assert we can download the object
-		buf := bytes.NewBuffer(nil)
 		if err := sdk.PinObject(t.Context(), obj); err != nil {
 			t.Fatalf("failed to pin object: %v", err)
 		} else if _, err := sdk.Object(t.Context(), obj.ID()); err != nil {
 			t.Fatalf("failed to get object: %v", err)
-		} else if err := sdk.Download(t.Context(), buf, obj); err != nil {
+		}
+		got, err := readAll(sdk.Download(obj))
+		if err != nil {
 			t.Fatalf("failed to download: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data) {
+		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
 
@@ -310,10 +383,10 @@ func TestE2E(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create shared object URL: %v", err)
 		}
-		buf.Reset()
-		if err := sdk.DownloadSharedObject(t.Context(), buf, sharedURL); err != nil {
+		got, err = readAll(sdk.DownloadSharedObject(t.Context(), sharedURL))
+		if err != nil {
 			t.Fatalf("failed to download shared object: %v", err)
-		} else if !bytes.Equal(buf.Bytes(), data) {
+		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
 	}
@@ -509,10 +582,15 @@ func BenchmarkDownload(b *testing.B) {
 			b.ResetTimer()
 			for b.Loop() {
 				buf.Reset()
-				err = sdk.Download(context.Background(), buf, obj, WithDownloadInflight(inflight))
+				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
+				if _, err := io.Copy(buf, rc); err != nil {
+					rc.Close()
+					b.Fatalf("failed to download: %v", err)
+				}
+				rc.Close()
 			}
 		})
 	}
