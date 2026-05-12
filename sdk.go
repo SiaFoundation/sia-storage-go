@@ -348,32 +348,33 @@ top:
 	return nil
 }
 
-// Download downloads object data.
-func (s *SDK) Download(ctx context.Context, w io.Writer, obj Object, opts ...DownloadOption) error {
+// Download returns an [io.ReadCloser] streaming the object's data. Closing the
+// reader cancels the underlying download. Callers must always Close the
+// returned reader to release resources.
+func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
 	do := defaultDownloadOption(obj.Size())
 	for _, opt := range opts {
 		opt(&do)
 	}
 
 	if !do.normalizeRange(obj.Size()) {
-		return nil
+		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	// decrypt stream using the object's master key
 	if len(obj.dataKey) != 32 {
-		return fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
+		return nil, fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
 	}
-	w = decrypt((*[32]byte)(obj.dataKey), w, uint64(do.offset))
 
-	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.slabs, do.offset, do.length, do.onProgress)
+	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do), nil
 }
 
-// DownloadSharedObject downloads a shared object from a shared URL
-func (s *SDK) DownloadSharedObject(ctx context.Context, w io.Writer, sharedURL string, opts ...DownloadOption) error {
-	// retrieve shared object metadata
+// DownloadSharedObject returns an [io.ReadCloser] streaming a shared object's
+// data. Closing the reader cancels the underlying download. Callers must always
+// Close the returned reader to release resources.
+func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts ...DownloadOption) (io.ReadCloser, error) {
 	obj, encryptionKey, err := s.app.SharedObject(ctx, sharedURL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	do := defaultDownloadOption(obj.Size())
@@ -382,13 +383,40 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, w io.Writer, sharedURL s
 	}
 
 	if !do.normalizeRange(obj.Size()) {
-		return nil
+		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	// decrypt stream using the object's master key
-	w = decrypt((*[32]byte)(encryptionKey), w, uint64(do.offset))
+	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do), nil
+}
 
-	return s.downloadSlabs(ctx, w, do.maxInflight, do.hostTimeout, obj.Slabs, do.offset, do.length, do.onProgress)
+// downloadReader spawns a goroutine that runs downloadSlabs into the write end
+// of a pipe, decrypting on the fly. The returned reader, when closed, cancels
+// the download and unblocks the goroutine.
+func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
+	pr, pw := io.Pipe()
+	sw := decrypt(key, pw, uint64(do.offset))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := s.downloadSlabs(context.Background(), sw, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress)
+		pw.CloseWithError(err)
+	}()
+
+	return &downloadStream{pr: pr, done: done}
+}
+
+type downloadStream struct {
+	pr   *io.PipeReader
+	done chan struct{}
+}
+
+func (d *downloadStream) Read(p []byte) (int, error) { return d.pr.Read(p) }
+
+func (d *downloadStream) Close() error {
+	err := d.pr.Close()
+	<-d.done
+	return err
 }
 
 func defaultDownloadOption(maxLength uint64) downloadOption {
@@ -886,7 +914,7 @@ func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
 // WithDownloadRange sets the byte range to download from the object. The range
 // is clamped to the object size: if offset+length exceeds the object size, only
 // the available bytes are returned. If offset is at or beyond the end, or
-// length is zero, no data is written and Download returns nil.
+// length is zero, the returned reader yields no data.
 func WithDownloadRange(offset, length uint64) DownloadOption {
 	return func(do *downloadOption) {
 		do.offset = offset

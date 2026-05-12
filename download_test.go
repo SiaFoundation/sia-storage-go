@@ -30,10 +30,10 @@ func TestOutOfOrderDownload(t *testing.T) {
 		}
 	}
 
-	buf := bytes.NewBuffer(nil)
-	if err := sdk.Download(t.Context(), buf, obj, WithDownloadInflight(40)); err != nil {
+	got, err := readAll(sdk.Download(obj, WithDownloadInflight(40)))
+	if err != nil {
 		t.Fatal(err)
-	} else if !bytes.Equal(buf.Bytes(), data) {
+	} else if !bytes.Equal(got, data) {
 		t.Fatal("data mismatch")
 	}
 }
@@ -156,13 +156,13 @@ func TestSlabRecovery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := bytes.NewBuffer(nil)
-			if err := sdk.Download(t.Context(), buf, obj, WithDownloadRange(tt.offset, tt.length)); err != nil {
+			got, err := readAll(sdk.Download(obj, WithDownloadRange(tt.offset, tt.length)))
+			if err != nil {
 				t.Fatalf("download failed: %v", err)
 			}
 			expected := data[tt.offset : tt.offset+tt.length]
-			if !bytes.Equal(buf.Bytes(), expected) {
-				t.Fatalf("data mismatch: got %d bytes, expected %d", buf.Len(), len(expected))
+			if !bytes.Equal(got, expected) {
+				t.Fatalf("data mismatch: got %d bytes, expected %d", len(got), len(expected))
 			}
 		})
 	}
