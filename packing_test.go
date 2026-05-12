@@ -264,7 +264,7 @@ func TestUploadPacked(t *testing.T) {
 
 	// assert packed uploads are recoverable on reader error, even when
 	// the dead padding pushes us across a slab boundary
-	u, err = s.UploadPacked()
+	u, err = sdk.UploadPacked()
 	if err != nil {
 		t.Fatalf("failed to create packed upload: %v", err)
 	}
@@ -305,25 +305,25 @@ func TestUploadPacked(t *testing.T) {
 		t.Fatalf("expected 2 objects, got %d", len(objects))
 	}
 
-	buf.Reset()
-	if err := s.Download(t.Context(), buf, objects[0]); err != nil {
+	got, err = readAll(sdk.Download(objects[0]))
+	if err != nil {
 		t.Fatalf("download object 0: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), goodData1) {
+	} else if !bytes.Equal(got, goodData1) {
 		t.Fatal("object 0: data mismatch")
 	}
 
-	buf.Reset()
-	if err := s.Download(t.Context(), buf, objects[1]); err != nil {
+	got, err = readAll(sdk.Download(objects[1]))
+	if err != nil {
 		t.Fatalf("download object 1: %v", err)
-	} else if !bytes.Equal(buf.Bytes(), goodData2) {
+	} else if !bytes.Equal(got, goodData2) {
 		t.Fatal("object 1: data mismatch")
 	}
 
 	// assert pipeline errors surface correctly through the closed pipe path
-	s2 := newTestSDK(t, appKey, newMockAppClient(), newMockDialer(5)) // not enough hosts for 30 shards
-	defer s2.Close()
+	sdk2, _ := newTestSDK(t, 5, zaptest.NewLogger(t)) // not enough hosts for 30 shards
+	defer sdk2.Close()
 
-	u, err = s2.UploadPacked()
+	u, err = sdk2.UploadPacked()
 	if err != nil {
 		t.Fatal(err)
 	}
