@@ -62,6 +62,11 @@ func (m *mockHostClient) Close() error {
 	return nil
 }
 
+// AddFailedRPC implements the [hostClient] interface.
+func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
+	m.provider.AddFailedRPC(hostKey, errors.New("aborted"))
+}
+
 // UploadQueue implements the [hostClient] interface.
 func (m *mockHostClient) UploadQueue() (*client.HostQueue, error) {
 	return m.provider.UploadQueue()
