@@ -81,10 +81,12 @@ func (sr *SlabReader) take() ReadSlab {
 		Shards: sr.shards,
 	}
 
-	// allocate fresh buffers for the next slab
-	sr.shards = make([][]byte, len(sr.shards))
-	for i := range sr.shards {
-		sr.shards[i] = make([]byte, proto4.SectorSize)
+	// skip allocation if nothing was buffered
+	if sr.length > 0 {
+		sr.shards = make([][]byte, len(sr.shards))
+		for i := range sr.shards {
+			sr.shards[i] = make([]byte, proto4.SectorSize)
+		}
 	}
 	sr.length = 0
 
