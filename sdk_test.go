@@ -119,14 +119,11 @@ func TestUpload(t *testing.T) {
 		}
 	})
 
-	t.Run("flaky hosts", func(t *testing.T) {
+	t.Run("transient errors", func(t *testing.T) {
 		sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
 		defer sdk.Close()
 
-		// 10 of 30 hosts fail their first write but succeed on retry.
-		// the upload should complete because failed hosts are requeued
-		// for other shards via Retry.
-		hosts.SetFlakyHosts(t, 10, 1)
+		hosts.SetErrHosts(t, 10, 1, errors.New("temporary"))
 
 		obj := NewEmptyObject()
 		err := sdk.Upload(context.Background(), &obj, bytes.NewReader(data))
