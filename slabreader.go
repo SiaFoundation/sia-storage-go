@@ -67,7 +67,7 @@ func (sr *SlabReader) ReadSlab(r io.Reader) (ReadSlab, error) {
 		} else if err != nil {
 			return ReadSlab{}, err
 		} else if n == 0 {
-			return sr.take(), io.EOF
+			continue
 		}
 	}
 
