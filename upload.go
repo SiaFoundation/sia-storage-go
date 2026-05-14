@@ -15,9 +15,17 @@ import (
 	"lukechampine.com/frand"
 )
 
-// uploadTimeout is the per-attempt timeout for uploading a single sector
-// to a host.
-const uploadTimeout = 90 * time.Second
+const (
+	// maxHostAttempts is the maximum number of upload attempts per host
+	// before it is permanently removed from the upload queue. The attempt
+	// counter is tracked by the shared HostQueue across all shards, not
+	// per shard.
+	maxHostAttempts = 3
+
+	// uploadTimeout is the per-attempt timeout for uploading a single
+	// sector to a host.
+	uploadTimeout = 90 * time.Second
+)
 
 type (
 	shard struct {
@@ -151,12 +159,12 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			shardsCh:      make(chan shard, totalShards),
 		}
 		for shardIdx, data := range slab.Shards {
-			host, _, ok := queue.Next()
+			host, attempts, ok := queue.Next()
 			if !ok {
 				send(slabUpload{err: ErrNoMoreHosts})
 				return
 			}
-			go su.uploadShard(ctx, shardIdx, host, data)
+			go su.uploadShard(ctx, shardIdx, host, attempts < maxHostAttempts, data)
 		}
 
 		// send slab off for collection
@@ -170,7 +178,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 
 // uploadShard encrypts and uploads a single shard to a host, racing slow hosts
 // by spawning additional upload attempts after a timeout.
-func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialHost types.PublicKey, sector []byte) {
+func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialHost types.PublicKey, canRetry bool, sector []byte) {
 	// encrypt the sector
 	nonce := make([]byte, 24)
 	nonce[0] = byte(shardIndex)
@@ -190,20 +198,21 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	defer cancel(client.ErrAbortedRPC)
 
 	type writeResult struct {
-		host    types.PublicKey
-		root    types.Hash256
-		err     error
-		elapsed time.Duration
+		host     types.PublicKey
+		root     types.Hash256
+		err      error
+		elapsed  time.Duration
+		canRetry bool
 	}
 	results := make(chan writeResult, 8)
 
-	launchWrite := func(host types.PublicKey) {
+	launchWrite := func(host types.PublicKey, canRetry bool) {
 		go func() {
 			defer func() { <-su.sema }()
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
 			select {
-			case results <- writeResult{host, root, err, time.Since(start)}:
+			case results <- writeResult{host, root, err, time.Since(start), canRetry}:
 			case <-shardCtx.Done():
 				// a write won; return this host so other shards can use it
 				if ctx.Err() == nil {
@@ -213,7 +222,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 		}()
 	}
 
-	launchWrite(initialHost)
+	launchWrite(initialHost, canRetry)
 	active := 1
 
 	// race timer scales with active attempts to avoid stampeding
@@ -255,11 +264,13 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			active--
 
 			// requeue failed host so other shards can try it
-			su.queue.Retry(res.host)
+			if res.canRetry {
+				su.queue.Retry(res.host)
+			}
 
 			// if all active writes failed, start a new one
 			if active == 0 {
-				host, _, ok := su.queue.Next()
+				host, attempts, ok := su.queue.Next()
 				if !ok {
 					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
 					return
@@ -270,7 +281,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 					return
 				case su.sema <- struct{}{}:
 				}
-				launchWrite(host)
+				launchWrite(host, attempts < maxHostAttempts)
 				active++
 			}
 
@@ -282,12 +293,12 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			// race a slow host
 			select {
 			case su.sema <- struct{}{}:
-				host, _, ok := su.queue.Next()
+				host, attempts, ok := su.queue.Next()
 				if !ok {
 					<-su.sema
 					continue
 				}
-				launchWrite(host)
+				launchWrite(host, attempts < maxHostAttempts)
 				active++
 			default:
 			}

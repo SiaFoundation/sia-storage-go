@@ -37,6 +37,11 @@ func newMockHostStore(n int) *hostCache {
 	return store
 }
 
+type hostErr struct {
+	remaining int
+	err       error
+}
+
 type mockHostClient struct {
 	provider *client.Provider
 	hosts    *hostCache
@@ -47,8 +52,8 @@ type mockHostClient struct {
 	sectorDelayMu sync.Mutex
 	sectorDelays  map[types.Hash256]time.Duration
 
-	flakyMu    sync.Mutex
-	flakyHosts map[types.PublicKey]int // fail first N writes
+	errHostsMu sync.Mutex
+	errHosts   map[types.PublicKey]hostErr
 
 	sectorsMu   sync.Mutex
 	hostSectors map[types.PublicKey]map[types.Hash256][]byte
@@ -113,6 +118,18 @@ func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) er
 	return context.Cause(ctx)
 }
 
+func (m *mockHostClient) hostError(hostKey types.PublicKey) error {
+	m.errHostsMu.Lock()
+	defer m.errHostsMu.Unlock()
+
+	errs := m.errHosts[hostKey]
+	if errs.remaining <= 0 {
+		return nil
+	}
+	m.errHosts[hostKey] = hostErr{remaining: errs.remaining - 1, err: errs.err}
+	return errs.err
+}
+
 // WriteSector implements the [hostClient] interface.
 func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, data []byte) (_ rhp.RPCWriteSectorResult, err error) {
 	if ok, _ := m.hosts.Usable(hostKey); !ok {
@@ -132,14 +149,10 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 	m.writeCalls[hostKey]++
 	m.writesMu.Unlock()
 
-	// simulate flaky hosts that fail their first N writes
-	m.flakyMu.Lock()
-	if m.flakyHosts[hostKey] > 0 {
-		m.flakyHosts[hostKey]--
-		m.flakyMu.Unlock()
-		return rhp.RPCWriteSectorResult{}, context.DeadlineExceeded
+	// simulate RPC error
+	if err := m.hostError(hostKey); err != nil {
+		return rhp.RPCWriteSectorResult{}, err
 	}
-	m.flakyMu.Unlock()
 
 	// simulate i/o
 	if err := m.delay(ctx, hostKey); err != nil {
@@ -275,18 +288,18 @@ func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration)
 	m.sectorDelays[root] = d
 }
 
-// SetFlakyHosts marks the first n hosts as flaky: each will fail its
-// first failCount write attempts before succeeding.
-func (m *mockHostClient) SetFlakyHosts(t *testing.T, n, failCount int) {
-	t.Helper()
+// SetErrHosts marks the first n hosts as failing: each will return
+// the given error for its first failCount write attempts.
+func (m *mockHostClient) SetErrHosts(tb testing.TB, n, failCount int, err error) {
+	tb.Helper()
 
 	hosts, _ := m.hosts.UsableHosts()
 	if n > len(hosts) {
-		t.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
+		tb.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
 	}
 
-	m.flakyMu.Lock()
-	defer m.flakyMu.Unlock()
+	m.errHostsMu.Lock()
+	defer m.errHostsMu.Unlock()
 
 	var set int
 	for _, hi := range hosts {
@@ -294,7 +307,7 @@ func (m *mockHostClient) SetFlakyHosts(t *testing.T, n, failCount int) {
 			break
 		}
 		set++
-		m.flakyHosts[hi.PublicKey] = failCount
+		m.errHosts[hi.PublicKey] = hostErr{remaining: failCount, err: err}
 	}
 }
 
@@ -304,7 +317,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		provider:     client.NewProvider(hosts),
 		slowHosts:    make(map[types.PublicKey]time.Duration),
 		sectorDelays: make(map[types.Hash256]time.Duration),
-		flakyHosts:   make(map[types.PublicKey]int),
+		errHosts:     make(map[types.PublicKey]hostErr),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
 		writeCalls:   make(map[types.PublicKey]int),
 		pricesCalls:  make(map[types.PublicKey]int),
