@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -206,15 +207,19 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	}
 	results := make(chan writeResult, 8)
 
+	var initialDone atomic.Bool
 	launchWrite := func(host types.PublicKey, canRetry bool) {
 		go func() {
 			defer func() { <-su.sema }()
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
+			if host == initialHost {
+				initialDone.Store(true)
+			}
 			select {
 			case results <- writeResult{host, root, err, time.Since(start), canRetry}:
 			case <-shardCtx.Done():
-				// a write won; return this host so other shards can use it
+				// a write won, return this host so other shards can use it
 				if ctx.Err() == nil {
 					su.queue.Retry(host)
 				}
@@ -239,8 +244,9 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			if res.err == nil {
 				cancel(client.ErrAbortedRPC)
 
-				// penalize the original host if a racer won
-				if res.host != initialHost {
+				// penalize the original host if a racer beat it
+				// while it was still uploading
+				if res.host != initialHost && !initialDone.Load() {
 					su.hosts.AddFailedRPC(initialHost)
 				}
 
