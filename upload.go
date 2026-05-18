@@ -221,7 +221,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			case results <- writeResult{host, root, err, time.Since(start), canRetry}:
 			case <-shardCtx.Done():
 				// a write won, return this host so other shards can use it
-				if ctx.Err() == nil {
+				if ctx.Err() == nil && canRetry {
 					su.queue.Retry(host)
 				}
 			}
