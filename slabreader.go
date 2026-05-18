@@ -1,6 +1,7 @@
 package siastorage
 
 import (
+	"errors"
 	"io"
 
 	proto4 "go.sia.tech/core/rhp/v4"
@@ -62,7 +63,7 @@ func (sr *SlabReader) ReadSlab(r io.Reader) (ReadSlab, error) {
 		n, err := r.Read(segment)
 		sr.length += n
 
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return sr.take(), io.EOF
 		} else if err != nil {
 			return ReadSlab{}, err

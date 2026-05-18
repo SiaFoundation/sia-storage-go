@@ -3,6 +3,7 @@ package siastorage
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -135,9 +136,9 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 
 		// read next slab
 		slab, err := sr.ReadSlab(br)
-		if slab.Length == 0 && err == io.EOF {
+		if slab.Length == 0 && errors.Is(err, io.EOF) {
 			return
-		} else if err != nil && err != io.EOF {
+		} else if err != nil && !errors.Is(err, io.EOF) {
 			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
 			return
 		}
