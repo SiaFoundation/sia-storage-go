@@ -87,6 +87,10 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 		opt(&uo)
 	}
 
+	if uo.maxInflight <= 0 {
+		return uo, nil, fmt.Errorf("maxInflight must be positive, got %d", uo.maxInflight)
+	}
+
 	totalShards := int(uo.dataShards) + int(uo.parityShards)
 	if err := slabs.ValidateECParams(int(uo.dataShards), totalShards); err != nil {
 		return uo, nil, err
