@@ -28,16 +28,17 @@ var (
 type (
 	// A PackedUpload allows multiple objects to be uploaded together in a single
 	// upload. This can be more efficient than uploading each object separately
-	// if the size of the objects is less than the minimum slab size.
+	// if the size of the objects is less than the optimal data size.
 	PackedUpload struct {
 		// static upload options
 		dataShards   uint8
 		parityShards uint8
 
 		// upload state
-		reader  *io.PipeReader
-		writer  *io.PipeWriter
-		objects []packedObject
+		reader       *io.PipeReader
+		writer       *io.PipeWriter
+		objects      []packedObject
+		totalWritten int64 // cumulative bytes written to pipe, including dead padding from errored reads
 
 		// orchestration
 		result        packedResult
@@ -64,6 +65,7 @@ type (
 // packed into the upload. The caller must call Finalize to get the resulting
 // objects after all objects have been added.
 func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
+	// return early if upload is finalized
 	select {
 	case <-ctx.Done():
 		return 0, ctx.Err()
@@ -81,7 +83,6 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 
 	// spawn goroutine to interrupt io.Copy if context is cancelled
 	done := make(chan struct{})
-	defer close(done)
 	addCtx, cancel, err := u.tg.AddContext(ctx)
 	if err != nil {
 		return 0, err
@@ -91,19 +92,25 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 		select {
 		case <-done:
 		case <-addCtx.Done():
-			u.reader.CloseWithError(context.Cause(addCtx))
+			u.finish(nil, context.Cause(addCtx))
 		}
 	}()
 
 	// pipe data into writer
+	offset := u.totalWritten
 	n, err := io.Copy(u.writer, r)
+	close(done) // stop the cancellation goroutine before processing the result
+	u.totalWritten += n
 	if err != nil {
-		// overwrite the error on cancellation to provide more context
-		if ctx.Err() != nil {
-			err = context.Cause(addCtx)
+		if errors.Is(err, io.ErrClosedPipe) {
+			// if the pipe was closed the result is ready
+			<-u.resultAvailCh
+			if u.result.err != nil {
+				return 0, u.result.err
+			}
+			return 0, ErrUploadFinalized
 		}
-		// stream is corrupted, finish with error
-		u.finish(nil, err)
+		// reader error: partial bytes become dead padding, upload stays usable
 		return 0, fmt.Errorf("failed to add object: %w", err)
 	} else if n == 0 {
 		return 0, ErrEmptyObject
@@ -111,7 +118,7 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 
 	// create packed object
 	u.objects = append(u.objects, packedObject{
-		offset:   u.Length(),
+		offset:   offset,
 		length:   n,
 		dataKey:  dataKey,
 		packedAt: time.Now(),
@@ -149,7 +156,7 @@ func (u *PackedUpload) Finalize(ctx context.Context) ([]Object, error) {
 	}
 
 	// build objects
-	slabSize := u.SlabSize()
+	slabSize := u.OptimalDataSize()
 	objects := make([]Object, len(u.objects))
 	for i, o := range u.objects {
 		// sanity check slab range to avoid panics
@@ -180,29 +187,26 @@ func (u *PackedUpload) Finalize(ctx context.Context) ([]Object, error) {
 	return objects, nil
 }
 
-// Length returns the cumulative length of all objects currently in the upload.
+// Length returns the cumulative number of bytes written to the upload pipeline,
+// including dead padding from errored reads.
 func (u *PackedUpload) Length() int64 {
-	if len(u.objects) == 0 {
-		return 0
-	}
-	last := u.objects[len(u.objects)-1]
-	return last.offset + last.length
+	return u.totalWritten
 }
 
 // Remaining returns the number of bytes remaining until reaching the optimal
 // packed size. Adding objects larger than this will span multiple slabs. To
 // minimize padding, prioritize objects that fit within the remaining size.
 func (u *PackedUpload) Remaining() int64 {
-	slabSize := u.SlabSize()
-	length := u.Length()
-	if length == 0 {
+	slabSize := u.OptimalDataSize()
+	if u.totalWritten == 0 {
 		return slabSize
 	}
-	return (slabSize - (length % slabSize)) % slabSize
+	return (slabSize - (u.totalWritten % slabSize)) % slabSize
 }
 
-// SlabSize returns the size of a slab based on the number of data shards.
-func (u *PackedUpload) SlabSize() int64 {
+// OptimalDataSize returns the data portion of a slab based on the number of
+// data shards.
+func (u *PackedUpload) OptimalDataSize() int64 {
 	return int64(u.dataShards) * proto4.SectorSize
 }
 
