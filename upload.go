@@ -200,8 +200,8 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	}
 
 	// shardCtx is cancelled when a write succeeds, aborting any racers
-	shardCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(client.ErrAbortedRPC)
+	shardCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	type writeResult struct {
 		host     types.PublicKey
@@ -247,7 +247,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 
 		case res := <-results:
 			if res.err == nil {
-				cancel(client.ErrAbortedRPC)
+				cancel()
 
 				// penalize the original host if a racer beat it
 				// while it was still uploading

@@ -72,7 +72,7 @@ func (m *mockHostClient) Close() error {
 
 // AddFailedRPC implements the [hostClient] interface.
 func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
-	m.provider.AddFailedRPC(hostKey, errors.New("aborted"))
+	m.provider.AddFailedRPC(hostKey)
 }
 
 // UploadQueue implements the [hostClient] interface.
@@ -139,7 +139,7 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
 		}
@@ -178,7 +178,7 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddReadSample(hostKey, length, time.Since(start))
 		}
@@ -213,7 +213,7 @@ func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddSettingsSample(hostKey, time.Since(start))
 		}

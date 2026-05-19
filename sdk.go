@@ -131,11 +131,9 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	}
 
 	var wg sync.WaitGroup
-	initialCtx, initialCancel := context.WithCancel(ctx)
-	overdriveCtx, overdriveCancel := context.WithCancelCause(ctx)
+	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
-		initialCancel()
-		overdriveCancel(client.ErrAbortedRPC)
+		cancel()
 		wg.Wait()
 	}()
 
@@ -156,17 +154,16 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	}
 	responseCh := make(chan result, len(slab.Sectors))
 	var outstanding int
-	tryDownloadSector := func(ctx context.Context, d sectorDownload) {
+	tryDownloadSector := func(d sectorDownload, initial bool) {
 		outstanding++
 		wg.Go(func() {
-			dlCtx, cancel := context.WithTimeout(ctx, timeout)
+			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
-			_, err := s.hosts.ReadSector(dlCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+			_, err := s.hosts.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
 			select {
 			case <-ctx.Done():
-				return
 			case responseCh <- result{
 				index:   d.index,
 				buf:     buf.Bytes(),
@@ -175,12 +172,18 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 				elapsed: time.Since(start),
 			}:
 			}
+			// a host gets demoted if either
+			// 1. it hit the shard timeout
+			// 2. it was part of the initial batch of hosts and was interrupted
+			if (timeoutCtx.Err() != nil && ctx.Err() == nil) || (initial && ctx.Err() != nil) {
+				s.hosts.AddFailedRPC(d.sector.HostKey)
+			}
 		})
 	}
 
 	// launch minShards downloads right away
 	for range slab.MinShards {
-		tryDownloadSector(initialCtx, slabSectors[slabHosts[0]])
+		tryDownloadSector(slabSectors[slabHosts[0]], true)
 		slabHosts = slabHosts[1:]
 	}
 
@@ -218,13 +221,13 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 				return nil, ErrNotEnoughShards
 			}
 			if res.err != nil && len(slabHosts) > 0 {
-				tryDownloadSector(overdriveCtx, slabSectors[slabHosts[0]])
+				tryDownloadSector(slabSectors[slabHosts[0]], false)
 				slabHosts = slabHosts[1:]
 			}
 		case <-timer.C:
 			// periodically launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
-				tryDownloadSector(overdriveCtx, slabSectors[slabHosts[0]])
+				tryDownloadSector(slabSectors[slabHosts[0]], false)
 				slabHosts = slabHosts[1:]
 			}
 		case <-ctx.Done():
