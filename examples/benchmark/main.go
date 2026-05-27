@@ -45,6 +45,7 @@ type seededVerifier struct {
 	src       *mrand.ChaCha8
 	size      uint64
 	remaining uint64
+	buf       []byte
 	start     time.Time
 	ttfb      time.Duration
 	hasTTFB   bool
@@ -80,7 +81,10 @@ func (v *seededVerifier) Write(p []byte) (int, error) {
 	if uint64(len(p)) > v.remaining {
 		return 0, fmt.Errorf("expected %d more bytes, got %d", v.remaining, len(p))
 	}
-	expected := make([]byte, len(p))
+	if cap(v.buf) < len(p) {
+		v.buf = make([]byte, len(p))
+	}
+	expected := v.buf[:len(p)]
 	_, _ = v.src.Read(expected)
 	if !bytes.Equal(expected, p) {
 		return 0, fmt.Errorf("data mismatch at byte %d", v.size-v.remaining)
@@ -135,8 +139,8 @@ func main() {
 
 	builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
 		ID:          appID,
-		Name:        "My Example App",
-		Description: "My Example App Description",
+		Name:        "Benchmark Example",
+		Description: "Benchmarks upload and download performance of the siastorage SDK",
 		ServiceURL:  "https://myexampleapp.com",
 	})
 
@@ -231,4 +235,13 @@ func main() {
 		formatBitrate(obj.Size(), downloadDuration),
 		verifier.gapMax,
 	)
+
+	fmt.Println("Cleaning up...")
+	if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
+		log.Fatal("failed to delete object:", err)
+	}
+	if err := sdk.PruneSlabs(ctx); err != nil {
+		log.Fatal("failed to prune slabs:", err)
+	}
+	fmt.Println("Object unpinned and slabs pruned.")
 }
