@@ -22,12 +22,12 @@ successive writes during the download.
 | Flag                      | Description                                         | Default               |
 |---------------------------|-----------------------------------------------------|-----------------------|
 | `-size`                   | Size of the data to upload and download, in bytes.  | `125829120` (120 MiB) |
-| `-upload-max-inflight`    | Maximum number of concurrent shard uploads.         | `30`                  |
-| `-download-max-inflight`  | Maximum number of concurrent chunk downloads.       | `80`                  |
+| `-upload-max-inflight`    | Maximum number of concurrent shard uploads.         | `0` (SDK default)     |
+| `-download-max-inflight`  | Maximum number of concurrent chunk downloads.       | `0` (SDK default)     |
 
 ## Example
 
-Run the benchmark with 10 GB of data, 16 concurrent uploaders and 32 concurrent
+Run the benchmark with 10 GiB of data, 16 concurrent uploaders and 32 concurrent
 downloaders:
 
 ```sh
