@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/reedsolomon"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/indexd/slabs"
@@ -232,25 +231,10 @@ func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
 // used to add objects and then finalized to get the resulting objects. A packed
 // upload is not thread-safe.
 func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
-	uo := uploadOption{
-		dataShards:   10,
-		parityShards: 20,
-		maxInflight:  30,
-	}
-	for _, opt := range opts {
-		opt(&uo)
-	}
-
-	// validate erasure coding params
-	totalShards := int(uo.dataShards) + int(uo.parityShards)
-	if err := slabs.ValidateECParams(int(uo.dataShards), totalShards); err != nil {
-		return nil, err
-	}
-
-	// create RS encoder
-	enc, err := reedsolomon.New(int(uo.dataShards), int(uo.parityShards))
+	// create upload options
+	uo, enc, err := newUploadOption(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create erasure coder: %w", err)
+		return nil, err
 	}
 
 	// create packed upload
@@ -266,17 +250,17 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 		tg:            threadgroup.New(),
 	}
 
-	// register with threadgroup to ensure proper cleanup of goroutines on Close
+	// ensure proper goroutine cleanup on close
 	ctx, cancel, err := u.tg.AddContext(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
 	// upload slabs in background
-	slabCh := make(chan slabUpload, concurrentSlabUploads)
+	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
-		s.uploadSlabs(ctx, slabCh, reader, enc, int(u.dataShards), int(u.parityShards), uo.maxInflight, uo.onProgress)
-		close(slabCh)
+		defer close(slabCh)
+		s.uploadSlabs(ctx, slabCh, reader, enc, uo)
 	}()
 
 	// collect uploaded slabs in the background, we have to do this to avoid a
@@ -284,55 +268,8 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	// uploadSlabs reads from that pipe
 	go func() {
 		defer cancel()
-
-		var uploaded []slabs.SlabSlice
-		var uploadErr error
-
-	outer:
-		for slab := range slabCh {
-			if errors.Is(slab.err, io.EOF) {
-				break
-			} else if slab.err != nil {
-				uploadErr = slab.err
-				break
-			}
-
-			// collect shards
-			totalShards := u.dataShards + u.parityShards
-			sectors := make([]slabs.PinnedSector, totalShards)
-			for n := totalShards; n > 0; n-- {
-				select {
-				case <-ctx.Done():
-					uploadErr = ctx.Err()
-					break outer
-				case shard := <-slab.uploadsCh:
-					if shard.err != nil {
-						uploadErr = fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
-						break outer
-					}
-					sectors[shard.index] = slabs.PinnedSector{
-						HostKey: shard.host,
-						Root:    shard.root,
-					}
-				}
-			}
-
-			// append uploaded slab
-			uploaded = append(uploaded, slabs.SlabSlice{
-				EncryptionKey: slab.encryptionKey,
-				MinShards:     uint(u.dataShards),
-				Sectors:       sectors,
-				Offset:        0,
-				Length:        slab.length,
-			})
-		}
-
-		// ensure context is taken into account
-		if uploadErr == nil && ctx.Err() != nil {
-			uploadErr = ctx.Err()
-		}
-
-		u.finish(uploaded, uploadErr)
+		uploaded, err := collectSlabs(ctx, slabCh, uo)
+		u.finish(uploaded, err)
 	}()
 
 	return u, nil

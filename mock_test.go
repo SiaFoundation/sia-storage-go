@@ -58,6 +58,9 @@ type mockHostClient struct {
 	sectorsMu   sync.Mutex
 	hostSectors map[types.PublicKey]map[types.Hash256][]byte
 
+	writesMu   sync.Mutex
+	writeCalls map[types.PublicKey]int
+
 	pricesMu    sync.Mutex
 	pricesCalls map[types.PublicKey]int
 }
@@ -65,6 +68,11 @@ type mockHostClient struct {
 // Close implements the [hostClient] interface.
 func (m *mockHostClient) Close() error {
 	return nil
+}
+
+// AddFailedRPC implements the [hostClient] interface.
+func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
+	m.provider.AddFailedRPC(hostKey)
 }
 
 // UploadQueue implements the [hostClient] interface.
@@ -131,11 +139,15 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
 		}
 	}()
+
+	m.writesMu.Lock()
+	m.writeCalls[hostKey]++
+	m.writesMu.Unlock()
 
 	// simulate RPC error
 	if err := m.hostError(hostKey); err != nil {
@@ -166,7 +178,7 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddReadSample(hostKey, length, time.Since(start))
 		}
@@ -201,7 +213,7 @@ func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			m.provider.AddFailedRPC(hostKey, err)
+			m.provider.AddFailedRPC(hostKey)
 		} else {
 			m.provider.AddSettingsSample(hostKey, time.Since(start))
 		}
@@ -225,6 +237,15 @@ func (m *mockHostClient) PricesCalls() map[types.PublicKey]int {
 	return calls
 }
 
+// WriteCalls returns the number of WriteSector calls per host.
+func (m *mockHostClient) WriteCalls() map[types.PublicKey]int {
+	m.writesMu.Lock()
+	defer m.writesMu.Unlock()
+	calls := make(map[types.PublicKey]int, len(m.writeCalls))
+	maps.Copy(calls, m.writeCalls)
+	return calls
+}
+
 // ResetPricesCalls clears the Prices call counters.
 func (m *mockHostClient) ResetPricesCalls() {
 	m.pricesMu.Lock()
@@ -239,28 +260,26 @@ func (m *mockHostClient) ResetSlowHosts() {
 	m.provider = client.NewProvider(m.hosts) // reset provider to clear host performance metrics
 }
 
-func (m *mockHostClient) SetSlowHosts(tb testing.TB, n int, d time.Duration) {
+func (m *mockHostClient) SetSlowHosts(tb testing.TB, n int, d time.Duration) []types.PublicKey {
 	tb.Helper()
 
 	hosts, _ := m.hosts.UsableHosts()
 	if n > len(hosts) {
-		tb.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
+		tb.Fatalf("cannot set %d slow hosts: only %d hosts available", n, len(hosts))
 	}
 
 	m.delayMu.Lock()
 	defer m.delayMu.Unlock()
 
-	var set int
+	slow := make([]types.PublicKey, 0, n)
 	for _, hi := range hosts {
-		if set >= n {
-			return // already set enough hosts
+		if len(slow) >= n {
+			break
 		}
-		set++
 		m.slowHosts[hi.PublicKey] = d
+		slow = append(slow, hi.PublicKey)
 	}
-	if set < n {
-		tb.Fatalf("not enough hosts to set as slow: only %d hosts available", len(hosts))
-	}
+	return slow
 }
 
 func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration) {
@@ -300,6 +319,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		sectorDelays: make(map[types.Hash256]time.Duration),
 		errHosts:     make(map[types.PublicKey]hostErr),
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
+		writeCalls:   make(map[types.PublicKey]int),
 		pricesCalls:  make(map[types.PublicKey]int),
 	}
 	return m
