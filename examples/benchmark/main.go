@@ -11,11 +11,13 @@ import (
 	"log"
 	mrand "math/rand/v2"
 	"os"
+	"strings"
 	"time"
 
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	siastorage "go.sia.tech/siastorage"
+	"golang.org/x/term"
 )
 
 const appIDHex = "5c0b1af28e6ac76395b2087ea987297b9c496f90d2ab3e3d3d07980ae4c43633"
@@ -126,15 +128,34 @@ func encodedSize(obj siastorage.Object) uint64 {
 	return n
 }
 
-func main() {
-	size := flag.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
-	uploadMaxInflight := flag.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
-	downloadMaxInflight := flag.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
-	flag.Parse()
+// readPhrase reads the wallet recovery phrase from stdin. When stdin is a
+// terminal it reads without echoing the secret; otherwise it reads a single
+// line so the benchmark can still be driven non-interactively (e.g. piped in).
+func readPhrase() (string, error) {
+	fmt.Println("Enter recovery phrase:")
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		b, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return "", fmt.Errorf("failed to read recovery phrase: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
 
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("failed to read recovery phrase: %w", err)
+		}
+		return "", fmt.Errorf("failed to read recovery phrase: unexpected EOF on stdin")
+	}
+	return strings.TrimSpace(scanner.Text()), nil
+}
+
+func run(ctx context.Context, size uint64, uploadMaxInflight, downloadMaxInflight int) error {
 	var appID types.Hash256
 	if err := appID.UnmarshalText([]byte(appIDHex)); err != nil {
-		log.Fatal("failed to parse app ID:", err)
+		return fmt.Errorf("failed to parse app ID: %w", err)
 	}
 
 	builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
@@ -144,74 +165,85 @@ func main() {
 		ServiceURL:  "https://myexampleapp.com",
 	})
 
-	ctx := context.Background()
-
 	responseURL, err := builder.RequestConnection(ctx)
 	if err != nil {
-		log.Fatal("failed to request connection:", err)
+		return fmt.Errorf("failed to request connection: %w", err)
 	}
 	fmt.Println("Visit the following URL to authorize the application:", responseURL)
 
 	if err := builder.WaitForApproval(ctx); err != nil {
-		log.Fatal("failed to wait for approval:", err)
+		return fmt.Errorf("failed to wait for approval: %w", err)
 	}
 	fmt.Println("Connection approved!")
 
-	fmt.Println("Enter recovery phrase:")
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		log.Fatal("failed to read recovery phrase")
+	phrase, err := readPhrase()
+	if err != nil {
+		return err
 	}
-	phrase := scanner.Text()
 
 	sdk, err := builder.Register(ctx, phrase)
 	if err != nil {
-		log.Fatal("failed to register app:", err)
+		return fmt.Errorf("failed to register app: %w", err)
 	}
 	defer sdk.Close()
 	fmt.Println("App registered successfully!")
 
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
-		log.Fatal("failed to generate seed:", err)
+		return fmt.Errorf("failed to generate seed: %w", err)
 	}
 
 	var uploadOpts []siastorage.UploadOption
-	if *uploadMaxInflight > 0 {
-		uploadOpts = append(uploadOpts, siastorage.WithUploadInflight(*uploadMaxInflight))
+	if uploadMaxInflight > 0 {
+		uploadOpts = append(uploadOpts, siastorage.WithUploadInflight(uploadMaxInflight))
 	}
 
 	fmt.Println("Uploading random data...")
 	obj := siastorage.NewEmptyObject()
 	uploadStart := time.Now()
-	if err := sdk.Upload(ctx, &obj, newSeededReader(seed, *size), uploadOpts...); err != nil {
-		log.Fatal("failed to upload object:", err)
+	if err := sdk.Upload(ctx, &obj, newSeededReader(seed, size), uploadOpts...); err != nil {
+		return fmt.Errorf("failed to upload object: %w", err)
 	}
 	uploadDuration := time.Since(uploadStart)
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
-		log.Fatal("failed to pin object:", err)
+		return fmt.Errorf("failed to pin object: %w", err)
 	}
 	fmt.Println("Object pinned successfully!")
 
+	// Best-effort cleanup so a failure during download/verification doesn't
+	// leave a pinned object and its slabs behind in the user's account.
+	defer func() {
+		fmt.Println("Cleaning up...")
+		if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
+			log.Printf("failed to delete object: %v", err)
+			return
+		}
+		if err := sdk.PruneSlabs(ctx); err != nil {
+			log.Printf("failed to prune slabs: %v", err)
+			return
+		}
+		fmt.Println("Object unpinned and slabs pruned.")
+	}()
+
 	var downloadOpts []siastorage.DownloadOption
-	if *downloadMaxInflight > 0 {
-		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(*downloadMaxInflight))
+	if downloadMaxInflight > 0 {
+		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(downloadMaxInflight))
 	}
 
 	fmt.Println("Downloading object...")
-	verifier := newSeededVerifier(seed, *size)
+	verifier := newSeededVerifier(seed, size)
 	downloadStart := time.Now()
 	rc, err := sdk.Download(obj, downloadOpts...)
 	if err != nil {
-		log.Fatal("failed to start download:", err)
+		return fmt.Errorf("failed to start download: %w", err)
 	}
 	defer rc.Close()
 	if _, err := io.Copy(verifier, rc); err != nil {
-		log.Fatal("failed to copy data:", err)
+		return fmt.Errorf("failed to copy data: %w", err)
 	}
 	if verifier.remaining != 0 {
-		log.Fatalf("expected %d more bytes", verifier.remaining)
+		return fmt.Errorf("expected %d more bytes", verifier.remaining)
 	}
 	downloadDuration := time.Since(downloadStart)
 
@@ -226,7 +258,7 @@ func main() {
 		formatBitrate(encoded, uploadDuration),
 	)
 	fmt.Printf(
-		"Object downloaded ID: %s\tSize: %s\tEncoded: %s\tElapsed: %s\tTTFB: %s\tThroughput: %s\tMax Write Latency: %s\n",
+		"Object downloaded ID: %s\tSize: %s\tEncoded: %s\tElapsed: %s\tTTFB: %s\tThroughput: %s\tMax Latency: %s\n",
 		obj.ID(),
 		formatBytes(obj.Size()),
 		formatBytes(encoded),
@@ -236,12 +268,16 @@ func main() {
 		verifier.gapMax,
 	)
 
-	fmt.Println("Cleaning up...")
-	if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
-		log.Fatal("failed to delete object:", err)
+	return nil
+}
+
+func main() {
+	size := flag.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
+	uploadMaxInflight := flag.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
+	downloadMaxInflight := flag.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
+	flag.Parse()
+
+	if err := run(context.Background(), *size, *uploadMaxInflight, *downloadMaxInflight); err != nil {
+		log.Fatal(err)
 	}
-	if err := sdk.PruneSlabs(ctx); err != nil {
-		log.Fatal("failed to prune slabs:", err)
-	}
-	fmt.Println("Object unpinned and slabs pruned.")
 }
