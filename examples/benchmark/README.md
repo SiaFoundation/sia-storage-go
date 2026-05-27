@@ -31,7 +31,7 @@ Run the benchmark with 10 GiB of data, 16 concurrent uploaders and 32 concurrent
 downloaders:
 
 ```sh
-go run . -size $((10 * 1024 * 1024 * 1024)) -upload-max-inflight 16 -download-max-inflight 32
+go run ./examples/benchmark -size $((10 * 1024 * 1024 * 1024)) -upload-max-inflight 16 -download-max-inflight 32
 ```
 
 Follow the printed URL to authorize the app, then paste your recovery phrase
