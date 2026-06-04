@@ -254,8 +254,8 @@ func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
 
 // PruneSlabs removes all slabs on the account that are not associated with
 // an object.
-func (s *SDK) PruneSlabs(ctx context.Context) error {
-	return s.app.PruneSlabs(ctx, s.appKey)
+func (s *SDK) PruneSlabs(ctx context.Context, opts ...api.URLQueryParameterOption) error {
+	return s.app.PruneSlabs(ctx, s.appKey, opts...)
 }
 
 // DeleteObject deletes the object with the given key from the indexer.
