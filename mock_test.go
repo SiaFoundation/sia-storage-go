@@ -518,7 +518,7 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 	return nil
 }
 
-func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey) error {
+func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, _ ...api.URLQueryParameterOption) error {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
