@@ -55,7 +55,7 @@ type (
 		Slab(context.Context, types.PrivateKey, slabs.SlabID) (slabs.PinnedSlab, error)
 		PinSlabs(context.Context, types.PrivateKey, ...slabs.SlabPinParams) ([]slabs.SlabID, error)
 		UnpinSlab(context.Context, types.PrivateKey, slabs.SlabID) error
-		PruneSlabs(context.Context, types.PrivateKey) error
+		PruneSlabs(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) error
 	}
 
 	downloadOption struct {
