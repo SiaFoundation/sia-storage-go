@@ -25,6 +25,10 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
+// pinBatchSize is the maximum number of slabs sent to the indexer in a
+// single PinSlabs request.
+const pinBatchSize = 32
+
 type (
 	// A hostClient is an interface for interacting with hosts.
 	hostClient interface {
@@ -406,14 +410,18 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 		}
 	}
 
-	slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params...)
-	if err != nil {
-		return fmt.Errorf("failed to pin slabs: %w", err)
-	}
+	for i := 0; i < len(params); i += pinBatchSize {
+		end := min(i+pinBatchSize, len(params))
 
-	for i, slab := range obj.slabs {
-		if expected := slab.Digest(); slabIDs[i] != expected {
-			return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i, slabIDs[i], expected)
+		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params[i:end]...)
+		if err != nil {
+			return fmt.Errorf("failed to pin slabs: %w", err)
+		}
+
+		for j, slab := range obj.slabs[i:end] {
+			if expected := slab.Digest(); slabIDs[j] != expected {
+				return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i+j, slabIDs[j], expected)
+			}
 		}
 	}
 
