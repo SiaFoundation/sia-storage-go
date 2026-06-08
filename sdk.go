@@ -397,26 +397,44 @@ func (s *SDK) Close() error {
 // PinObject pins the object's slabs and saves the object metadata to the
 // indexer.
 func (s *SDK) PinObject(ctx context.Context, obj Object) error {
-	params := make([]slabs.SlabPinParams, len(obj.slabs))
-	for i, slab := range obj.slabs {
-		params[i] = slabs.SlabPinParams{
-			EncryptionKey: slab.EncryptionKey,
-			MinShards:     slab.MinShards,
-			Sectors:       slab.Sectors,
+	const pinBatchSize = 50
+
+	var pinned []slabs.SlabID
+	unpinAll := func() {
+		for _, id := range pinned {
+			if err := s.app.UnpinSlab(ctx, s.appKey, id); err != nil {
+				s.log.Warn("failed to unpin slab during rollback", zap.Stringer("id", id), zap.Error(err))
+			}
 		}
 	}
 
-	slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params...)
-	if err != nil {
-		return fmt.Errorf("failed to pin slabs: %w", err)
-	}
+	for offset := 0; offset < len(obj.slabs); offset += pinBatchSize {
+		end := min(offset+pinBatchSize, len(obj.slabs))
+		batch := obj.slabs[offset:end]
 
-	for i, slab := range obj.slabs {
-		if expected := slab.Digest(); slabIDs[i] != expected {
-			return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i, slabIDs[i], expected)
+		params := make([]slabs.SlabPinParams, len(batch))
+		for i, slab := range batch {
+			params[i] = slabs.SlabPinParams{
+				EncryptionKey: slab.EncryptionKey,
+				MinShards:     slab.MinShards,
+				Sectors:       slab.Sectors,
+			}
+		}
+
+		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params...)
+		if err != nil {
+			unpinAll()
+			return fmt.Errorf("failed to pin slabs: %w", err)
+		}
+		pinned = append(pinned, slabIDs...)
+
+		for i, slab := range batch {
+			if expected := slab.Digest(); slabIDs[i] != expected {
+				unpinAll()
+				return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", offset+i, slabIDs[i], expected)
+			}
 		}
 	}
-
 	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
