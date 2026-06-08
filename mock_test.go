@@ -333,6 +333,7 @@ type mockAppClient struct {
 	objects       map[types.Hash256]slabs.SealedObject
 	deleted       map[types.Hash256]time.Time
 	hostsOverride []hosts.HostInfo
+	pinSlabsCalls []int
 }
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
@@ -353,6 +354,8 @@ func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp ap
 func (mc *mockAppClient) PinSlabs(_ context.Context, _ types.PrivateKey, toPin ...slabs.SlabPinParams) (digests []slabs.SlabID, err error) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
+
+	mc.pinSlabsCalls = append(mc.pinSlabsCalls, len(toPin))
 
 	for _, s := range toPin {
 		id := s.Digest()

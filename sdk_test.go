@@ -510,6 +510,49 @@ func TestE2E(t *testing.T) {
 	assertShareable(objects2[1], data4)
 }
 
+func TestPinObjectBatching(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(30)
+	appMock := newMockAppClient(hostStore)
+	hostMock := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appMock, hostMock, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sdk.Close()
+
+	// build a large object
+	const numSlabs = pinBatchSize*2 + pinBatchSize/2
+	obj := NewEmptyObject()
+	for range numSlabs {
+		obj.slabs = append(obj.slabs, slabs.SlabSlice{
+			EncryptionKey: slabs.EncryptionKey(types.GeneratePrivateKey()),
+			MinShards:     1,
+			Sectors: []slabs.PinnedSector{{
+				Root:    frand.Entropy256(),
+				HostKey: types.GeneratePrivateKey().PublicKey(),
+			}},
+			Length: 1,
+		})
+	}
+	if err := sdk.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert batches
+	expected := []int{pinBatchSize, pinBatchSize, pinBatchSize / 2}
+	if len(appMock.pinSlabsCalls) != len(expected) {
+		t.Fatal("unexpected", appMock.pinSlabsCalls)
+	}
+	for i, c := range appMock.pinSlabsCalls {
+		if c != expected[i] {
+			t.Fatal("mismatch", c, expected[i])
+		}
+	}
+}
+
 func TestRefreshHosts(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
 	hostStore := newMockHostStore(30)
