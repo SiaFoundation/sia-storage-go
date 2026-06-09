@@ -524,19 +524,7 @@ func TestPinObjectBatching(t *testing.T) {
 	defer sdk.Close()
 
 	// build a large object
-	const numSlabs = pinBatchSize*2 + pinBatchSize/2
-	obj := NewEmptyObject()
-	for range numSlabs {
-		obj.slabs = append(obj.slabs, slabs.SlabSlice{
-			EncryptionKey: slabs.EncryptionKey(types.GeneratePrivateKey()),
-			MinShards:     1,
-			Sectors: []slabs.PinnedSector{{
-				Root:    frand.Entropy256(),
-				HostKey: types.GeneratePrivateKey().PublicKey(),
-			}},
-			Length: 1,
-		})
-	}
+	obj := newTestObject(t, pinBatchSize*2+pinBatchSize/2)
 	if err := sdk.PinObject(t.Context(), obj); err != nil {
 		t.Fatal(err)
 	}
@@ -703,4 +691,31 @@ func BenchmarkDownload(b *testing.B) {
 			benchMatrix(b, s, i)
 		}
 	}
+}
+
+func newTestObject(t *testing.T, numSlabs int) Object {
+	t.Helper()
+
+	randomSectors := func(n int) []slabs.PinnedSector {
+		sectors := make([]slabs.PinnedSector, n)
+		for i := range sectors {
+			sectors[i] = slabs.PinnedSector{
+				Root:    frand.Entropy256(),
+				HostKey: types.GeneratePrivateKey().PublicKey(),
+			}
+		}
+		return sectors
+	}
+
+	obj := NewEmptyObject()
+	for range numSlabs {
+		obj.slabs = append(obj.slabs, slabs.SlabSlice{
+			EncryptionKey: slabs.EncryptionKey(types.GeneratePrivateKey()),
+			MinShards:     10,
+			Sectors:       randomSectors(30),
+			Length:        1,
+		})
+	}
+
+	return obj
 }

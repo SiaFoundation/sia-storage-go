@@ -27,7 +27,7 @@ import (
 
 // pinBatchSize is the maximum number of slabs sent to the indexer in a
 // single PinSlabs request.
-const pinBatchSize = 32
+const pinBatchSize = 50
 
 type (
 	// A hostClient is an interface for interacting with hosts.
