@@ -408,6 +408,9 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 			MinShards:     slab.MinShards,
 			Sectors:       slab.Sectors,
 		}
+		if err := params[i].Validate(); err != nil {
+			return fmt.Errorf("slab %d invalid: %w", i, err)
+		}
 	}
 
 	for i := 0; i < len(params); i += pinBatchSize {
