@@ -328,8 +328,7 @@ func saveConfig(cfg config) (string, error) {
 		return "", err
 	}
 	if err := toml.NewEncoder(f).Encode(cfg); err != nil {
-		f.Close()
-		return "", err
+		return "", errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return "", err
@@ -533,16 +532,22 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 	uploadBar.SetCurrent(int64(size)) // ensure the bar completes
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
+		// The upload succeeded but the slabs were never associated with an
+		// object, so prune them best-effort to avoid leaving orphaned data.
+		if pruneErr := sdk.PruneSlabs(ctx); pruneErr != nil {
+			log.Printf("failed to prune slabs after pin failure: %v", pruneErr)
+		}
 		progress.Wait()
 		return fmt.Errorf("failed to pin object: %w", err)
 	}
 
 	// Best-effort cleanup so a failure during download/verification doesn't
-	// leave a pinned object and its slabs behind in the user's account.
+	// leave a pinned object and its slabs behind in the user's account. Both
+	// steps run independently: PruneSlabs is safe and useful even if the
+	// object delete fails, since it only removes unreferenced slabs.
 	defer func() {
 		if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
 			log.Printf("failed to delete object: %v", err)
-			return
 		}
 		if err := sdk.PruneSlabs(ctx); err != nil {
 			log.Printf("failed to prune slabs: %v", err)
@@ -607,17 +612,24 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 }
 
 // newFileLogger writes SDK logs to a timestamped file so they don't interleave
-// with the progress bars on stderr.
-func newFileLogger() (*zap.Logger, string, error) {
-	path := fmt.Sprintf("benchmark-%s.log", time.Now().Format("20060102T150405"))
+// with the progress bars on stderr. The returned closer flushes the logger and
+// closes the underlying file; callers should defer it.
+func newFileLogger() (logger *zap.Logger, path string, closer func() error, err error) {
+	path = fmt.Sprintf("benchmark-%s.log", time.Now().Format("20060102T150405"))
 	f, err := os.Create(path)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	cfg := zap.NewProductionEncoderConfig()
 	cfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	core := zapcore.NewCore(zapcore.NewConsoleEncoder(cfg), zapcore.AddSync(f), zap.InfoLevel)
-	return zap.New(core), path, nil
+	logger = zap.New(core)
+	closer = func() error {
+		// Sync flushes zap's buffers to the file; Close releases the fd.
+		syncErr := logger.Sync()
+		return errors.Join(syncErr, f.Close())
+	}
+	return logger, path, closer, nil
 }
 
 func usage() {
@@ -661,11 +673,11 @@ func main() {
 		hostSummary := fs.Bool("host-summary", false, "print a per-host breakdown of shards and throughput after the run")
 		fs.Parse(os.Args[2:])
 
-		logger, logPath, err := newFileLogger()
+		logger, logPath, closeLogger, err := newFileLogger()
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer logger.Sync()
+		defer closeLogger()
 		fmt.Fprintf(os.Stderr, "logging to %s\n", logPath)
 
 		sdk, err := connect(ctx, *profileName, logger)
