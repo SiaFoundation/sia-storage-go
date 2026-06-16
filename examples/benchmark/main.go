@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	siastorage "go.sia.tech/siastorage"
@@ -90,16 +92,16 @@ type seededVerifier struct {
 	prev      time.Duration
 	hasPrev   bool
 	gapMax    time.Duration
-	progress  *progressBar
+	bar       *mpb.Bar
 }
 
-func newSeededVerifier(seed [32]byte, size uint64, progress *progressBar) *seededVerifier {
+func newSeededVerifier(seed [32]byte, size uint64, bar *mpb.Bar) *seededVerifier {
 	return &seededVerifier{
 		src:       mrand.NewChaCha8(seed),
 		size:      size,
 		remaining: size,
 		start:     time.Now(),
-		progress:  progress,
+		bar:       bar,
 	}
 }
 
@@ -130,7 +132,7 @@ func (v *seededVerifier) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("data mismatch at byte %d", v.size-v.remaining)
 	}
 	v.remaining -= uint64(len(p))
-	v.progress.add(uint64(len(p)))
+	v.bar.IncrBy(len(p))
 	return len(p), nil
 }
 
@@ -162,14 +164,6 @@ func formatBitrate(b uint64, d time.Duration) string {
 	panic("unreachable")
 }
 
-func formatClock(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	total := int(d.Seconds())
-	return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
-}
-
 func encodedSize(obj siastorage.Object) uint64 {
 	var n uint64
 	for _, s := range obj.Slabs() {
@@ -178,85 +172,33 @@ func encodedSize(obj siastorage.Object) uint64 {
 	return n
 }
 
-// progressBar renders a single-line progress bar to stderr, mirroring the
-// indicatif-style bar used by the Rust benchmark.
-type progressBar struct {
-	mu       sync.Mutex
-	total    uint64
-	cur      uint64
-	msg      string
-	start    time.Time
-	lastDraw time.Time
-}
-
-func newProgressBar(total uint64, msg string) *progressBar {
-	now := time.Now()
-	p := &progressBar{total: total, msg: msg, start: now}
-	p.draw(now)
-	return p
-}
-
-func (p *progressBar) set(n uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cur = n
-	p.maybeDraw()
-}
-
-func (p *progressBar) add(n uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cur += n
-	p.maybeDraw()
-}
-
-func (p *progressBar) maybeDraw() {
-	now := time.Now()
-	if now.Sub(p.lastDraw) < 100*time.Millisecond && p.cur < p.total {
-		return
-	}
-	p.draw(now)
-}
-
-func (p *progressBar) draw(now time.Time) {
-	const width = 40
-	p.lastDraw = now
-	ratio := 0.0
-	if p.total > 0 {
-		ratio = float64(p.cur) / float64(p.total)
-	}
-	if ratio > 1 {
-		ratio = 1
-	}
-	filled := int(float64(width) * ratio)
-	var bar string
-	if filled >= width {
-		bar = strings.Repeat("=", width)
-	} else {
-		bar = strings.Repeat("=", filled) + ">" + strings.Repeat("-", width-filled-1)
-	}
-	elapsed := now.Sub(p.start)
-	var eta time.Duration
-	if p.cur > 0 && p.cur < p.total {
-		eta = time.Duration(float64(elapsed) * float64(p.total-p.cur) / float64(p.cur))
-	}
-	fmt.Fprintf(os.Stderr, "\r%-8s [%s] [%s] %s/%s (%s, %s)   ",
-		p.msg,
-		formatClock(elapsed),
-		bar,
-		formatBytes(p.cur),
-		formatBytes(p.total),
-		formatBitrate(p.cur, elapsed),
-		formatClock(eta),
+// newTransferBar adds an indicatif-style progress bar to the container. The
+// rate is reported as a bitrate (Mbps) to match the benchmark's summary, and
+// is frozen at completion so a finished bar doesn't decay while the next
+// transfer runs.
+func newTransferBar(p *mpb.Progress, name string, total uint64, start time.Time) *mpb.Bar {
+	var frozen time.Duration
+	return p.New(int64(total),
+		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding("-").Rbound("]"),
+		mpb.BarWidth(40),
+		mpb.PrependDecorators(
+			decor.Name(fmt.Sprintf("%-8s ", name)),
+			decor.CountersKibiByte("% .2f / % .2f", decor.WCSyncSpace),
+		),
+		mpb.AppendDecorators(
+			decor.Any(func(s decor.Statistics) string {
+				elapsed := time.Since(start)
+				if s.Completed {
+					if frozen == 0 {
+						frozen = elapsed
+					}
+					elapsed = frozen
+				}
+				return formatBitrate(uint64(s.Current), elapsed)
+			}, decor.WCSyncSpace),
+			decor.OnComplete(decor.AverageETA(decor.ET_STYLE_GO, decor.WCSyncSpace), "done"),
+		),
 	)
-}
-
-func (p *progressBar) finish() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cur = p.total
-	p.draw(time.Now())
-	fmt.Fprintln(os.Stderr)
 }
 
 // hostStat accumulates per-host transfer totals.
@@ -558,10 +500,13 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 		return fmt.Errorf("failed to generate seed: %w", err)
 	}
 
+	progress := mpb.New(mpb.WithOutput(os.Stderr))
+
 	// upload the data to the network
-	uploadProgress := newProgressBar(size, "upload")
 	uploadHosts := newHostStats()
 	var encodedUploaded atomic.Uint64
+	uploadStart := time.Now()
+	uploadBar := newTransferBar(progress, "upload", size, uploadStart)
 	uploadOpts := []siastorage.UploadOption{
 		siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
 			encoded := encodedUploaded.Add(p.ShardSize)
@@ -570,7 +515,7 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 			if unencoded > size {
 				unencoded = size
 			}
-			uploadProgress.set(unencoded)
+			uploadBar.SetCurrent(int64(unencoded))
 			uploadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
 		}),
 	}
@@ -579,14 +524,16 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 	}
 
 	obj := siastorage.NewEmptyObject()
-	uploadStart := time.Now()
 	if err := sdk.Upload(ctx, &obj, newSeededReader(seed, size), uploadOpts...); err != nil {
+		uploadBar.Abort(false)
+		progress.Wait()
 		return fmt.Errorf("failed to upload object: %w", err)
 	}
 	uploadDuration := time.Since(uploadStart)
-	uploadProgress.finish()
+	uploadBar.SetCurrent(int64(size)) // ensure the bar completes
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
+		progress.Wait()
 		return fmt.Errorf("failed to pin object: %w", err)
 	}
 
@@ -603,7 +550,6 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 	}()
 
 	// download and verify the data
-	downloadProgress := newProgressBar(size, "download")
 	downloadHosts := newHostStats()
 	downloadOpts := []siastorage.DownloadOption{
 		siastorage.WithDownloadProgress(func(p siastorage.ShardProgress) {
@@ -614,21 +560,28 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(downloadMaxInflight))
 	}
 
-	verifier := newSeededVerifier(seed, size, downloadProgress)
 	downloadStart := time.Now()
+	downloadBar := newTransferBar(progress, "download", size, downloadStart)
+	verifier := newSeededVerifier(seed, size, downloadBar)
 	rc, err := sdk.Download(obj, downloadOpts...)
 	if err != nil {
+		downloadBar.Abort(false)
+		progress.Wait()
 		return fmt.Errorf("failed to start download: %w", err)
 	}
 	defer rc.Close()
 	if _, err := io.Copy(verifier, rc); err != nil {
+		downloadBar.Abort(false)
+		progress.Wait()
 		return fmt.Errorf("failed to copy data: %w", err)
 	}
 	if verifier.remaining != 0 {
+		downloadBar.Abort(false)
+		progress.Wait()
 		return fmt.Errorf("expected %d more bytes", verifier.remaining)
 	}
 	downloadDuration := time.Since(downloadStart)
-	downloadProgress.finish()
+	progress.Wait() // flush and stop rendering before printing the summary
 
 	encoded := encodedSize(obj)
 	fmt.Printf("\n%-15s%s\n", "Size:", formatBytes(obj.Size()))
