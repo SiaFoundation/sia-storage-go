@@ -5,23 +5,57 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	mrand "math/rand/v2"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	siastorage "go.sia.tech/siastorage"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/term"
 )
 
-const appIDHex = "5c0b1af28e6ac76395b2087ea987297b9c496f90d2ab3e3d3d07980ae4c43633"
+const (
+	appIDHex       = "5c0b1af28e6ac76395b2087ea987297b9c496f90d2ab3e3d3d07980ae4c43633"
+	defaultIndexer = "https://sia.storage"
+	defaultProfile = "default"
 
+	// These mirror the SDK's default redundancy and are used only to map the
+	// number of encoded bytes uploaded back to an approximate unencoded
+	// position for the upload progress bar.
+	benchDataShards  = 10
+	benchTotalShards = 30
+)
+
+func appMetadata() (siastorage.AppMetadata, error) {
+	var appID types.Hash256
+	if err := appID.UnmarshalText([]byte(appIDHex)); err != nil {
+		return siastorage.AppMetadata{}, fmt.Errorf("failed to parse app ID: %w", err)
+	}
+	return siastorage.AppMetadata{
+		ID:          appID,
+		Name:        "Benchmark",
+		Description: "A simple upload and download benchmark for the SDK",
+		ServiceURL:  "https://sia.tech",
+	}, nil
+}
+
+// seededReader produces a deterministic stream of bytes from a seed.
 type seededReader struct {
 	src       *mrand.ChaCha8
 	remaining uint64
@@ -43,6 +77,8 @@ func (r *seededReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// seededVerifier verifies a downloaded stream against the same seed used to
+// produce it, while recording latency metrics and driving a progress bar.
 type seededVerifier struct {
 	src       *mrand.ChaCha8
 	size      uint64
@@ -54,14 +90,16 @@ type seededVerifier struct {
 	prev      time.Duration
 	hasPrev   bool
 	gapMax    time.Duration
+	progress  *progressBar
 }
 
-func newSeededVerifier(seed [32]byte, size uint64) *seededVerifier {
+func newSeededVerifier(seed [32]byte, size uint64, progress *progressBar) *seededVerifier {
 	return &seededVerifier{
 		src:       mrand.NewChaCha8(seed),
 		size:      size,
 		remaining: size,
 		start:     time.Now(),
+		progress:  progress,
 	}
 }
 
@@ -92,6 +130,7 @@ func (v *seededVerifier) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("data mismatch at byte %d", v.size-v.remaining)
 	}
 	v.remaining -= uint64(len(p))
+	v.progress.add(uint64(len(p)))
 	return len(p), nil
 }
 
@@ -108,6 +147,9 @@ func formatBytes(b uint64) string {
 }
 
 func formatBitrate(b uint64, d time.Duration) string {
+	if d <= 0 {
+		return "0.00 bps"
+	}
 	bps := float64(b) * 8.0 / d.Seconds()
 	units := []string{"bps", "Kbps", "Mbps", "Gbps", "Tbps"}
 	v := bps
@@ -120,12 +162,273 @@ func formatBitrate(b uint64, d time.Duration) string {
 	panic("unreachable")
 }
 
+func formatClock(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	total := int(d.Seconds())
+	return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
+}
+
 func encodedSize(obj siastorage.Object) uint64 {
 	var n uint64
 	for _, s := range obj.Slabs() {
 		n += uint64(len(s.Sectors)) * proto4.SectorSize
 	}
 	return n
+}
+
+// progressBar renders a single-line progress bar to stderr, mirroring the
+// indicatif-style bar used by the Rust benchmark.
+type progressBar struct {
+	mu       sync.Mutex
+	total    uint64
+	cur      uint64
+	msg      string
+	start    time.Time
+	lastDraw time.Time
+}
+
+func newProgressBar(total uint64, msg string) *progressBar {
+	now := time.Now()
+	p := &progressBar{total: total, msg: msg, start: now}
+	p.draw(now)
+	return p
+}
+
+func (p *progressBar) set(n uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cur = n
+	p.maybeDraw()
+}
+
+func (p *progressBar) add(n uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cur += n
+	p.maybeDraw()
+}
+
+func (p *progressBar) maybeDraw() {
+	now := time.Now()
+	if now.Sub(p.lastDraw) < 100*time.Millisecond && p.cur < p.total {
+		return
+	}
+	p.draw(now)
+}
+
+func (p *progressBar) draw(now time.Time) {
+	const width = 40
+	p.lastDraw = now
+	ratio := 0.0
+	if p.total > 0 {
+		ratio = float64(p.cur) / float64(p.total)
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(float64(width) * ratio)
+	var bar string
+	if filled >= width {
+		bar = strings.Repeat("=", width)
+	} else {
+		bar = strings.Repeat("=", filled) + ">" + strings.Repeat("-", width-filled-1)
+	}
+	elapsed := now.Sub(p.start)
+	var eta time.Duration
+	if p.cur > 0 && p.cur < p.total {
+		eta = time.Duration(float64(elapsed) * float64(p.total-p.cur) / float64(p.cur))
+	}
+	fmt.Fprintf(os.Stderr, "\r%-8s [%s] [%s] %s/%s (%s, %s)   ",
+		p.msg,
+		formatClock(elapsed),
+		bar,
+		formatBytes(p.cur),
+		formatBytes(p.total),
+		formatBitrate(p.cur, elapsed),
+		formatClock(eta),
+	)
+}
+
+func (p *progressBar) finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cur = p.total
+	p.draw(time.Now())
+	fmt.Fprintln(os.Stderr)
+}
+
+// hostStat accumulates per-host transfer totals.
+type hostStat struct {
+	shards  int
+	bytes   uint64
+	elapsed time.Duration // summed per-shard time; overcounts wall-clock as shards overlap
+}
+
+type hostStats struct {
+	mu sync.Mutex
+	m  map[string]*hostStat
+}
+
+func newHostStats() *hostStats {
+	return &hostStats{m: make(map[string]*hostStat)}
+}
+
+func (h *hostStats) record(host string, bytes uint64, elapsed time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.m[host]
+	if s == nil {
+		s = &hostStat{}
+		h.m[host] = s
+	}
+	s.shards++
+	s.bytes += bytes
+	s.elapsed += elapsed
+}
+
+func (h *hostStats) printSummary(label string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.m) == 0 {
+		return
+	}
+	rate := func(s *hostStat) float64 {
+		if s.elapsed <= 0 {
+			return 0
+		}
+		return float64(s.bytes) / s.elapsed.Seconds()
+	}
+	type row struct {
+		host string
+		stat *hostStat
+	}
+	rows := make([]row, 0, len(h.m))
+	var total uint64
+	for host, s := range h.m {
+		rows = append(rows, row{host, s})
+		total += s.bytes
+	}
+	sort.Slice(rows, func(i, j int) bool { return rate(rows[i].stat) > rate(rows[j].stat) })
+	fmt.Printf("\n%s per-host summary (%d hosts):\n", label, len(rows))
+	for _, r := range rows {
+		fmt.Printf("  %s  %4d shards  %11s  %s\n",
+			r.host, r.stat.shards, formatBytes(r.stat.bytes), formatBitrate(r.stat.bytes, r.stat.elapsed))
+	}
+	fmt.Printf("  total %s across %d hosts\n", formatBytes(total), len(rows))
+}
+
+// --- profile config (shared with the Rust benchmark) ------------------------
+//
+// The on-disk location and format intentionally match the Rust benchmark in
+// sia-sdk-rs, so a profile created by either tool works in the other:
+//   - location: the `directories` crate's ProjectDirs("tech", "Sia", "sia-benchmark")
+//   - format:   TOML, with a `[profiles.<name>]` table per profile
+//   - app_key:  the 32-byte app-key seed, hex-encoded (matching AppKey::export)
+
+type config struct {
+	Profiles map[string]profile `toml:"profiles"`
+}
+
+type profile struct {
+	Indexer string `toml:"indexer"`
+	// AppKey is the 32-byte app-key seed, hex-encoded (matching AppKey::export).
+	AppKey string `toml:"app_key"`
+}
+
+func configPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("could not determine config directory: %w", err)
+	}
+	// Mirror the `directories` crate's per-OS ProjectDirs config layout so the
+	// path lines up with the Rust benchmark.
+	var rel string
+	switch runtime.GOOS {
+	case "darwin":
+		rel = filepath.Join("tech.Sia.sia-benchmark", "config.toml")
+	case "windows":
+		rel = filepath.Join("Sia", "sia-benchmark", "config", "config.toml")
+	default: // linux and other XDG platforms
+		rel = filepath.Join("sia-benchmark", "config.toml")
+	}
+	return filepath.Join(base, rel), nil
+}
+
+func loadConfig() (config, error) {
+	path, err := configPath()
+	if err != nil {
+		return config{}, err
+	}
+	cfg := config{Profiles: map[string]profile{}}
+	if _, err := toml.DecodeFile(path, &cfg); errors.Is(err, os.ErrNotExist) {
+		return cfg, nil
+	} else if err != nil {
+		return config{}, err
+	}
+	if cfg.Profiles == nil {
+		cfg.Profiles = map[string]profile{}
+	}
+	return cfg, nil
+}
+
+func saveConfig(cfg config) (string, error) {
+	path, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if err := toml.NewEncoder(f).Encode(cfg); err != nil {
+		f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func readProfile(name string) (string, types.PrivateKey, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return "", nil, err
+	}
+	p, ok := cfg.Profiles[name]
+	if !ok {
+		return "", nil, fmt.Errorf("profile %q not found; run `benchmark login --profile %s` first", name, name)
+	}
+	seed, err := hex.DecodeString(p.AppKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("profile %q has an invalid app key: %w", name, err)
+	}
+	if len(seed) != 32 {
+		return "", nil, fmt.Errorf("profile %q has an invalid app key: expected 32 bytes, got %d", name, len(seed))
+	}
+	return p.Indexer, types.NewPrivateKeyFromSeed(seed), nil
+}
+
+func upsertProfile(name, indexer string, key types.PrivateKey) (string, error) {
+	if len(key) < 32 {
+		return "", fmt.Errorf("app key too short: %d bytes", len(key))
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return "", err
+	}
+	cfg.Profiles[name] = profile{
+		Indexer: strings.TrimSpace(indexer),
+		// Store the 32-byte seed (matching the Rust AppKey::export format) so
+		// the profile is interchangeable between the two benchmarks.
+		AppKey: hex.EncodeToString(key[:32]),
+	}
+	return saveConfig(cfg)
 }
 
 // readPhrase reads the wallet recovery phrase from stdin. When stdin is a
@@ -152,18 +455,14 @@ func readPhrase() (string, error) {
 	return strings.TrimSpace(scanner.Text()), nil
 }
 
-func run(ctx context.Context, size uint64, uploadMaxInflight, downloadMaxInflight int) error {
-	var appID types.Hash256
-	if err := appID.UnmarshalText([]byte(appIDHex)); err != nil {
-		return fmt.Errorf("failed to parse app ID: %w", err)
-	}
+// --- commands ----------------------------------------------------------------
 
-	builder := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
-		ID:          appID,
-		Name:        "Benchmark Example",
-		Description: "Benchmarks upload and download performance of the siastorage SDK",
-		ServiceURL:  "https://myexampleapp.com",
-	})
+func login(ctx context.Context, profileName, indexer string, newPhrase bool) error {
+	meta, err := appMetadata()
+	if err != nil {
+		return err
+	}
+	builder := siastorage.NewBuilder(indexer, meta)
 
 	responseURL, err := builder.RequestConnection(ctx)
 	if err != nil {
@@ -176,9 +475,15 @@ func run(ctx context.Context, size uint64, uploadMaxInflight, downloadMaxInfligh
 	}
 	fmt.Println("Connection approved!")
 
-	phrase, err := readPhrase()
-	if err != nil {
-		return err
+	var phrase string
+	if newPhrase {
+		phrase = siastorage.NewSeedPhrase()
+		fmt.Printf("Generated recovery phrase (write it down):\n  %s\n", phrase)
+	} else {
+		phrase, err = readPhrase()
+		if err != nil {
+			return err
+		}
 	}
 
 	sdk, err := builder.Register(ctx, phrase)
@@ -186,53 +491,130 @@ func run(ctx context.Context, size uint64, uploadMaxInflight, downloadMaxInfligh
 		return fmt.Errorf("failed to register app: %w", err)
 	}
 	defer sdk.Close()
-	fmt.Println("App registered successfully!")
 
+	path, err := upsertProfile(profileName, indexer, sdk.AppKey())
+	if err != nil {
+		return fmt.Errorf("failed to save profile: %w", err)
+	}
+	fmt.Printf("Profile %q saved to %s (indexer: %s)\n", profileName, path, indexer)
+	return nil
+}
+
+func connect(ctx context.Context, profileName string, logger *zap.Logger) (*siastorage.SDK, error) {
+	indexer, key, err := readProfile(profileName)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := appMetadata()
+	if err != nil {
+		return nil, err
+	}
+	builder := siastorage.NewBuilder(indexer, meta)
+	sdk, err := builder.SDK(key, siastorage.WithLogger(logger))
+	if errors.Is(err, siastorage.ErrUnauthorized) {
+		return nil, fmt.Errorf("app key for profile %q is not authorized; run `benchmark login --profile %s`", profileName, profileName)
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+	account, err := sdk.Account(ctx)
+	if err != nil {
+		sdk.Close()
+		return nil, fmt.Errorf("failed to fetch account: %w", err)
+	}
+	if !account.Ready {
+		sdk.Close()
+		return nil, errors.New("account is not ready yet — the indexer is still propagating registration on the network; try again shortly")
+	}
+	return sdk, nil
+}
+
+func listProfiles() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if len(cfg.Profiles) == 0 {
+		fmt.Println("No profiles configured. Run `benchmark login` to create one.")
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Profiles))
+	pad := 0
+	for name := range cfg.Profiles {
+		names = append(names, name)
+		if len(name) > pad {
+			pad = len(name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Printf("  %-*s  %s\n", pad, name, cfg.Profiles[name].Indexer)
+	}
+	return nil
+}
+
+func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadMaxInflight, downloadMaxInflight int, hostSummary bool) error {
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return fmt.Errorf("failed to generate seed: %w", err)
 	}
 
-	var uploadOpts []siastorage.UploadOption
+	// upload the data to the network
+	uploadProgress := newProgressBar(size, "upload")
+	uploadHosts := newHostStats()
+	var encodedUploaded atomic.Uint64
+	uploadOpts := []siastorage.UploadOption{
+		siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
+			encoded := encodedUploaded.Add(p.ShardSize)
+			// map encoded bytes back to an approximate unencoded position
+			unencoded := encoded * benchDataShards / benchTotalShards
+			if unencoded > size {
+				unencoded = size
+			}
+			uploadProgress.set(unencoded)
+			uploadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
+		}),
+	}
 	if uploadMaxInflight > 0 {
 		uploadOpts = append(uploadOpts, siastorage.WithUploadInflight(uploadMaxInflight))
 	}
 
-	fmt.Println("Uploading random data...")
 	obj := siastorage.NewEmptyObject()
 	uploadStart := time.Now()
 	if err := sdk.Upload(ctx, &obj, newSeededReader(seed, size), uploadOpts...); err != nil {
 		return fmt.Errorf("failed to upload object: %w", err)
 	}
 	uploadDuration := time.Since(uploadStart)
+	uploadProgress.finish()
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
 		return fmt.Errorf("failed to pin object: %w", err)
 	}
-	fmt.Println("Object pinned successfully!")
 
 	// Best-effort cleanup so a failure during download/verification doesn't
 	// leave a pinned object and its slabs behind in the user's account.
 	defer func() {
-		fmt.Println("Cleaning up...")
 		if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
 			log.Printf("failed to delete object: %v", err)
 			return
 		}
 		if err := sdk.PruneSlabs(ctx); err != nil {
 			log.Printf("failed to prune slabs: %v", err)
-			return
 		}
-		fmt.Println("Object unpinned and slabs pruned.")
 	}()
 
-	var downloadOpts []siastorage.DownloadOption
+	// download and verify the data
+	downloadProgress := newProgressBar(size, "download")
+	downloadHosts := newHostStats()
+	downloadOpts := []siastorage.DownloadOption{
+		siastorage.WithDownloadProgress(func(p siastorage.ShardProgress) {
+			downloadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
+		}),
+	}
 	if downloadMaxInflight > 0 {
 		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(downloadMaxInflight))
 	}
 
-	fmt.Println("Downloading object...")
-	verifier := newSeededVerifier(seed, size)
+	verifier := newSeededVerifier(seed, size, downloadProgress)
 	downloadStart := time.Now()
 	rc, err := sdk.Download(obj, downloadOpts...)
 	if err != nil {
@@ -246,38 +628,110 @@ func run(ctx context.Context, size uint64, uploadMaxInflight, downloadMaxInfligh
 		return fmt.Errorf("expected %d more bytes", verifier.remaining)
 	}
 	downloadDuration := time.Since(downloadStart)
+	downloadProgress.finish()
 
 	encoded := encodedSize(obj)
-	fmt.Printf(
-		"Object uploaded ID: %s\tSize: %s\tEncoded: %s\tElapsed: %s\tThroughput: %s\tEncoded Throughput: %s\n",
-		obj.ID(),
-		formatBytes(obj.Size()),
-		formatBytes(encoded),
-		uploadDuration,
-		formatBitrate(obj.Size(), uploadDuration),
-		formatBitrate(encoded, uploadDuration),
-	)
-	fmt.Printf(
-		"Object downloaded ID: %s\tSize: %s\tEncoded: %s\tElapsed: %s\tTTFB: %s\tThroughput: %s\tMax Latency: %s\n",
-		obj.ID(),
-		formatBytes(obj.Size()),
-		formatBytes(encoded),
-		downloadDuration,
-		verifier.ttfb,
-		formatBitrate(obj.Size(), downloadDuration),
-		verifier.gapMax,
-	)
+	fmt.Printf("\n%-15s%s\n", "Size:", formatBytes(obj.Size()))
+	fmt.Printf("%-15s%s\n", "Encoded:", formatBytes(encoded))
 
+	fmt.Println("\nUpload")
+	fmt.Printf("  %-20s%s\n", "Elapsed:", uploadDuration)
+	fmt.Printf("  %-20s%s\n", "Throughput:", formatBitrate(obj.Size(), uploadDuration))
+	fmt.Printf("  %-20s%s\n", "Encoded Throughput:", formatBitrate(encoded, uploadDuration))
+
+	fmt.Println("\nDownload")
+	fmt.Printf("  %-20s%s\n", "Size:", formatBytes(obj.Size()))
+	fmt.Printf("  %-20s%s\n", "Elapsed:", downloadDuration)
+	fmt.Printf("  %-20s%s\n", "TTFB:", verifier.ttfb)
+	fmt.Printf("  %-20s%s\n", "Throughput:", formatBitrate(obj.Size(), downloadDuration))
+	fmt.Printf("  %-20s%s\n", "Max latency:", verifier.gapMax)
+
+	if hostSummary {
+		uploadHosts.printSummary("Upload")
+		downloadHosts.printSummary("Download")
+	}
 	return nil
 }
 
-func main() {
-	size := flag.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
-	uploadMaxInflight := flag.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
-	downloadMaxInflight := flag.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
-	flag.Parse()
+// newFileLogger writes SDK logs to a timestamped file so they don't interleave
+// with the progress bars on stderr.
+func newFileLogger() (*zap.Logger, string, error) {
+	path := fmt.Sprintf("benchmark-%s.log", time.Now().Format("20060102T150405"))
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, "", err
+	}
+	cfg := zap.NewProductionEncoderConfig()
+	cfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	core := zapcore.NewCore(zapcore.NewConsoleEncoder(cfg), zapcore.AddSync(f), zap.InfoLevel)
+	return zap.New(core), path, nil
+}
 
-	if err := run(context.Background(), *size, *uploadMaxInflight, *downloadMaxInflight); err != nil {
-		log.Fatal(err)
+func usage() {
+	fmt.Fprintln(os.Stderr, `benchmark — benchmark Sia uploads and downloads
+
+Usage:
+  benchmark login    [--profile NAME] [--indexer URL] [--new]
+  benchmark run      [--profile NAME] [--size BYTES] [--upload-max-inflight N]
+                     [--download-max-inflight N] [--host-summary]
+  benchmark profiles
+
+Each profile binds an app key to an indexer so subsequent runs can skip the
+auth flow.`)
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+
+	ctx := context.Background()
+
+	switch os.Args[1] {
+	case "login":
+		fs := flag.NewFlagSet("login", flag.ExitOnError)
+		profileName := fs.String("profile", defaultProfile, "profile to store the app key under")
+		indexer := fs.String("indexer", defaultIndexer, "indexer URL to authorize against")
+		newPhrase := fs.Bool("new", false, "generate a new recovery phrase instead of prompting for one")
+		fs.Parse(os.Args[2:])
+		if err := login(ctx, *profileName, *indexer, *newPhrase); err != nil {
+			log.Fatal(err)
+		}
+
+	case "run":
+		fs := flag.NewFlagSet("run", flag.ExitOnError)
+		profileName := fs.String("profile", defaultProfile, "profile to use")
+		size := fs.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
+		uploadMaxInflight := fs.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
+		downloadMaxInflight := fs.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
+		hostSummary := fs.Bool("host-summary", false, "print a per-host breakdown of shards and throughput after the run")
+		fs.Parse(os.Args[2:])
+
+		logger, logPath, err := newFileLogger()
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer logger.Sync()
+		fmt.Fprintf(os.Stderr, "logging to %s\n", logPath)
+
+		sdk, err := connect(ctx, *profileName, logger)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer sdk.Close()
+
+		if err := runBenchmark(ctx, sdk, *size, *uploadMaxInflight, *downloadMaxInflight, *hostSummary); err != nil {
+			log.Fatal(err)
+		}
+
+	case "profiles":
+		if err := listProfiles(); err != nil {
+			log.Fatal(err)
+		}
+
+	default:
+		usage()
+		os.Exit(2)
 	}
 }
