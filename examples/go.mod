@@ -1,6 +1,6 @@
 module go.sia.tech/siastorage/examples
 
-go 1.26.4
+go 1.26.0
 
 replace go.sia.tech/siastorage => ../
 
