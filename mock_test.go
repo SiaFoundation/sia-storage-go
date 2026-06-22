@@ -45,6 +45,7 @@ type hostErr struct {
 type mockHostClient struct {
 	provider *client.Provider
 	hosts    *hostCache
+	inflight atomic.Int64
 
 	delayMu   sync.Mutex
 	slowHosts map[types.PublicKey]time.Duration
@@ -83,6 +84,29 @@ func (m *mockHostClient) UploadQueue() (*client.HostQueue, error) {
 // Prioritize implements the [hostClient] interface.
 func (m *mockHostClient) Prioritize(hosts []types.PublicKey) []types.PublicKey {
 	return m.provider.Prioritize(hosts)
+}
+
+// PickWrite implements the [hostClient] interface.
+func (m *mockHostClient) PickWrite(candidates []types.PublicKey) (types.PublicKey, func(), []types.PublicKey, bool) {
+	host, release, remaining, ok := m.provider.PickWrite(candidates)
+	if !ok {
+		return host, release, remaining, ok
+	}
+	m.inflight.Add(1)
+	return host, func() { m.inflight.Add(-1); release() }, remaining, ok
+}
+
+// TrackInflightRead implements the [hostClient] interface.
+func (m *mockHostClient) TrackInflightRead(hostKey types.PublicKey) func() {
+	release := m.provider.TrackInflightRead(hostKey)
+	m.inflight.Add(1)
+	return func() { m.inflight.Add(-1); release() }
+}
+
+// OutstandingInflight returns the number of inflight reservations whose
+// release has not yet been called.
+func (m *mockHostClient) OutstandingInflight() int64 {
+	return m.inflight.Load()
 }
 
 func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
