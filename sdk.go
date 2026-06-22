@@ -38,6 +38,8 @@ type (
 
 		AddFailedRPC(hostKey types.PublicKey)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
+		PickWrite(candidates []types.PublicKey) (host types.PublicKey, release func(), remaining []types.PublicKey, ok bool)
+		TrackInflightRead(hostKey types.PublicKey) func()
 		UploadQueue() (*client.HostQueue, error)
 		Close() error
 	}
@@ -160,7 +162,9 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	var outstanding int
 	tryDownloadSector := func(d sectorDownload, initial bool) {
 		outstanding++
+		release := s.hosts.TrackInflightRead(d.sector.HostKey)
 		wg.Go(func() {
+			defer release()
 			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
