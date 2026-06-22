@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,12 @@ type (
 		sema     chan struct{}
 		queue    *client.HostQueue
 		shardsCh chan shard
+
+		// waiting counts shards that still need their first upload attempt,
+		// across every slab being uploaded. A shard only races slow hosts while
+		// this is zero, so a racer never grabs a slot that another shard still
+		// needs for its first try.
+		waiting *changeCounter
 	}
 
 	uploadOption struct {
@@ -113,6 +120,10 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 	// create semaphore to limit concurrent shard uploads
 	shardSema := make(chan struct{}, uo.maxInflight)
 
+	// counts shards that still need their first attempt. shared across every
+	// slab so a racer never steals a slot another shard still needs.
+	waiting := newChangeCounter(0)
+
 	// send guards against blocking on a full channel when the consumer
 	// has stopped reading due to an error or context cancellation
 	send := func(su slabUpload) {
@@ -163,6 +174,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			sema:          shardSema,
 			queue:         queue,
 			shardsCh:      make(chan shard, totalShards),
+			waiting:       waiting,
 		}
 		for shardIdx, data := range slab.Shards {
 			host, attempts, ok := queue.Next()
@@ -170,6 +182,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 				send(slabUpload{err: ErrNoMoreHosts})
 				return
 			}
+			waiting.add(1) // count this shard until it gets its first slot
 			go su.uploadShard(ctx, shardIdx, host, attempts < maxHostAttempts, data)
 		}
 
@@ -191,6 +204,13 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	c, _ := chacha20.NewUnauthenticatedCipher(su.encryptionKey[:], nonce)
 	c.XORKeyStream(sector, sector)
 
+	// this shard counts toward waiting until it gets its first slot. only
+	// release once. the defer keeps the count right even if we bail out early,
+	// like when the context is cancelled before a slot frees up.
+	var releaseOnce sync.Once
+	releaseWaiting := func() { releaseOnce.Do(func() { su.waiting.add(-1) }) }
+	defer releaseWaiting()
+
 	// acquire semaphore
 	select {
 	case <-ctx.Done():
@@ -198,6 +218,8 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 		return
 	case su.sema <- struct{}{}:
 	}
+	// got a slot, so this shard no longer holds racing back
+	releaseWaiting()
 
 	// shardCtx is cancelled when a write succeeds, aborting any racers
 	shardCtx, cancel := context.WithCancel(ctx)
@@ -235,22 +257,35 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	launchWrite(initialHost, canRetry)
 	active := 1
 
-	// race timer scales with active attempts to avoid stampeding
-	raceTimer := time.NewTimer(time.Second)
-	defer raceTimer.Stop()
+	// only race a host once it is clearly slower than normal. before we have
+	// timing data the estimate is large, so racing stays off until it warms up.
+	raceTimeout := time.Duration(float64(su.hosts.WriteEstimate(uint64(len(sector)))) * raceFactor)
+	lastEvent := time.Now()
 
 	for {
+		// only race when no shard is still waiting for its first try and a host is free
+		eligible := su.waiting.load() == 0 && su.queue.Available() > 0
+		var raceCh <-chan time.Time
+		var idleCh <-chan struct{}
+		if eligible {
+			// Go cleans up this timer even if we never read the channel
+			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
+		} else {
+			_, idleCh = su.waiting.snapshot()
+		}
+
 		select {
 		case <-ctx.Done():
 			su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 			return
 
 		case res := <-results:
+			lastEvent = time.Now()
 			if res.err == nil {
 				cancel()
 
-				// penalize the original host if a racer beat it
-				// while it was still uploading
+				// penalize the original host if a racer beat it while it was
+				// still uploading
 				if res.host != initialHost && !initialDone.Load() {
 					su.hosts.AddFailedRPC(initialHost)
 				}
@@ -296,11 +331,12 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 				active++
 			}
 
-			// timer may have fired while processing results but the
-			// semaphore bounds any spurious race spawns
-			raceTimer.Reset(time.Duration(max(active, 1)) * time.Second)
-
-		case <-raceTimer.C:
+		case <-raceCh:
+			lastEvent = time.Now()
+			// check the gate again, a shard may have started waiting since
+			if su.waiting.load() != 0 {
+				continue
+			}
 			// race a slow host
 			select {
 			case su.sema <- struct{}{}:
@@ -314,7 +350,8 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			default:
 			}
 
-			raceTimer.Reset(time.Duration(max(active, 1)) * time.Second)
+		case <-idleCh:
+			// the gate changed, loop around and check again
 		}
 	}
 }

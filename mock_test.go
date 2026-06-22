@@ -85,6 +85,25 @@ func (m *mockHostClient) Prioritize(hosts []types.PublicKey) []types.PublicKey {
 	return m.provider.Prioritize(hosts)
 }
 
+// ReadEstimate implements the [hostClient] interface.
+func (m *mockHostClient) ReadEstimate(bytes uint64) time.Duration {
+	return m.provider.ReadEstimate(bytes)
+}
+
+// WriteEstimate implements the [hostClient] interface.
+func (m *mockHostClient) WriteEstimate(bytes uint64) time.Duration {
+	return m.provider.WriteEstimate(bytes)
+}
+
+// SetSlowHostKeys marks the given hosts slow, each delaying its RPCs by d.
+func (m *mockHostClient) SetSlowHostKeys(keys []types.PublicKey, d time.Duration) {
+	m.delayMu.Lock()
+	defer m.delayMu.Unlock()
+	for _, hk := range keys {
+		m.slowHosts[hk] = d
+	}
+}
+
 func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]

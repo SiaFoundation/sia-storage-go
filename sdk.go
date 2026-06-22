@@ -38,6 +38,8 @@ type (
 
 		AddFailedRPC(hostKey types.PublicKey)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
+		ReadEstimate(bytes uint64) time.Duration
+		WriteEstimate(bytes uint64) time.Duration
 		UploadQueue() (*client.HostQueue, error)
 		Close() error
 	}
@@ -114,7 +116,7 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex int, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
+func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -191,15 +193,29 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 		slabHosts = slabHosts[1:]
 	}
 
-	// launch more downloads as results come in or periodically to race
-	// slow hosts
+	// only race a host once it is clearly slower than normal. before we have
+	// timing data the estimate is large, so racing stays off until it warms up.
+	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(length)) * raceFactor)
+	lastEvent := time.Now()
+
 	var successful int
 	shards := make([][]byte, len(slab.Sectors))
-	timer := time.NewTimer(500 * time.Millisecond)
-	defer timer.Stop()
 	for {
+		// only race while this chunk is near the read head and a spare host is
+		// free. the spare check stops a tiny estimate from spinning the timer.
+		eligible := len(slabHosts) > 0 && seq < popped.load()+raceWindow
+		var raceCh <-chan time.Time
+		var windowCh <-chan struct{}
+		if eligible {
+			// Go cleans up this timer even if we never read the channel
+			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
+		} else {
+			_, windowCh = popped.snapshot()
+		}
+
 		select {
 		case res := <-responseCh:
+			lastEvent = time.Now()
 			outstanding--
 			if res.err == nil {
 				// successful download
@@ -228,17 +244,22 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 				tryDownloadSector(slabSectors[slabHosts[0]], false)
 				slabHosts = slabHosts[1:]
 			}
-		case <-timer.C:
+
+		case <-raceCh:
+			lastEvent = time.Now()
 			// periodically launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
 				tryDownloadSector(slabSectors[slabHosts[0]], false)
 				slabHosts = slabHosts[1:]
 			}
+
+		case <-windowCh:
+			// the read head moved, loop around and check again
+
 		case <-ctx.Done():
 			// download got interrupted before it could finish
 			return nil, ctx.Err()
 		}
-		timer.Reset(500 * time.Millisecond)
 	}
 }
 
@@ -491,8 +512,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex int, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, slabIndex, hostTimeout, onProgress)
+func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, chunk, slabIndex, seq, popped, hostTimeout, onProgress)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -536,100 +557,80 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	chunks := newChunkIter(ss, offset, length)
 	bw := bufio.NewWriterSize(w, 1<<16)
 
-	// recover first chunk synchronously for fast TTFB
-	chunk, slabIdx, ok := chunks.next()
-	if !ok {
-		return bw.Flush()
-	}
-	rc, err := s.recoverChunk(ctx, chunk, slabIdx, hostTimeout, onProgress)
-	if err != nil {
-		return err
-	}
-	if err := stripedJoin(bw, rc.shards, rc.skip, rc.writeLen); err != nil {
-		return err
-	}
+	// popped counts how many chunks the reader has taken. each chunk task uses
+	// it to tell how close it is to the read head.
+	popped := newChangeCounter(0)
+	var nextSeq int
 
-	type chunkWork struct {
-		index     int
-		slabIndex int
-		chunk     slabs.SlabSlice
-	}
 	type chunkResult struct {
-		index int
 		recoveredChunk
 		err error
 	}
-
-	workCh := make(chan chunkWork, maxInflight)
-	resultCh := make(chan chunkResult, maxInflight)
-
-	// start worker pool
-	var wg sync.WaitGroup
-	for range maxInflight {
-		wg.Go(func() {
-			for w := range workCh {
-				rc, err := s.recoverChunk(ctx, w.chunk, w.slabIndex, hostTimeout, onProgress)
-				select {
-				case resultCh <- chunkResult{index: w.index, recoveredChunk: rc, err: err}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		})
+	type chunkTask struct {
+		ch     chan chunkResult
+		cancel context.CancelFunc
 	}
 
-	// feed chunks to workers
-	go func() {
-		defer func() {
-			close(workCh)
-			wg.Wait()
-			close(resultCh)
-		}()
-		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, slabIdx, ok := chunks.next()
-			if !ok {
-				return
-			}
-			select {
-			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, chunk: chunk}:
-			case <-ctx.Done():
-				return
-			}
+	var queue []chunkTask
+	var wg sync.WaitGroup
+
+	// spawnNext starts recovery of the next chunk, assigning it the next
+	// sequence number. Returns false at end of stream.
+	spawnNext := func() bool {
+		chunk, slabIdx, ok := chunks.next()
+		if !ok {
+			return false
 		}
+		seq := nextSeq
+		nextSeq++
+		taskCtx, taskCancel := context.WithCancel(ctx)
+		ch := make(chan chunkResult, 1)
+		wg.Go(func() {
+			rc, err := s.recoverChunk(taskCtx, chunk, slabIdx, seq, popped, hostTimeout, onProgress)
+			ch <- chunkResult{recoveredChunk: rc, err: err}
+		})
+		queue = append(queue, chunkTask{ch: ch, cancel: taskCancel})
+		return true
+	}
+
+	// cancel any tasks left in the queue and wait for every goroutine to exit
+	// so none outlive this function
+	defer func() {
+		for _, t := range queue {
+			t.cancel()
+		}
+		wg.Wait()
 	}()
 
-	completed := make(map[int]chunkResult)
-	nextWrite := 0
-	for res := range resultCh {
-		if res.err != nil {
-			return res.err
+	// fill the window
+	for range maxInflight {
+		if !spawnNext() {
+			break
 		}
-		if res.index == nextWrite {
+	}
+
+	for len(queue) > 0 {
+		task := queue[0]
+		queue = queue[1:]
+		popped.add(1) // this chunk is now the read head
+		spawnNext()   // refill the window
+
+		select {
+		case <-ctx.Done():
+			task.cancel()
+			return ctx.Err()
+		case res := <-task.ch:
+			if res.err != nil {
+				return res.err
+			}
 			if err := stripedJoin(bw, res.shards, res.skip, res.writeLen); err != nil {
 				return err
 			}
-			nextWrite++
-			for {
-				r, ok := completed[nextWrite]
-				if !ok {
-					break
-				}
-				delete(completed, nextWrite)
-				if err := stripedJoin(bw, r.shards, r.skip, r.writeLen); err != nil {
-					return err
-				}
-				nextWrite++
-			}
-		} else {
-			completed[res.index] = res
 		}
 	}
 
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if len(completed) > 0 {
-		panic(fmt.Sprintf("%d chunks remaining but no tasks in flight", len(completed)))
 	}
 	return bw.Flush()
 }

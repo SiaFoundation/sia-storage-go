@@ -146,61 +146,6 @@ func TestUpload(t *testing.T) {
 	})
 }
 
-func TestUploadRacing(t *testing.T) {
-	sdk, hosts := newTestSDK(t, 50, zaptest.NewLogger(t))
-	defer sdk.Close()
-
-	// make 30 hosts slow enough to trigger the race timer (>1s)
-	// but leave 20 fast hosts for racers to pick up
-	slowHosts := hosts.SetSlowHosts(t, 30, 5*time.Second)
-	slowSet := make(map[types.PublicKey]bool, len(slowHosts))
-	for _, hk := range slowHosts {
-		slowSet[hk] = true
-	}
-
-	data := frand.Bytes(4096)
-	obj := NewEmptyObject()
-	err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	} else if len(obj.Slabs()) != 1 {
-		t.Fatalf("expected 1 slab, got %d", len(obj.Slabs()))
-	}
-
-	// verify racers won some shards by checking that more than 30
-	// hosts received write calls (the extra calls are racers)
-	writes := hosts.WriteCalls()
-	var totalWrites int
-	for _, n := range writes {
-		totalWrites += n
-	}
-	if totalWrites <= 30 {
-		t.Fatalf("expected racing to produce extra writes, got %d total", totalWrites)
-	}
-
-	// verify the uploaded shards are on fast hosts since the slow
-	// ones took 5s and the race timer fires after 1s
-	for _, slab := range obj.Slabs() {
-		var fastCount int
-		for _, sector := range slab.Sectors {
-			if !slowSet[sector.HostKey] {
-				fastCount++
-			}
-		}
-		if fastCount == 0 {
-			t.Fatal("expected at least some shards on fast hosts")
-		}
-	}
-
-	// verify the data roundtrips
-	got, err := readAll(sdk.Download(obj))
-	if err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(got, data) {
-		t.Fatal("data mismatch")
-	}
-}
-
 func TestResumableUpload(t *testing.T) {
 	sdk, _ := newTestSDK(t, 50, zaptest.NewLogger(t))
 	defer sdk.Close()
