@@ -620,6 +620,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			task.cancel()
 			return ctx.Err()
 		case res := <-task.ch:
+			task.cancel()
 			if res.err != nil {
 				return res.err
 			}
