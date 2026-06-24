@@ -3,10 +3,10 @@ module go.sia.tech/siastorage // v0.1.0
 go 1.26.0
 
 require (
-	github.com/klauspost/reedsolomon v1.14.0
+	github.com/klauspost/reedsolomon v1.14.1
 	go.sia.tech/core v0.21.1
 	go.sia.tech/coreutils v0.22.1-0.20260609163241-06d70f59a225
-	go.sia.tech/indexd v0.2.4-0.20260622131308-a260bc6f42b1
+	go.sia.tech/indexd v0.2.4-0.20260624113120-8df0b5ce6c39
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.53.0
 	lukechampine.com/frand v1.5.1
