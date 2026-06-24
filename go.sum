@@ -19,8 +19,6 @@ github.com/julienschmidt/httprouter v1.3.0 h1:U0609e9tgbseu3rBINet9P48AI/D3oJs4d
 github.com/julienschmidt/httprouter v1.3.0/go.mod h1:JR6WtHb+2LUe8TCKY3cZOxFyyO8IZAc4RVcycCCAKdM=
 github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
 github.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
-github.com/klauspost/reedsolomon v1.14.0 h1:5YSZeclzSYg5nl349+GDG/agDtQ6MZiwUYXvVKN1Jx0=
-github.com/klauspost/reedsolomon v1.14.0/go.mod h1:yjqqjgMTQkBUHSG97/rm4zipffCNbCiZcB3kTqr++sQ=
 github.com/klauspost/reedsolomon v1.14.1 h1:swE9kzyWXD/wVG+l5Pe8bWnQ0giIY7D1GjCBKk3kG2U=
 github.com/klauspost/reedsolomon v1.14.1/go.mod h1:yjqqjgMTQkBUHSG97/rm4zipffCNbCiZcB3kTqr++sQ=
 github.com/oschwald/geoip2-golang v1.13.0 h1:Q44/Ldc703pasJeP5V9+aFSZFmBN7DKHbNsSFzQATJI=
@@ -50,8 +48,6 @@ go.sia.tech/core v0.21.1 h1:IZY7KvX52IMP6SBrlMp7i38f18Q4k9IJYkuVlZLxvQQ=
 go.sia.tech/core v0.21.1/go.mod h1:HUIelqenk1TTkDpYnsN6vgAFzNLxW/ueNYxvZCvoIBs=
 go.sia.tech/coreutils v0.22.1-0.20260609163241-06d70f59a225 h1:gtTHpiRGpDbE7l3mhe0nG/b51fnt7XBCGmjPu3RAfiM=
 go.sia.tech/coreutils v0.22.1-0.20260609163241-06d70f59a225/go.mod h1:jE53hiZ6UMhbP8F7yqFCZlWmK1LdDTqfertVqZugido=
-go.sia.tech/indexd v0.2.4-0.20260622131308-a260bc6f42b1 h1:nte4Hd7Bjnrr250ptK+hQEf7oD6uZ14T74wFCesreZI=
-go.sia.tech/indexd v0.2.4-0.20260622131308-a260bc6f42b1/go.mod h1:WXubankt4SgwvUtBOa1TB1QlZx6eggps3wG1sU30caY=
 go.sia.tech/indexd v0.2.4-0.20260624113120-8df0b5ce6c39 h1:7a+joxNVV43RUsfytHtbzfn4IVGAd+wylFo2qHB2GYw=
 go.sia.tech/indexd v0.2.4-0.20260624113120-8df0b5ce6c39/go.mod h1:rB+9mSH3zQZpmxAzlJBYOUcRWpbxwkNZt7E3QFHIjOQ=
 go.sia.tech/jape v0.14.1 h1:3QWpOzAxxcaECuv2Mc6tbkFh+olLnyUxxP5SfwgI/qY=
