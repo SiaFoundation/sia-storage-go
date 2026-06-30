@@ -193,7 +193,7 @@ func TestChunkSegments(t *testing.T) {
 	const dataShards = 4
 	const parityShards = 1
 
-	// 3.5 shards of data, striped into real shards
+	// 3.5 data shards worth of data, striped across the slab's data shards.
 	data := frand.Bytes(proto.SectorSize * 7 / 2)
 	slab, err := NewSlabReader(dataShards, parityShards).ReadSlab(bytes.NewReader(data))
 	if !errors.Is(err, io.EOF) {
@@ -224,7 +224,7 @@ func TestChunkSegments(t *testing.T) {
 		})
 	}
 
-	// shards too short to satisfy writeLen must surface ErrShortData
+	// data shards too short to satisfy writeLen must surface ErrShortData
 	t.Run("short data", func(t *testing.T) {
 		short := [][]byte{frand.Bytes(proto.LeafSize), frand.Bytes(proto.LeafSize)}
 		if _, err := joinSegments(recoveredChunk{shards: short, writeLen: 4 * proto.LeafSize}); !errors.Is(err, reedsolomon.ErrShortData) {
