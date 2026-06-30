@@ -156,6 +156,30 @@ func TestStripedReadWrite(t *testing.T) {
 	} else if reflect.DeepEqual(slab.Shards[4], make([]byte, proto4.SectorSize)) {
 		t.Fatal("parity shard should be filled after encoding")
 	}
+
+	// joining the shards back together should result in the original data
+	buf := make([]byte, len(data))
+	if err := stripedJoin(buf, slab.Shards[:dataShards], 0); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(buf, data) {
+		t.Fatal("mismatch")
+	}
+
+	// join only the first half
+	buf = make([]byte, len(data)/2)
+	if err := stripedJoin(buf, slab.Shards[:dataShards], 0); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(buf, data[:len(data)/2]) {
+		t.Fatal("mismatch")
+	}
+
+	// join only the second half
+	buf = make([]byte, len(data)/2)
+	if err := stripedJoin(buf, slab.Shards[:dataShards], len(data)/2); err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(buf, data[len(data)/2:]) {
+		t.Fatal("mismatch")
+	}
 }
 
 // chunks splits data into segments of the given size.

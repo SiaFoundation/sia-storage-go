@@ -2,12 +2,9 @@ package siastorage
 
 import (
 	"bytes"
-	"errors"
-	"io"
 	"testing"
 	"time"
 
-	"github.com/klauspost/reedsolomon"
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap/zaptest"
@@ -169,66 +166,4 @@ func TestSlabRecovery(t *testing.T) {
 			}
 		})
 	}
-}
-
-// joinSegments concatenates every segment yielded by a chunkSegments built from
-// rc, returning the bytes and the first non-EOF error.
-func joinSegments(rc recoveredChunk) ([]byte, error) {
-	cs := newChunkSegments(rc)
-	var out []byte
-	for {
-		seg, err := cs.next()
-		if errors.Is(err, io.EOF) {
-			return out, nil
-		} else if err != nil {
-			return out, err
-		} else if len(seg) == 0 || len(seg) > proto.LeafSize {
-			return out, errors.New("segment must be non-empty and within one leaf")
-		}
-		out = append(out, seg...)
-	}
-}
-
-func TestChunkSegments(t *testing.T) {
-	const dataShards = 4
-	const parityShards = 1
-
-	// 3.5 data shards worth of data, striped across the slab's data shards.
-	data := frand.Bytes(proto.SectorSize * 7 / 2)
-	slab, err := NewSlabReader(dataShards, parityShards).ReadSlab(bytes.NewReader(data))
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected io.EOF, got %v", err)
-	}
-	shards := slab.Shards[:dataShards]
-	half := len(data) / 2
-
-	// skip/writeLen should select arbitrary sub-ranges of the recovered data
-	tests := []struct {
-		name           string
-		skip, writeLen int
-		expected       []byte
-	}{
-		{"full", 0, len(data), data},
-		{"first half", 0, half, data[:half]},
-		{"second half", half, half, data[half:]},
-		{"empty", 0, 0, nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := joinSegments(recoveredChunk{shards: shards, skip: tt.skip, writeLen: tt.writeLen})
-			if err != nil {
-				t.Fatal(err)
-			} else if !bytes.Equal(got, tt.expected) {
-				t.Fatalf("data mismatch: expected %d bytes, got %d", len(tt.expected), len(got))
-			}
-		})
-	}
-
-	// data shards too short to satisfy writeLen must surface ErrShortData
-	t.Run("short data", func(t *testing.T) {
-		short := [][]byte{frand.Bytes(proto.LeafSize), frand.Bytes(proto.LeafSize)}
-		if _, err := joinSegments(recoveredChunk{shards: short, writeLen: 4 * proto.LeafSize}); !errors.Is(err, reedsolomon.ErrShortData) {
-			t.Fatalf("expected ErrShortData, got %v", err)
-		}
-	})
 }
