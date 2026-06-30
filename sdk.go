@@ -1,7 +1,6 @@
 package siastorage
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -323,7 +322,7 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 		return nil, fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
 	}
 
-	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do), nil
+	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do)
 }
 
 // DownloadSharedObject returns an [io.ReadCloser] streaming a shared object's
@@ -344,30 +343,40 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do), nil
+	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do)
 }
 
-// downloadReader streams reconstructed chunks directly to readers. The returned
-// reader, when closed, cancels any chunk downloads in flight.
-func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &downloadStream{
-		chunks: newChunkDownloader(ctx, cancel, s, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress),
-		cipher: newRekeyStream(key, uint64(do.offset)),
+// downloadReader streams recovered chunks directly to the reader. Closing the
+// returned reader cancels any chunk downloads in flight.
+func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) (io.ReadCloser, error) {
+	if do.maxInflight <= 0 {
+		return nil, errors.New("download inflight must be greater than 0")
 	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return &downloadStream{
+		chunks: newChunkDownloader(ctx, cancel, s, key, ss, do),
+	}, nil
 }
 
-// downloadStream is an [io.ReadCloser] that streams reconstructed, decrypted
-// chunks.
+// downloadStream is an [io.ReadCloser] over the recovered, decrypted plaintext
+// produced by a [chunkDownloader]; it only tracks its position within the
+// current chunk.
 type downloadStream struct {
 	chunks *chunkDownloader
-	cipher *rekeyStream
 
 	closed atomic.Bool // set by Close, possibly on a different goroutine than Read
 
-	segments *chunkSegments
-	segment  []byte // leftover from the previous Read
-	err      error
+	cur []byte // current chunk's plaintext (pooled), nil if drained
+	off int    // bytes of cur already consumed
+}
+
+// release returns cur to the pool once it is fully consumed.
+func (d *downloadStream) release() {
+	if d.off == len(d.cur) {
+		d.chunks.putBuf(d.cur)
+		d.cur = nil
+		d.off = 0
+	}
 }
 
 func (d *downloadStream) Read(p []byte) (int, error) {
@@ -375,92 +384,80 @@ func (d *downloadStream) Read(p []byte) (int, error) {
 		return 0, nil
 	} else if d.closed.Load() {
 		return 0, io.ErrClosedPipe
-	} else if d.err != nil {
-		return 0, d.err
 	}
 
-	var total int
-	for len(p) > 0 {
-		segment, err := d.nextSegment()
+	// fetch the next chunk only once the current one is drained, so a large
+	// buffer gets the available bytes rather than blocking until it's full.
+	if d.cur == nil {
+		buf, err := d.chunks.nextChunk()
 		if err != nil {
-			d.err = err
-			if total > 0 {
-				return total, nil
+			if d.closed.Load() {
+				return 0, io.ErrClosedPipe
 			}
 			return 0, err
 		}
-
-		n := min(len(p), len(segment))
-		d.cipher.XORKeyStream(p[:n], segment[:n])
-		if n < len(segment) {
-			d.segment = segment[n:]
+		if d.closed.Load() {
+			d.chunks.putBuf(buf)
+			return 0, io.ErrClosedPipe
 		}
-		p = p[n:]
-		total += n
+		d.cur, d.off = buf, 0
 	}
-	return total, nil
+	n := copy(p, d.cur[d.off:])
+	d.off += n
+	d.release()
+	return n, nil
 }
 
 func (d *downloadStream) WriteTo(w io.Writer) (int64, error) {
 	if d.closed.Load() {
 		return 0, io.ErrClosedPipe
-	} else if errors.Is(d.err, io.EOF) {
-		return 0, nil
-	} else if d.err != nil {
-		return 0, d.err
 	}
 
-	// buffer the small per-segment writes
-	bw := bufio.NewWriterSize(w, 1<<16)
 	var total int64
-	for {
-		segment, err := d.nextSegment()
-		if err != nil {
-			// flush decrypted data before reporting the source error
-			if ferr := bw.Flush(); ferr != nil {
-				return total, ferr
-			}
-			d.err = err
-			if errors.Is(err, io.EOF) {
-				return total, nil
-			}
-			return total, err
-		}
-
-		// in-place XOR is safe; bufio.Writer copies segment into its buffer
-		d.cipher.XORKeyStream(segment, segment)
-		// a write error is a destination failure, so leave d.err unset
-		n, err := bw.Write(segment)
+	// flush any leftover from a prior Read before pulling new chunks
+	if d.cur != nil {
+		n, err := w.Write(d.cur[d.off:])
 		total += int64(n)
+		d.off += n
+		d.release()
+		if err != nil {
+			return total, err
+		} else if d.cur != nil {
+			// cur wasn't released, so w short-wrote without reporting an error
+			return total, io.ErrShortWrite
+		}
+	}
+	for {
+		if d.closed.Load() {
+			return total, io.ErrClosedPipe
+		}
+		buf, err := d.chunks.nextChunk()
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		} else if err != nil {
+			if d.closed.Load() {
+				return total, io.ErrClosedPipe
+			}
+			return total, err
+		}
+		if d.closed.Load() {
+			d.chunks.putBuf(buf)
+			return total, io.ErrClosedPipe
+		}
+		d.cur, d.off = buf, 0
+		n, err := w.Write(d.cur)
+		total += int64(n)
+		d.off += n
+		d.release()
+		if d.cur != nil {
+			if err != nil {
+				return total, err
+			}
+			return total, io.ErrShortWrite
+		}
 		if err != nil {
 			return total, err
 		}
-	}
-}
-
-func (d *downloadStream) nextSegment() ([]byte, error) {
-	if len(d.segment) > 0 {
-		segment := d.segment
-		d.segment = nil
-		return segment, nil
-	}
-
-	for {
-		if d.segments != nil {
-			segment, err := d.segments.next()
-			if err == nil {
-				return segment, nil
-			} else if !errors.Is(err, io.EOF) {
-				return nil, err
-			}
-			d.segments = nil
-		}
-
-		rc, err := d.chunks.nextChunk()
-		if err != nil {
-			return nil, err
-		}
-		d.segments = newChunkSegments(rc)
 	}
 }
 
@@ -625,207 +622,178 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 	}, nil
 }
 
-// chunkWork is a chunk handed to a worker for recovery.
-type chunkWork struct {
-	index     int
-	slabIndex int
-	chunk     slabs.SlabSlice
-}
-
-// chunkResult is the outcome of recovering a chunkWork, tagged with its index
-// so out-of-order results can be reordered into the original chunk sequence.
+// chunkResult is the decrypted plaintext of a chunk.
 type chunkResult struct {
-	index int
-	recoveredChunk
-	err error
+	data []byte // pooled; returned via putBuf once consumed
+	err  error
 }
 
-// chunkDownloader recovers chunks concurrently and yields them in order via
-// nextChunk. The first chunk is recovered synchronously for fast TTFB; the
-// worker pool is started lazily once a subsequent chunk is requested.
+// chunkDownloader recovers and decrypts chunks concurrently and yields their
+// plaintext in order via nextChunk. Each chunk recovers in its own goroutine
+// (chacha20 is seekable, so decryption parallelizes); the dispatcher publishes
+// one single-use result channel per chunk in order, so nextChunk reads them back
+// in order. A recovery error cancels the context to abort in-flight work but is
+// still reported in chunk order as context.Cause, not a bare context.Canceled.
 type chunkDownloader struct {
 	s           *SDK
 	ctx         context.Context
-	cancel      context.CancelFunc
-	chunks      *chunkIter
-	maxInflight int
+	cancel      context.CancelCauseFunc
+	key         *[32]byte
 	hostTimeout time.Duration
 	onProgress  func(ShardProgress)
+	bufPool     sync.Pool // *[chunkSize]byte plaintext buffers
+	chunks      *chunkIter
+	cipherOff   uint64
 
-	workCh    chan chunkWork
-	resultCh  chan chunkResult
-	completed map[int]chunkResult
-	next      int
-	err       error
+	sema    chan struct{}         // bounds concurrent chunk recoveries to maxInflight
+	results chan chan chunkResult // result channels in chunk order
 
-	started atomic.Bool   // set by start, read by close on a different goroutine
-	done    chan struct{} // closed by the worker pool on exit
+	started atomic.Bool
+	once    sync.Once
+	err     error         // terminal error, cached for repeat nextChunk calls; consumer goroutine only
+	done    chan struct{} // closed once the dispatcher and all chunk goroutines exit
 }
 
-func newChunkDownloader(ctx context.Context, cancel context.CancelFunc, s *SDK, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) *chunkDownloader {
+// newChunkDownloader builds a chunkDownloader whose dispatcher starts lazily on
+// the first nextChunk call, so construction issues no host reads.
+func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *SDK, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) *chunkDownloader {
 	return &chunkDownloader{
 		s:           s,
 		ctx:         ctx,
 		cancel:      cancel,
-		chunks:      newChunkIter(ss, offset, length),
-		maxInflight: maxInflight,
-		hostTimeout: hostTimeout,
-		onProgress:  onProgress,
-		completed:   make(map[int]chunkResult),
+		key:         key,
+		hostTimeout: do.hostTimeout,
+		onProgress:  do.onProgress,
+		bufPool:     sync.Pool{New: func() any { return new([chunkSize]byte) }},
+		chunks:      newChunkIter(ss, do.offset, do.length),
+		cipherOff:   do.offset,
+		sema:        make(chan struct{}, do.maxInflight),
+		results:     make(chan chan chunkResult, do.maxInflight),
 		done:        make(chan struct{}),
 	}
 }
 
-func (d *chunkDownloader) start() {
-	d.started.Store(true)
-	d.workCh = make(chan chunkWork, d.maxInflight)
-	d.resultCh = make(chan chunkResult, d.maxInflight)
+func (c *chunkDownloader) start() {
+	c.once.Do(func() {
+		c.started.Store(true)
+		go c.run()
+	})
+}
 
+// run walks the chunks in order, acquiring a sema slot and publishing a result
+// channel for each before spawning a goroutine to fill it. Publishing in order
+// keeps the output ordered; sema bounds how many chunks recover ahead of the
+// consumer.
+func (c *chunkDownloader) run() {
 	var wg sync.WaitGroup
-	for range d.maxInflight {
+	defer close(c.done)
+	defer close(c.results)
+	defer wg.Wait()
+	for {
+		chunk, slabIdx, ok := c.chunks.next()
+		if !ok {
+			return
+		}
+		// acquire a slot before publishing so recoveries never exceed maxInflight.
+		select {
+		case c.sema <- struct{}{}:
+		case <-c.ctx.Done():
+			return
+		}
+		res := make(chan chunkResult, 1)
+		select {
+		case c.results <- res:
+		case <-c.ctx.Done():
+			<-c.sema // release the slot we just acquired
+			return
+		}
+		offset := c.cipherOff
+		c.cipherOff += uint64(chunk.Length)
 		wg.Go(func() {
-			for work := range d.workCh {
-				rc, err := d.s.recoverChunk(d.ctx, work.chunk, work.slabIndex, d.hostTimeout, d.onProgress)
-				select {
-				case d.resultCh <- chunkResult{index: work.index, recoveredChunk: rc, err: err}:
-				case <-d.ctx.Done():
-					return
-				}
+			defer func() { <-c.sema }()
+			data, err := c.recoverAndDecrypt(chunk, slabIdx, offset)
+			if err != nil {
+				// surface the error promptly via the cause instead of
+				// waiting behind slower in-order chunks; first cause wins.
+				c.cancel(err)
 			}
+			res <- chunkResult{data: data, err: err}
 		})
 	}
+}
 
-	go func() {
-		defer close(d.done)
-		defer func() {
-			close(d.workCh)
-			wg.Wait()
-			close(d.resultCh)
-		}()
-		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, slabIdx, ok := d.chunks.next()
-			if !ok {
-				return
+func (c *chunkDownloader) drainResults() {
+	for res := range c.results {
+		r := <-res
+		if r.data != nil {
+			c.putBuf(r.data)
+		}
+	}
+}
+
+// recoverAndDecrypt recovers a chunk into a pooled buffer and decrypts it in
+// place at its absolute plaintext offset, so chunks decrypt independently.
+func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex int, cipherOffset uint64) ([]byte, error) {
+	rc, err := c.s.recoverChunk(c.ctx, chunk, slabIndex, c.hostTimeout, c.onProgress)
+	if err != nil {
+		return nil, err
+	}
+	arr := c.bufPool.Get().(*[chunkSize]byte)
+	out := arr[:rc.writeLen]
+	if err := stripedJoin(out, rc.shards, rc.skip); err != nil {
+		c.bufPool.Put(arr)
+		return nil, err
+	}
+	newRekeyStream(c.key, cipherOffset).XORKeyStream(out, out)
+	return out, nil
+}
+
+// putBuf returns a plaintext buffer obtained from recoverAndDecrypt to the pool.
+func (c *chunkDownloader) putBuf(buf []byte) {
+	if cap(buf) == chunkSize {
+		c.bufPool.Put((*[chunkSize]byte)(buf[:chunkSize]))
+	}
+}
+
+// nextChunk blocks until the next chunk's plaintext is ready and returns it in
+// order, io.EOF once all chunks are yielded. Hand the buffer to putBuf when done.
+func (c *chunkDownloader) nextChunk() ([]byte, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	c.start()
+	res, ok := <-c.results
+	if !ok {
+		// dispatcher exited: nil cause means it finished cleanly, else cancelled
+		if c.err = context.Cause(c.ctx); c.err == nil {
+			c.err = io.EOF
+			c.cancel(nil)
+		}
+		return nil, c.err
+	}
+	// block on this chunk's result rather than racing ctx.Done, so a later
+	// failure can't preempt earlier data; the worker always sends one result.
+	r := <-res
+	if r.err != nil {
+		c.err = r.err
+		// prefer the cancellation cause over a bare context.Canceled
+		if errors.Is(r.err, context.Canceled) {
+			if cause := context.Cause(c.ctx); cause != nil {
+				c.err = cause
 			}
-			select {
-			case d.workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, chunk: chunk}:
-			case <-d.ctx.Done():
-				return
-			}
 		}
-	}()
+		c.close()
+		return nil, c.err
+	}
+	return r.data, nil
 }
 
-func (d *chunkDownloader) nextChunk() (recoveredChunk, error) {
-	if d.err != nil {
-		return recoveredChunk{}, d.err
-	} else if d.maxInflight <= 0 {
-		d.err = errors.New("download inflight must be greater than 0")
-		return recoveredChunk{}, d.err
+func (c *chunkDownloader) close() {
+	c.cancel(nil)
+	if c.started.Load() {
+		<-c.done
+		c.drainResults()
 	}
-
-	if !d.started.Load() {
-		chunk, slabIdx, ok := d.chunks.next()
-		if !ok {
-			d.err = io.EOF
-			d.cancel()
-			return recoveredChunk{}, io.EOF
-		}
-		rc, err := d.s.recoverChunk(d.ctx, chunk, slabIdx, d.hostTimeout, d.onProgress)
-		if err != nil {
-			d.err = err
-			d.close()
-			return recoveredChunk{}, err
-		}
-		d.start()
-		return rc, nil
-	}
-
-	if res, ok := d.completed[d.next]; ok {
-		delete(d.completed, d.next)
-		d.next++
-		return res.recoveredChunk, nil
-	}
-	for res := range d.resultCh {
-		if res.err != nil {
-			d.err = res.err
-			d.close()
-			return recoveredChunk{}, res.err
-		}
-		if res.index == d.next {
-			d.next++
-			return res.recoveredChunk, nil
-		}
-		d.completed[res.index] = res
-	}
-
-	if err := d.ctx.Err(); err != nil {
-		d.err = err
-		return recoveredChunk{}, err
-	} else if len(d.completed) > 0 {
-		panic(fmt.Sprintf("%d chunks remaining but no tasks in flight", len(d.completed)))
-	}
-	d.err = io.EOF
-	d.cancel()
-	return recoveredChunk{}, io.EOF
-}
-
-func (d *chunkDownloader) close() {
-	d.cancel()
-	if d.started.Load() {
-		<-d.done
-	}
-}
-
-// chunkSegments iterates over a recovered chunk, yielding data from its data
-// shards one leaf-sized segment at a time. The first 'skip' bytes of the
-// recovered data are skipped, and at most 'remaining' bytes are yielded in
-// total.
-type chunkSegments struct {
-	shards    [][]byte
-	skip      int
-	remaining int
-	off       int // byte offset into the current stripe
-	shard     int // index of the next shard within the current stripe
-}
-
-func newChunkSegments(rc recoveredChunk) *chunkSegments {
-	return &chunkSegments{
-		shards:    rc.shards,
-		skip:      rc.skip,
-		remaining: rc.writeLen,
-	}
-}
-
-func (cs *chunkSegments) next() ([]byte, error) {
-	for cs.remaining > 0 {
-		if len(cs.shards) == 0 {
-			return nil, reedsolomon.ErrShortData
-		} else if cs.shard >= len(cs.shards) {
-			cs.shard = 0
-			cs.off += proto4.LeafSize
-		}
-
-		shard := cs.shards[cs.shard]
-		cs.shard++
-		if cs.off > len(shard) || len(shard)-cs.off < proto4.LeafSize {
-			return nil, reedsolomon.ErrShortData
-		}
-		segment := shard[cs.off:][:proto4.LeafSize]
-		if cs.skip >= len(segment) {
-			cs.skip -= len(segment)
-			continue
-		} else if cs.skip > 0 {
-			segment = segment[cs.skip:]
-			cs.skip = 0
-		}
-		if cs.remaining < len(segment) {
-			segment = segment[:cs.remaining]
-		}
-		cs.remaining -= len(segment)
-		return segment, nil
-	}
-	return nil, io.EOF
 }
 
 func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
@@ -927,6 +895,34 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	wg.Wait()
 
 	s.log.Debug("warmed up hosts", zap.Uint64("n", warmed.Load()))
+	return nil
+}
+
+// stripedJoin joins the striped data shards, writing them to dst. The first 'skip'
+// bytes of the recovered data are skipped, and len(dst) bytes are written in
+// total.
+func stripedJoin(dst []byte, dataShards [][]byte, skip int) error {
+	writeLen := len(dst)
+	for off := 0; writeLen > 0; off += proto4.LeafSize {
+		for _, shard := range dataShards {
+			if len(shard[off:]) < proto4.LeafSize {
+				return reedsolomon.ErrShortData
+			}
+			shard = shard[off:][:proto4.LeafSize]
+			if skip >= len(shard) {
+				skip -= len(shard)
+				continue
+			} else if skip > 0 {
+				shard = shard[skip:]
+				skip = 0
+			}
+			if writeLen < len(shard) {
+				shard = shard[:writeLen]
+			}
+			n := copy(dst[len(dst)-writeLen:], shard)
+			writeLen -= n
+		}
+	}
 	return nil
 }
 
