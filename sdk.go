@@ -777,7 +777,7 @@ func (d *chunkDownloader) close() {
 	}
 }
 
-// chunkSegments iterates over a recovered chunk, yielding the striped data
+// chunkSegments iterates over a recovered chunk, yielding data from its data
 // shards one leaf-sized segment at a time. The first 'skip' bytes of the
 // recovered data are skipped, and at most 'remaining' bytes are yielded in
 // total.
