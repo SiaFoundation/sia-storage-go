@@ -65,12 +65,33 @@ func TestRoundtripCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
+	if _, ok := rc.(io.WriterTo); !ok {
+		t.Fatal("download reader does not implement io.WriterTo")
+	}
 	if _, err := io.Copy(cw, rc); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(buf.Bytes(), data) {
 		t.Fatal("data mismatch")
 	}
 	t.Logf("Downloaded: %d bytes, Write calls: %d", buf.Len(), cw.count)
+
+	rc, err = sdk.Download(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	prefix := make([]byte, 123)
+	if _, err := io.ReadFull(rc, prefix); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(prefix, data[:len(prefix)]) {
+		t.Fatal("prefix mismatch")
+	}
+	buf.Reset()
+	if _, err := io.Copy(buf, rc); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(append(prefix, buf.Bytes()...), data) {
+		t.Fatal("data mismatch after partial read")
+	}
 }
 
 func TestUpload(t *testing.T) {
