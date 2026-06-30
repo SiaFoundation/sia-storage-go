@@ -259,12 +259,10 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	}
 	results := make(chan writeResult, 8)
 
-	var wg sync.WaitGroup
 	var initialDone atomic.Bool
 	launchWrite := func(host types.PublicKey, release func(), canRetry bool) {
-		wg.Add(1)
 		go func() {
-			defer func() { release(); <-su.sema; wg.Done() }()
+			defer func() { release(); <-su.sema }()
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
 			if host == initialHost {
@@ -291,15 +289,15 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	for {
 		select {
 		case <-ctx.Done():
-			// cancel shardCtx to unblock write goroutines, then wait for
-			// them to release their inflight reservations
-			cancel()
-			wg.Wait()
+			// defer cancel() unblocks the write goroutines, which release
+			// their inflight reservations as they exit
 			su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 			return
 
 		case res := <-results:
 			if res.err == nil {
+				// cancel the racers; they release their reservations as
+				// they exit, so completion can be reported immediately
 				cancel()
 
 				// penalize the original host if a racer beat it
@@ -307,10 +305,6 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 				if res.host != initialHost && !initialDone.Load() {
 					su.hosts.AddFailedRPC(initialHost)
 				}
-
-				// wait for all write goroutines to release their inflight
-				// reservations before reporting completion
-				wg.Wait()
 
 				if su.onProgress != nil {
 					su.onProgress(ShardProgress{
@@ -338,21 +332,19 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 
 			// if all active writes failed, start a new one
 			if active == 0 {
-				host, release, attempts, ok := su.pool.pick()
-				if !ok {
-					cancel()
-					wg.Wait()
-					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
-					return
-				}
+				// acquire the semaphore before picking so we don't hold an
+				// inflight reservation while blocked on a saturated semaphore
 				select {
 				case <-ctx.Done():
-					release()
-					cancel()
-					wg.Wait()
 					su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 					return
 				case su.sema <- struct{}{}:
+				}
+				host, release, attempts, ok := su.pool.pick()
+				if !ok {
+					<-su.sema
+					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
+					return
 				}
 				launchWrite(host, release, attempts < maxHostAttempts)
 				active++
