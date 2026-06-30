@@ -22,18 +22,15 @@ func TestDownloadInflight(t *testing.T) {
 	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	if n := hosts.OutstandingInflight(); n != 0 {
-		t.Fatal("leaked inflight after upload", n)
-	}
+	hosts.waitInflightDrained(t)
 
 	got, err := readAll(sdk.Download(obj))
 	if err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, data) {
 		t.Fatal("data mismatch")
-	} else if n := hosts.OutstandingInflight(); n != 0 {
-		t.Fatal("leaked inflight after download", n)
 	}
+	hosts.waitInflightDrained(t)
 }
 
 func TestOutOfOrderDownload(t *testing.T) {

@@ -36,9 +36,7 @@ func TestUploadInflight(t *testing.T) {
 	}
 
 	// the upload's own reservations must all be released
-	if n := hosts.OutstandingInflight(); n != 0 {
-		t.Fatal("leaked inflight reservations", n)
-	}
+	hosts.waitInflightDrained(t)
 
 	// the slab's shards should land mostly on idle hosts
 	var onBusy int

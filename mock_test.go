@@ -109,6 +109,20 @@ func (m *mockHostClient) OutstandingInflight() int64 {
 	return m.inflight.Load()
 }
 
+// waitInflightDrained waits for all inflight reservations to be released.
+// Releases happen asynchronously as racing goroutines exit, so a completed
+// upload or download may still hold reservations for a brief window.
+func (m *mockHostClient) waitInflightDrained(t testing.TB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.OutstandingInflight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("leaked inflight reservations", m.OutstandingInflight())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]
