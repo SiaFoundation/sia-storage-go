@@ -369,34 +369,43 @@ type downloadStream struct {
 // release returns cur to the pool once it is fully consumed.
 func (d *downloadStream) release() {
 	if d.off == len(d.cur) {
-		d.chunks.putBuf(d.cur)
+		d.chunks.bufs.put(d.cur)
 		d.cur = nil
 		d.off = 0
 	}
 }
 
+// fill ensures d.cur holds an unconsumed chunk, fetching the next one only once
+// the current is drained so a large read gets whatever is available rather than
+// blocking until it is full. It reports io.ErrClosedPipe if the stream was
+// closed, io.EOF once every chunk has been yielded, or any download error.
+func (d *downloadStream) fill() error {
+	if d.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	if d.cur != nil {
+		return nil
+	}
+	buf, err := d.chunks.nextChunk()
+	if d.closed.Load() {
+		if err == nil {
+			d.chunks.bufs.put(buf)
+		}
+		return io.ErrClosedPipe
+	}
+	if err != nil {
+		return err
+	}
+	d.cur, d.off = buf, 0
+	return nil
+}
+
 func (d *downloadStream) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
-	} else if d.closed.Load() {
-		return 0, io.ErrClosedPipe
 	}
-
-	// fetch the next chunk only once the current one is drained, so a large
-	// buffer gets the available bytes rather than blocking until it's full.
-	if d.cur == nil {
-		buf, err := d.chunks.nextChunk()
-		if err != nil {
-			if d.closed.Load() {
-				return 0, io.ErrClosedPipe
-			}
-			return 0, err
-		}
-		if d.closed.Load() {
-			d.chunks.putBuf(buf)
-			return 0, io.ErrClosedPipe
-		}
-		d.cur, d.off = buf, 0
+	if err := d.fill(); err != nil {
+		return 0, err
 	}
 	n := copy(p, d.cur[d.off:])
 	d.off += n
@@ -405,51 +414,25 @@ func (d *downloadStream) Read(p []byte) (int, error) {
 }
 
 func (d *downloadStream) WriteTo(w io.Writer) (int64, error) {
-	if d.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
-
 	var total int64
-	// flush any leftover from a prior Read before pulling new chunks
-	if d.cur != nil {
+	for {
+		err := d.fill()
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		} else if err != nil {
+			return total, err
+		}
 		n, err := w.Write(d.cur[d.off:])
 		total += int64(n)
 		d.off += n
 		d.release()
-		if err != nil {
-			return total, err
-		} else if d.cur != nil {
-			// cur wasn't released, so w short-wrote without reporting an error
-			return total, io.ErrShortWrite
-		}
-	}
-	for {
-		if d.closed.Load() {
-			return total, io.ErrClosedPipe
-		}
-		buf, err := d.chunks.nextChunk()
-		if errors.Is(err, io.EOF) {
-			return total, nil
-		} else if err != nil {
-			if d.closed.Load() {
-				return total, io.ErrClosedPipe
-			}
-			return total, err
-		}
-		if d.closed.Load() {
-			d.chunks.putBuf(buf)
-			return total, io.ErrClosedPipe
-		}
-		d.cur, d.off = buf, 0
-		n, err := w.Write(d.cur)
-		total += int64(n)
-		d.off += n
-		d.release()
 		if d.cur != nil {
-			if err != nil {
-				return total, err
+			// cur wasn't fully consumed, so w short-wrote; surface the write's
+			// own error if it reported one, else a bare short write.
+			if err == nil {
+				err = io.ErrShortWrite
 			}
-			return total, io.ErrShortWrite
+			return total, err
 		}
 		if err != nil {
 			return total, err
@@ -637,17 +620,36 @@ type chunkDownloader struct {
 	key         *[32]byte
 	hostTimeout time.Duration
 	onProgress  func(ShardProgress)
-	bufPool     sync.Pool // *[chunkSize]byte plaintext buffers
+	bufs        *chunkBufPool
 	chunks      *chunkIter
 	cipherOff   uint64
 
 	sema    chan struct{}         // bounds concurrent chunk recoveries to maxInflight
 	results chan chan chunkResult // result channels in chunk order
 
-	started atomic.Bool
-	once    sync.Once
-	err     error         // terminal error, cached for repeat nextChunk calls; consumer goroutine only
-	done    chan struct{} // closed once the dispatcher and all chunk goroutines exit
+	once sync.Once
+	err  error         // terminal error, cached for repeat nextChunk calls; consumer goroutine only
+	done chan struct{} // closed once the dispatcher and all chunk goroutines exit
+}
+
+// chunkBufPool pools full-size plaintext buffers reused across chunk downloads,
+// hiding the [chunkSize]byte-array/slice conversion behind get and put.
+type chunkBufPool struct {
+	pool sync.Pool
+}
+
+func newChunkBufPool() *chunkBufPool {
+	return &chunkBufPool{pool: sync.Pool{New: func() any { return new([chunkSize]byte) }}}
+}
+
+// get returns a buffer of length n backed by a full [chunkSize]byte array.
+func (p *chunkBufPool) get(n int) []byte {
+	return p.pool.Get().(*[chunkSize]byte)[:n]
+}
+
+// put returns a buffer previously obtained from get to the pool.
+func (p *chunkBufPool) put(buf []byte) {
+	p.pool.Put((*[chunkSize]byte)(buf[:chunkSize]))
 }
 
 // newChunkDownloader builds a chunkDownloader whose dispatcher starts lazily on
@@ -660,7 +662,7 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		key:         key,
 		hostTimeout: do.hostTimeout,
 		onProgress:  do.onProgress,
-		bufPool:     sync.Pool{New: func() any { return new([chunkSize]byte) }},
+		bufs:        newChunkBufPool(),
 		chunks:      newChunkIter(ss, do.offset, do.length),
 		cipherOff:   do.offset,
 		sema:        make(chan struct{}, do.maxInflight),
@@ -670,10 +672,7 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 }
 
 func (c *chunkDownloader) start() {
-	c.once.Do(func() {
-		c.started.Store(true)
-		go c.run()
-	})
+	c.once.Do(func() { go c.run() })
 }
 
 // run walks the chunks in order, acquiring a sema slot and publishing a result
@@ -686,6 +685,10 @@ func (c *chunkDownloader) run() {
 	defer close(c.results)
 	defer wg.Wait()
 	for {
+		// bail out promptly if the download was cancelled
+		if c.ctx.Err() != nil {
+			return
+		}
 		chunk, slabIdx, ok := c.chunks.next()
 		if !ok {
 			return
@@ -722,7 +725,7 @@ func (c *chunkDownloader) drainResults() {
 	for res := range c.results {
 		r := <-res
 		if r.data != nil {
-			c.putBuf(r.data)
+			c.bufs.put(r.data)
 		}
 	}
 }
@@ -734,25 +737,17 @@ func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex int
 	if err != nil {
 		return nil, err
 	}
-	arr := c.bufPool.Get().(*[chunkSize]byte)
-	out := arr[:rc.writeLen]
+	out := c.bufs.get(rc.writeLen)
 	if err := stripedJoin(out, rc.shards, rc.skip); err != nil {
-		c.bufPool.Put(arr)
+		c.bufs.put(out)
 		return nil, err
 	}
 	newRekeyStream(c.key, cipherOffset).XORKeyStream(out, out)
 	return out, nil
 }
 
-// putBuf returns a plaintext buffer obtained from recoverAndDecrypt to the pool.
-func (c *chunkDownloader) putBuf(buf []byte) {
-	if cap(buf) == chunkSize {
-		c.bufPool.Put((*[chunkSize]byte)(buf[:chunkSize]))
-	}
-}
-
 // nextChunk blocks until the next chunk's plaintext is ready and returns it in
-// order, io.EOF once all chunks are yielded. Hand the buffer to putBuf when done.
+// order, io.EOF once all chunks are yielded. Hand the buffer to c.bufs.put when done.
 func (c *chunkDownloader) nextChunk() ([]byte, error) {
 	if c.err != nil {
 		return nil, c.err
@@ -786,10 +781,11 @@ func (c *chunkDownloader) nextChunk() ([]byte, error) {
 
 func (c *chunkDownloader) close() {
 	c.cancel(nil)
-	if c.started.Load() {
-		<-c.done
-		c.drainResults()
-	}
+	// ensure the dispatcher was launched so done is guaranteed to close; if it
+	// never ran, run observes the cancelled context and exits immediately.
+	c.start()
+	<-c.done
+	c.drainResults()
 }
 
 func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
@@ -898,7 +894,7 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 // bytes of the recovered data are skipped, and len(dst) bytes are written in
 // total.
 func stripedJoin(dst []byte, dataShards [][]byte, skip int) error {
-	writeLen := len(dst)
+	written, writeLen := 0, len(dst)
 	for off := 0; writeLen > 0; off += proto4.LeafSize {
 		for _, shard := range dataShards {
 			if len(shard[off:]) < proto4.LeafSize {
@@ -915,7 +911,8 @@ func stripedJoin(dst []byte, dataShards [][]byte, skip int) error {
 			if writeLen < len(shard) {
 				shard = shard[:writeLen]
 			}
-			n := copy(dst[len(dst)-writeLen:], shard)
+			n := copy(dst[written:], shard)
+			written += n
 			writeLen -= n
 		}
 	}
