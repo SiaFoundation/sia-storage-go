@@ -1,0 +1,17 @@
+[package]
+name = "sia_storage_go"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/SiaFoundation/sia-storage-go"
+license = "MIT"
+description = "UniFFI bindings for the Sia Storage SDK"
+authors = ["The Sia Foundation"]
+publish = false
+
+[lib]
+name = "sia_storage_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+sia_storage_ffi = { git = "https://github.com/SiaFoundation/sia-sdk-rs.git", version = "0.9.0" }
+uniffi = { version = "=0.31.0", features = ["cli", "tokio"] }

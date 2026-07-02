@@ -4,3 +4,7 @@ GeoLite2-City.mmdb
 
 go.work
 go.work.sum
+
+# Rust build artifacts
+target/
+lib/

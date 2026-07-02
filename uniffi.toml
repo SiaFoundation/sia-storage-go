@@ -1,0 +1,2 @@
+[bindings.go]
+cdylib_name = "sia_storage_ffi"
