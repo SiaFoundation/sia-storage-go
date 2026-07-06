@@ -88,15 +88,7 @@ func newUploadPool(hosts hostClient, candidates []types.PublicKey) *uploadPool {
 // pick reserves an inflight write slot on the best available host. The returned
 // attempt count starts at 1 and increases each time the same host is picked.
 func (p *uploadPool) pick() (types.PublicKey, func(), int, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	host, release, remaining, ok := p.hosts.PickWrite(p.available)
-	if !ok {
-		return types.PublicKey{}, nil, 0, false
-	}
-	p.available = remaining
-	p.attempts[host]++
-	return host, release, p.attempts[host], true
+	return p.swap(types.PublicKey{}, false)
 }
 
 // retry returns host to the pool so a later pick can choose it again.
