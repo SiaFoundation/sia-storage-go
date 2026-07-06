@@ -6,9 +6,11 @@ import (
 	ffi "go.sia.tech/siastorage/sia_storage_ffi"
 )
 
-// uploadChunkSize is the size of the chunks handed to the FFI layer during
-// uploads.
-const uploadChunkSize = 1 << 20 // 1 MiB
+// uploadChunkSize is the size of the chunks handed across the FFI boundary
+// during uploads. Each chunk is one Go->Rust foreign-Reader call, so larger
+// chunks mean fewer boundary crossings (and less per-call cgo/goroutine
+// overhead) at the cost of more memory per read. Sector-aligned.
+const uploadChunkSize = 1 << 22 // 4 MiB (one sector)
 
 // ffiReader adapts an io.Reader to the generated Reader interface. The FFI
 // contract signals EOF with an empty chunk.
