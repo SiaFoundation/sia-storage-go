@@ -603,7 +603,7 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 
 // chunkResult is the decrypted plaintext of a chunk.
 type chunkResult struct {
-	data []byte // pooled; returned via putBuf once consumed
+	data []byte // pooled; returned via bufs.put once consumed
 	err  error
 }
 
