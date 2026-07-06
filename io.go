@@ -22,19 +22,17 @@ func newFFIReader(r io.Reader) ffi.Reader {
 }
 
 func (fr *ffiReader) Read() ([]byte, error) {
-	for {
-		n, err := fr.r.Read(fr.buf)
-		if n > 0 {
-			// fr.buf is reused across calls, so hand out a copy
-			chunk := make([]byte, n)
-			copy(chunk, fr.buf)
-			return chunk, nil
-		} else if err == io.EOF {
-			return []byte{}, nil
-		} else if err != nil {
-			return nil, ffi.NewIoErrorIo()
-		}
+	n, err := io.ReadFull(fr.r, fr.buf)
+	if n > 0 {
+		// fr.buf is reused across calls, so hand out a copy
+		chunk := make([]byte, n)
+		copy(chunk, fr.buf)
+		return chunk, nil
 	}
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return []byte{}, nil
+	}
+	return nil, ffi.NewIoErrorIo()
 }
 
 // downloadReader adapts the generated Download handle to an io.ReadCloser.

@@ -1,79 +1,70 @@
-// Package siastorage is a Go SDK for interacting with the Sia decentralized
-// storage network through an indexer.
+// Package siastorage is a Go SDK for storing and retrieving data on the Sia
+// decentralized storage network through an indexer.
 //
 // The SDK is implemented in Rust (github.com/SiaFoundation/sia-sdk-rs) and
 // exposed to Go via UniFFI-generated bindings. This package wraps the
-// low-level generated bindings in sia_storage_ffi with an idiomatic Go API.
+// low-level generated bindings in the sia_storage_ffi package with an
+// idiomatic Go API that mirrors the previous native Go implementation.
 // Applications that need functionality not covered by the wrappers can use
 // the sia_storage_ffi package directly.
+//
+// Because the SDK is backed by a Rust library, some types that were provided
+// by go.sia.tech/indexd in the native implementation (for example
+// slabs.SlabSlice, slabs.Cursor and app.AccountResponse) are exposed here as
+// their lightweight FFI equivalents to avoid re-introducing that dependency
+// tree.
 package siastorage
 
 import (
-	"log/slog"
+	"crypto/rand"
+	"encoding/hex"
+	"time"
 
+	"go.sia.tech/core/types"
 	ffi "go.sia.tech/siastorage/sia_storage_ffi"
 )
 
 // Types re-exported from the generated bindings. See the sia_storage_ffi
 // package for their documentation.
 type (
-	// An AppKey is used to sign requests to the indexer. It is derived from a
-	// BIP-39 recovery phrase and must be stored securely by the application.
-	AppKey = ffi.AppKey
-	// AppMetadata describes an application connecting to the indexer.
-	AppMetadata = ffi.AppMetadata
-	// An Object is an immutable, erasure-coded and client-side encrypted
-	// piece of data pinned to an indexer.
-	Object = ffi.PinnedObject
-	// A SealedObject is an encrypted object for secure offline storage or
-	// transmission. It can be opened with the app key using OpenObject.
-	SealedObject = ffi.SealedObject
-	// An ObjectEvent represents an object and whether it was deleted or not.
-	ObjectEvent = ffi.ObjectEvent
-	// An ObjectsCursor paginates through objects stored in the indexer.
-	ObjectsCursor = ffi.ObjectsCursor
-	// A Host is a storage provider on the Sia network.
-	Host = ffi.Host
-	// An Account is an account registered on the indexer.
-	Account = ffi.Account
-	// A Slab is a contiguous erasure-coded segment of a file.
+	// A Slab is a contiguous erasure-coded segment of an object.
 	Slab = ffi.Slab
 	// A PinnedSlab is a slab that has been pinned to the indexer.
 	PinnedSlab = ffi.PinnedSlab
-	// ShardProgress reports a successfully transferred shard.
-	ShardProgress = ffi.ShardProgress
-	// ProgressCallback receives ShardProgress updates during transfers.
-	ProgressCallback = ffi.ProgressCallback
-	// UploadOptions configures an upload operation.
-	UploadOptions = ffi.UploadOptions
-	// DownloadOptions configures a download operation.
-	DownloadOptions = ffi.DownloadOptions
+	// A PinnedSector is a sector stored on a specific host.
+	PinnedSector = ffi.PinnedSector
+	// A Host is a storage provider on the Sia network.
+	Host = ffi.Host
+	// An Account holds account information for the current app key. It
+	// replaces the app.AccountResponse returned by the native SDK.
+	Account = ffi.Account
+	// A Cursor paginates through objects stored in the indexer. It replaces
+	// slabs.Cursor from the native SDK. The zero value requests the first
+	// page of results.
+	Cursor = ffi.ObjectsCursor
 )
 
-// NewAppKey imports an app key from a 32-byte seed previously returned by
-// AppKey.Export.
-func NewAppKey(key []byte) (*AppKey, error) {
-	return ffi.NewAppKey(key)
+// A ShardProgress reports the result of a successfully completed shard upload
+// or download.
+type ShardProgress struct {
+	HostKey    types.PublicKey
+	SlabIndex  int
+	ShardIndex int
+	ShardSize  uint64
+	Elapsed    time.Duration
 }
 
-// NewObject creates a new empty object to upload into.
-func NewObject() *Object {
-	return ffi.NewPinnedObject()
-}
-
-// OpenObject opens a sealed object using the app key that sealed it.
-func OpenObject(appKey *AppKey, sealed SealedObject) (*Object, error) {
-	return ffi.PinnedObjectOpen(appKey, sealed)
-}
-
-// GenerateRecoveryPhrase generates a new BIP-39 12-word recovery phrase.
-func GenerateRecoveryPhrase() string {
+// NewSeedPhrase generates a new BIP-39 seed phrase.
+func NewSeedPhrase() string {
 	return ffi.GenerateRecoveryPhrase()
 }
 
-// ValidateRecoveryPhrase validates a BIP-39 recovery phrase.
-func ValidateRecoveryPhrase(phrase string) error {
-	return ffi.ValidateRecoveryPhrase(phrase)
+// GenerateAppID generates a new random application ID.
+func GenerateAppID() (id types.Hash256) {
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(err) // crypto/rand should never fail
+	}
+	return id
 }
 
 // EncodedSize calculates the encoded size of data given the original size and
@@ -82,26 +73,34 @@ func EncodedSize(size uint64, dataShards, parityShards uint8) uint64 {
 	return ffi.EncodedSize(size, dataShards, parityShards)
 }
 
-// NewProgressCallback wraps fn so it can be set as the progress callback in
-// UploadOptions or DownloadOptions.
-func NewProgressCallback(fn func(ShardProgress)) *ProgressCallback {
-	var cb ProgressCallback = progressFunc(fn)
-	return &cb
+// --- conversion helpers between core/types and the FFI string encodings ---
+
+func hashToString(h types.Hash256) string {
+	return hex.EncodeToString(h[:])
 }
 
-type progressFunc func(ShardProgress)
-
-func (fn progressFunc) Progress(p ShardProgress) { fn(p) }
-
-// SetLogger routes the SDK's internal logging to the provided slog.Logger.
-// Level is one of "trace", "debug", "info", "warn" or "error".
-func SetLogger(log *slog.Logger, level string) {
-	ffi.SetLogger(slogAdapter{log}, level)
+func parseHash(s string) (types.Hash256, error) {
+	var h types.Hash256
+	if err := h.UnmarshalText([]byte(s)); err != nil {
+		return types.Hash256{}, err
+	}
+	return h, nil
 }
 
-type slogAdapter struct{ log *slog.Logger }
+func parsePublicKey(s string) (types.PublicKey, error) {
+	var pk types.PublicKey
+	if err := pk.UnmarshalText([]byte(s)); err != nil {
+		return types.PublicKey{}, err
+	}
+	return pk, nil
+}
 
-func (l slogAdapter) Debug(msg string) { l.log.Debug(msg) }
-func (l slogAdapter) Info(msg string)  { l.log.Info(msg) }
-func (l slogAdapter) Warn(msg string)  { l.log.Warn(msg) }
-func (l slogAdapter) Error(msg string) { l.log.Error(msg) }
+// appKeyFromPrivate converts a types.PrivateKey into the FFI AppKey. The app
+// key seed is the first 32 bytes of the private key.
+func appKeyFromPrivate(pk types.PrivateKey) (*ffi.AppKey, error) {
+	return ffi.NewAppKey(pk[:32])
+}
+
+func privateFromAppKey(ak *ffi.AppKey) types.PrivateKey {
+	return types.NewPrivateKeyFromSeed(ak.Export())
+}
