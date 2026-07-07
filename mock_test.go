@@ -1,570 +1,356 @@
+//go:build siastorage_mock
+
 package siastorage
 
 import (
-	"context"
-	"encoding/hex"
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"io"
-	"maps"
-	"slices"
+	"os"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
-	proto "go.sia.tech/core/rhp/v4"
-	"go.sia.tech/core/types"
-	"go.sia.tech/coreutils/rhp/v4"
-	"go.sia.tech/indexd/api"
-	"go.sia.tech/indexd/api/app"
-	"go.sia.tech/indexd/client/v2"
-	"go.sia.tech/indexd/hosts"
-	"go.sia.tech/indexd/slabs"
-	"go.uber.org/zap"
+	"lukechampine.com/frand"
 )
 
-func newMockHostStore(n int) *hostCache {
-	var update []hosts.HostInfo
-	for range n {
-		hk := types.GeneratePrivateKey().PublicKey()
-		update = append(update, hosts.HostInfo{
-			PublicKey:     hk,
-			GoodForUpload: true,
-		})
-	}
-	store := newHostCache()
-	store.updateHosts(update)
-	return store
-}
-
-type hostErr struct {
-	remaining int
-	err       error
-}
-
-type mockHostClient struct {
-	provider *client.Provider
-	hosts    *hostCache
-
-	delayMu   sync.Mutex
-	slowHosts map[types.PublicKey]time.Duration
-
-	sectorDelayMu sync.Mutex
-	sectorDelays  map[types.Hash256]time.Duration
-
-	errHostsMu sync.Mutex
-	errHosts   map[types.PublicKey]hostErr
-
-	sectorsMu   sync.Mutex
-	hostSectors map[types.PublicKey]map[types.Hash256][]byte
-
-	writesMu   sync.Mutex
-	writeCalls map[types.PublicKey]int
-
-	pricesMu    sync.Mutex
-	pricesCalls map[types.PublicKey]int
-}
-
-// Close implements the [hostClient] interface.
-func (m *mockHostClient) Close() error {
-	return nil
-}
-
-// AddFailedRPC implements the [hostClient] interface.
-func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
-	m.provider.AddFailedRPC(hostKey)
-}
-
-// UploadQueue implements the [hostClient] interface.
-func (m *mockHostClient) UploadQueue() (*client.HostQueue, error) {
-	return m.provider.UploadQueue()
-}
-
-// Prioritize implements the [hostClient] interface.
-func (m *mockHostClient) Prioritize(hosts []types.PublicKey) []types.PublicKey {
-	return m.provider.Prioritize(hosts)
-}
-
-func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
-	m.delayMu.Lock()
-	delay, ok := m.slowHosts[hostKey]
-	m.delayMu.Unlock()
-	if !ok || delay <= 0 {
-		return nil
-	}
-
-	select {
-	case <-ctx.Done():
-	case <-time.After(delay):
-	}
-	return context.Cause(ctx)
-}
-
-func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) error {
-	m.sectorDelayMu.Lock()
-	delay, ok := m.sectorDelays[root]
-	if ok {
-		m.sectorDelays[root] = delay / 2
-	}
-	m.sectorDelayMu.Unlock()
-	if !ok || delay <= 0 {
-		return nil
-	}
-
-	select {
-	case <-ctx.Done():
-	case <-time.After(delay):
-	}
-	return context.Cause(ctx)
-}
-
-func (m *mockHostClient) hostError(hostKey types.PublicKey) error {
-	m.errHostsMu.Lock()
-	defer m.errHostsMu.Unlock()
-
-	errs := m.errHosts[hostKey]
-	if errs.remaining <= 0 {
-		return nil
-	}
-	m.errHosts[hostKey] = hostErr{remaining: errs.remaining - 1, err: errs.err}
-	return errs.err
-}
-
-// WriteSector implements the [hostClient] interface.
-func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, data []byte) (_ rhp.RPCWriteSectorResult, err error) {
-	if ok, _ := m.hosts.Usable(hostKey); !ok {
-		panic("host not found: " + hostKey.String()) // developer error
-	}
-
-	start := time.Now()
-	defer func() {
-		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else {
-			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
-		}
-	}()
-
-	m.writesMu.Lock()
-	m.writeCalls[hostKey]++
-	m.writesMu.Unlock()
-
-	// simulate RPC error
-	if err := m.hostError(hostKey); err != nil {
-		return rhp.RPCWriteSectorResult{}, err
-	}
-
-	// simulate i/o
-	if err := m.delay(ctx, hostKey); err != nil {
-		return rhp.RPCWriteSectorResult{}, err
-	}
-
-	m.sectorsMu.Lock()
-	defer m.sectorsMu.Unlock()
-
-	var sector [proto.SectorSize]byte
-	copy(sector[:], data)
-
-	root := proto.SectorRoot(&sector)
-	if _, ok := m.hostSectors[hostKey]; !ok {
-		m.hostSectors[hostKey] = make(map[types.Hash256][]byte)
-	}
-	m.hostSectors[hostKey][root] = sector[:]
-	return rhp.RPCWriteSectorResult{Root: root}, nil
-}
-
-// ReadSector implements the [hostClient] interface.
-func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
-	start := time.Now()
-	defer func() {
-		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else {
-			m.provider.AddReadSample(hostKey, length, time.Since(start))
-		}
-	}()
-
-	// simulate timeout
-	if err := m.delay(ctx, hostKey); err != nil {
-		return rhp.RPCReadSectorResult{}, err
-	} else if err := m.sectorDelay(ctx, sectorRoot); err != nil {
-		return rhp.RPCReadSectorResult{}, err
-	}
-
-	m.sectorsMu.Lock()
-	defer m.sectorsMu.Unlock()
-
-	sectors, ok := m.hostSectors[hostKey]
-	if !ok {
-		return rhp.RPCReadSectorResult{}, errors.New("host not found")
-	}
-	sector, ok := sectors[sectorRoot]
-	if !ok {
-		return rhp.RPCReadSectorResult{}, errors.New("sector not found")
-	}
-	if _, err := w.Write(sector[offset : offset+length]); err != nil {
-		return rhp.RPCReadSectorResult{}, err
-	}
-	return rhp.RPCReadSectorResult{}, nil
-}
-
-// Prices implements the [hostClient] interface.
-func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_ proto.HostPrices, err error) {
-	start := time.Now()
-	defer func() {
-		if err != nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else {
-			m.provider.AddSettingsSample(hostKey, time.Since(start))
-		}
-	}()
-
-	m.pricesMu.Lock()
-	m.pricesCalls[hostKey]++
-	m.pricesMu.Unlock()
-
-	// simulate delay
-	err = m.delay(ctx, hostKey)
-	return
-}
-
-// PricesCalls returns the number of Prices calls per host.
-func (m *mockHostClient) PricesCalls() map[types.PublicKey]int {
-	m.pricesMu.Lock()
-	defer m.pricesMu.Unlock()
-	calls := make(map[types.PublicKey]int, len(m.pricesCalls))
-	maps.Copy(calls, m.pricesCalls)
-	return calls
-}
-
-// WriteCalls returns the number of WriteSector calls per host.
-func (m *mockHostClient) WriteCalls() map[types.PublicKey]int {
-	m.writesMu.Lock()
-	defer m.writesMu.Unlock()
-	calls := make(map[types.PublicKey]int, len(m.writeCalls))
-	maps.Copy(calls, m.writeCalls)
-	return calls
-}
-
-// ResetPricesCalls clears the Prices call counters.
-func (m *mockHostClient) ResetPricesCalls() {
-	m.pricesMu.Lock()
-	defer m.pricesMu.Unlock()
-	m.pricesCalls = make(map[types.PublicKey]int)
-}
-
-func (m *mockHostClient) ResetSlowHosts() {
-	m.delayMu.Lock()
-	defer m.delayMu.Unlock()
-	m.slowHosts = make(map[types.PublicKey]time.Duration)
-	m.provider = client.NewProvider(m.hosts) // reset provider to clear host performance metrics
-}
-
-func (m *mockHostClient) SetSlowHosts(tb testing.TB, n int, d time.Duration) []types.PublicKey {
-	tb.Helper()
-
-	hosts, _ := m.hosts.UsableHosts()
-	if n > len(hosts) {
-		tb.Fatalf("cannot set %d slow hosts: only %d hosts available", n, len(hosts))
-	}
-
-	m.delayMu.Lock()
-	defer m.delayMu.Unlock()
-
-	slow := make([]types.PublicKey, 0, n)
-	for _, hi := range hosts {
-		if len(slow) >= n {
-			break
-		}
-		m.slowHosts[hi.PublicKey] = d
-		slow = append(slow, hi.PublicKey)
-	}
-	return slow
-}
-
-func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration) {
-	m.sectorDelayMu.Lock()
-	defer m.sectorDelayMu.Unlock()
-	m.sectorDelays[root] = d
-}
-
-// SetErrHosts marks the first n hosts as failing: each will return
-// the given error for its first failCount write attempts.
-func (m *mockHostClient) SetErrHosts(tb testing.TB, n, failCount int, err error) {
-	tb.Helper()
-
-	hosts, _ := m.hosts.UsableHosts()
-	if n > len(hosts) {
-		tb.Fatalf("cannot set %d flaky hosts: only %d hosts available", n, len(hosts))
-	}
-
-	m.errHostsMu.Lock()
-	defer m.errHostsMu.Unlock()
-
-	var set int
-	for _, hi := range hosts {
-		if set >= n {
-			break
-		}
-		set++
-		m.errHosts[hi.PublicKey] = hostErr{remaining: failCount, err: err}
-	}
-}
-
-func newMockHostClient(hosts *hostCache) *mockHostClient {
-	m := &mockHostClient{
-		hosts:        hosts,
-		provider:     client.NewProvider(hosts),
-		slowHosts:    make(map[types.PublicKey]time.Duration),
-		sectorDelays: make(map[types.Hash256]time.Duration),
-		errHosts:     make(map[types.PublicKey]hostErr),
-		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
-		writeCalls:   make(map[types.PublicKey]int),
-		pricesCalls:  make(map[types.PublicKey]int),
-	}
-	return m
-}
-
-type mockAppClient struct {
-	hosts *hostCache
-
-	mu            sync.Mutex
-	pinned        map[slabs.SlabID]slabs.PinnedSlab
-	objects       map[types.Hash256]slabs.SealedObject
-	deleted       map[types.Hash256]time.Time
-	hostsOverride []hosts.HostInfo
-	pinSlabsCalls []int
-}
-
-func newMockAppClient(hosts *hostCache) *mockAppClient {
-	return &mockAppClient{
-		hosts:   hosts,
-		objects: make(map[types.Hash256]slabs.SealedObject),
-		pinned:  make(map[slabs.SlabID]slabs.PinnedSlab),
-		deleted: make(map[types.Hash256]time.Time),
-	}
-}
-
-// Account implements the [appClient] interface.
-func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp app.AccountResponse, err error) {
-	return app.AccountResponse{}, nil
-}
-
-// PinSlabs implements the [appClient] interface.
-func (mc *mockAppClient) PinSlabs(_ context.Context, _ types.PrivateKey, toPin ...slabs.SlabPinParams) (digests []slabs.SlabID, err error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	mc.pinSlabsCalls = append(mc.pinSlabsCalls, len(toPin))
-
-	for _, s := range toPin {
-		id := s.Digest()
-		digests = append(digests, id)
-
-		ps := slabs.PinnedSlab{
-			ID:            id,
-			EncryptionKey: s.EncryptionKey,
-			MinShards:     s.MinShards,
-			Sectors:       make([]slabs.PinnedSector, len(s.Sectors)),
-		}
-		for i, sector := range s.Sectors {
-			ps.Sectors[i] = slabs.PinnedSector{
-				Root:    sector.Root,
-				HostKey: sector.HostKey,
-			}
-		}
-		mc.pinned[id] = ps
-	}
-	return
-}
-
-// Slab implements the [appClient] interface.
-func (mc *mockAppClient) Slab(_ context.Context, _ types.PrivateKey, id slabs.SlabID) (slabs.PinnedSlab, error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	slab, ok := mc.pinned[id]
-	if !ok {
-		return slabs.PinnedSlab{}, errors.New("slab not found")
-	}
-	return slab, nil
-}
-
-// UnpinSlab implements the [appClient] interface.
-func (mc *mockAppClient) UnpinSlab(_ context.Context, _ types.PrivateKey, id slabs.SlabID) error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	delete(mc.pinned, id)
-	return nil
-}
-
-// Hosts implements the [appClient] interface.
-func (mc *mockAppClient) Hosts(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) ([]hosts.HostInfo, error) {
-	mc.mu.Lock()
-	override := mc.hostsOverride
-	mc.mu.Unlock()
-	if override != nil {
-		return override, nil
-	}
-	return mc.hosts.UsableHosts()
-}
-
-// SetHosts overrides the host list returned by Hosts.
-func (mc *mockAppClient) SetHosts(hi []hosts.HostInfo) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.hostsOverride = hi
-}
-
-func (mc *mockAppClient) Object(_ context.Context, _ types.PrivateKey, objectKey types.Hash256) (slabs.SealedObject, error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	obj, ok := mc.objects[objectKey]
-	if !ok {
-		return slabs.SealedObject{}, slabs.ErrObjectNotFound
-	}
-	return obj, nil
-}
-
-func (mc *mockAppClient) ListObjects(_ context.Context, _ types.PrivateKey, _ slabs.Cursor, _ int) ([]slabs.ObjectEvent, error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	var objs []slabs.ObjectEvent
-	for _, obj := range mc.objects {
-		objs = append(objs, slabs.ObjectEvent{
-			Key:       obj.ID(),
-			Deleted:   false,
-			UpdatedAt: obj.UpdatedAt,
-			Object:    &obj,
-		})
-	}
-	for key, deletedAt := range mc.deleted {
-		objs = append(objs, slabs.ObjectEvent{
-			Key:       key,
-			Deleted:   true,
-			UpdatedAt: deletedAt,
-		})
-	}
-	slices.SortFunc(objs, func(a, b slabs.ObjectEvent) int {
-		return a.UpdatedAt.Compare(b.UpdatedAt)
-	})
-	return objs, nil
-}
-
-// SharedObject implements the [appClient] interface.
-func (mc *mockAppClient) SharedObject(_ context.Context, sharedURL string) (slabs.SharedObject, []byte, error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	buf, err := hex.DecodeString(sharedURL)
-	if err != nil {
-		return slabs.SharedObject{}, nil, errors.New("invalid shared URL")
-	} else if len(buf) != 64 {
-		return slabs.SharedObject{}, nil, errors.New("invalid shared URL")
-	}
-
-	objKey := (types.Hash256)(buf[:32])
-	encryptionKey := buf[32:]
-
-	obj, ok := mc.objects[objKey]
-	if !ok {
-		return slabs.SharedObject{}, nil, errors.New("object not found")
-	}
-
-	var objSlabs []slabs.SlabSlice
-	for _, slab := range obj.Slabs {
-		pinnedSlab := mc.pinned[slab.Digest()]
-		objSlabs = append(objSlabs, slabs.SlabSlice{
-			EncryptionKey: pinnedSlab.EncryptionKey,
-			MinShards:     pinnedSlab.MinShards,
-			Sectors:       pinnedSlab.Sectors,
-			Offset:        slab.Offset,
-			Length:        slab.Length,
-		})
-	}
-
-	return slabs.SharedObject{Slabs: objSlabs}, encryptionKey, nil
-}
-
-// PinObject implements the [appClient] interface.
-func (mc *mockAppClient) PinObject(_ context.Context, _ types.PrivateKey, obj slabs.SealedObject) (err error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.objects[obj.ID()] = obj
-	return nil
-}
-
-// CreateSharedObjectURL implements the [appClient] interface.
-func (mc *mockAppClient) CreateSharedObjectURL(_ context.Context, _ types.PrivateKey, objectKey types.Hash256, encryptionKey []byte, _ time.Time) (string, error) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	_, ok := mc.objects[objectKey]
-	if !ok {
-		return "", errors.New("object not found")
-	}
-
-	key := make([]byte, 64)
-	copy(key[:32], objectKey[:])
-	copy(key[32:], encryptionKey)
-	return hex.EncodeToString(key), nil
-}
-
-func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key types.Hash256) error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	if _, ok := mc.objects[key]; !ok {
-		return slabs.ErrObjectNotFound
-	}
-	delete(mc.objects, key)
-	mc.deleted[key] = time.Now()
-	return nil
-}
-
-func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, _ ...api.URLQueryParameterOption) error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	used := make(map[slabs.SlabID]slabs.PinnedSlab)
-	for _, obj := range mc.objects {
-		for _, slab := range obj.Slabs {
-			digest := slab.Digest()
-			used[digest] = slabs.PinnedSlab{
-				ID:            digest,
-				EncryptionKey: slab.EncryptionKey,
-				MinShards:     slab.MinShards,
-				Sectors:       slab.Sectors,
-			}
-		}
-	}
-	mc.pinned = used
-	return nil
-}
-
-// newMockBuilder creates a Builder backed by mock implementations.
-func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Builder {
-	return &Builder{
-		mockApp:       app,
-		mockHost:      hosts,
-		mockHostCache: hostStore,
-		consumed:      &atomic.Bool{},
-	}
-}
-
-// newTestSDK creates an SDK with mock clients for testing.
-func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient) {
+// newTestData returns a deterministic pseudo-random buffer.
+func newTestData(t *testing.T, n int) []byte {
 	t.Helper()
+	buf := make([]byte, n)
+	frand.Read(buf)
+	return buf
+}
 
-	appKey := types.GeneratePrivateKey()
-	hostStore := newMockHostStore(hosts)
-	appClient := newMockAppClient(hostStore)
-	hostClient := newMockHostClient(hostStore)
+func newTestMock(t *testing.T) *mockSDK {
+	t.Helper()
+	var seed [32]byte
+	frand.Read(seed[:])
+	return newMockSDK(60, seed)
+}
 
-	b := newMockBuilder(appClient, hostClient, hostStore)
-	sdk, err := b.SDK(appKey, WithLogger(log))
+func TestUploadDownload(t *testing.T) {
+	m := newTestMock(t)
+	data := newTestData(t, 5<<20)
+
+	var mu sync.Mutex
+	var uploadedShards int
+	obj := NewEmptyObject()
+	err := m.Upload(t.Context(), &obj, bytes.NewReader(data), WithUploadProgress(func(p ShardProgress) {
+		mu.Lock()
+		defer mu.Unlock()
+		uploadedShards++
+		if p.HostKey == ([32]byte{}) {
+			t.Error("progress host key is zero")
+		}
+		if p.ShardSize == 0 {
+			t.Error("progress shard size is zero")
+		}
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return sdk, hostClient
+	if obj.Size() != uint64(len(data)) {
+		t.Fatalf("expected size %d, got %d", len(data), obj.Size())
+	}
+	if obj.ID() == ([32]byte{}) {
+		t.Fatal("expected non-zero object ID")
+	}
+	if obj.EncodedSize() == 0 || obj.EncodedSize() < obj.Size() {
+		t.Fatalf("unexpected encoded size %d", obj.EncodedSize())
+	}
+	mu.Lock()
+	if uploadedShards == 0 {
+		t.Fatal("expected upload progress callbacks")
+	}
+	mu.Unlock()
+
+	var downloadedShards int
+	rc, err := m.Download(obj, WithDownloadProgress(func(_ ShardProgress) {
+		mu.Lock()
+		defer mu.Unlock()
+		downloadedShards++
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("downloaded data mismatch: got %d bytes", len(got))
+	}
+	mu.Lock()
+	if downloadedShards == 0 {
+		t.Fatal("expected download progress callbacks")
+	}
+	mu.Unlock()
+}
+
+func TestUploadAppend(t *testing.T) {
+	m := newTestMock(t)
+	first := newTestData(t, 1<<20)
+	second := newTestData(t, 2<<20)
+
+	obj := NewEmptyObject()
+	if err := m.Upload(t.Context(), &obj, bytes.NewReader(first)); err != nil {
+		t.Fatal(err)
+	}
+	firstID := obj.ID()
+	if err := m.Upload(t.Context(), &obj, bytes.NewReader(second)); err != nil {
+		t.Fatal(err)
+	}
+	if obj.ID() == firstID {
+		t.Fatal("appending must change the object ID")
+	}
+	if obj.Size() != uint64(len(first)+len(second)) {
+		t.Fatalf("expected size %d, got %d", len(first)+len(second), obj.Size())
+	}
+
+	rc, err := m.Download(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, append(append([]byte(nil), first...), second...)) {
+		t.Fatal("downloaded data mismatch")
+	}
+}
+
+func TestDownloadRange(t *testing.T) {
+	m := newTestMock(t)
+	data := newTestData(t, 3<<20)
+
+	obj := NewEmptyObject()
+	if err := m.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name           string
+		offset, length uint64
+		want           []byte
+	}{
+		{"interior", 1 << 19, 1 << 20, data[1<<19 : (1<<19)+(1<<20)]},
+		{"clamped", uint64(len(data)) - 100, 1 << 20, data[len(data)-100:]},
+		{"pastEnd", uint64(len(data)) + 1, 10, nil},
+		{"zeroLength", 0, 0, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rc, err := m.Download(obj, WithDownloadRange(tt.offset, tt.length))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rc.Close()
+			got, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Fatalf("expected %d bytes, got %d", len(tt.want), len(got))
+			}
+		})
+	}
+}
+
+func TestDownloadCloseInterrupts(t *testing.T) {
+	m := newTestMock(t)
+	data := newTestData(t, 1<<20)
+
+	obj := NewEmptyObject()
+	if err := m.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := m.Download(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// read a little, close, then confirm reads fail
+	buf := make([]byte, 1024)
+	if _, err := io.ReadFull(rc, buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rc.Read(buf); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("expected ErrClosedPipe, got %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal("second close should be a no-op")
+	}
+}
+
+func TestUploadInvalidRedundancy(t *testing.T) {
+	m := newTestMock(t)
+	obj := NewEmptyObject()
+	err := m.Upload(t.Context(), &obj, strings.NewReader("hello"), WithRedundancy(10, 1))
+	if err == nil || !strings.Contains(err.Error(), "invalid options") {
+		t.Fatalf("expected invalid options error, got %v", err)
+	}
+}
+
+func TestUploadPacked(t *testing.T) {
+	m := newTestMock(t)
+	first := newTestData(t, 1<<20)
+	second := newTestData(t, 1<<19)
+
+	up, err := m.UploadPacked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+
+	if up.OptimalDataSize() == 0 {
+		t.Fatal("expected non-zero optimal data size")
+	}
+	if up.Remaining() != up.OptimalDataSize() {
+		t.Fatalf("expected remaining %d, got %d", up.OptimalDataSize(), up.Remaining())
+	}
+
+	if n, err := up.Add(t.Context(), bytes.NewReader(first)); err != nil {
+		t.Fatal(err)
+	} else if n != int64(len(first)) {
+		t.Fatalf("expected %d bytes, got %d", len(first), n)
+	}
+	if _, err := up.Add(t.Context(), bytes.NewReader(nil)); !errors.Is(err, ErrEmptyObject) {
+		t.Fatalf("expected ErrEmptyObject, got %v", err)
+	}
+	if n, err := up.Add(t.Context(), bytes.NewReader(second)); err != nil {
+		t.Fatal(err)
+	} else if n != int64(len(second)) {
+		t.Fatalf("expected %d bytes, got %d", len(second), n)
+	}
+	if up.Length() != int64(len(first)+len(second)) {
+		t.Fatalf("expected length %d, got %d", len(first)+len(second), up.Length())
+	}
+
+	objects, err := up.Finalize(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 {
+		t.Fatalf("expected 2 objects, got %d", len(objects))
+	}
+	if objects[0].ID() == objects[1].ID() {
+		t.Fatal("expected distinct object IDs")
+	}
+
+	for i, want := range [][]byte{first, second} {
+		rc, err := m.Download(objects[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("object %d data mismatch", i)
+		}
+	}
+
+	// adding after finalize fails
+	if _, err := up.Add(t.Context(), bytes.NewReader(first)); !errors.Is(err, ErrUploadFinalized) {
+		t.Fatalf("expected ErrUploadFinalized, got %v", err)
+	}
+	// closing and re-adding fails
+	if err := up.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.Add(t.Context(), bytes.NewReader(first)); !errors.Is(err, ErrUploadClosed) {
+		t.Fatalf("expected ErrUploadClosed, got %v", err)
+	}
+}
+
+func TestUploadPackedReaderError(t *testing.T) {
+	m := newTestMock(t)
+	boom := errors.New("boom")
+
+	up, err := m.UploadPacked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+
+	// a failing reader must not register an object and must leave the
+	// upload usable
+	r := io.MultiReader(bytes.NewReader(newTestData(t, 1024)), &errReader{err: boom})
+	if _, err := up.Add(t.Context(), r); !errors.Is(err, boom) {
+		t.Fatalf("expected reader error, got %v", err)
+	}
+
+	data := newTestData(t, 2048)
+	if _, err := up.Add(t.Context(), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	objects, err := up.Finalize(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 {
+		t.Fatalf("expected 1 object, got %d", len(objects))
+	}
+	rc, err := m.Download(objects[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded data mismatch")
+	}
+}
+
+type errReader struct{ err error }
+
+func (r *errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestLargeRoundtrip exercises a large streaming transfer; enable with
+// SIA_TEST_LARGE=1.
+func TestLargeRoundtrip(t *testing.T) {
+	if os.Getenv("SIA_TEST_LARGE") == "" {
+		t.Skip("set SIA_TEST_LARGE=1 to run")
+	}
+	m := newTestMock(t)
+	const size = 512 << 20
+
+	src := frand.NewCustom(make([]byte, 32), 1024, 12)
+	sum := sha256.New()
+	obj := NewEmptyObject()
+	if err := m.Upload(t.Context(), &obj, io.TeeReader(io.LimitReader(src, size), sum), WithMaxBufferedSlabs(2)); err != nil {
+		t.Fatal(err)
+	}
+	want := sum.Sum(nil)
+
+	rc, err := m.Download(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got := sha256.New()
+	if n, err := io.Copy(got, rc); err != nil {
+		t.Fatal(err)
+	} else if n != size {
+		t.Fatalf("expected %d bytes, got %d", size, n)
+	}
+	if !bytes.Equal(got.Sum(nil), want) {
+		t.Fatal("data mismatch")
+	}
 }

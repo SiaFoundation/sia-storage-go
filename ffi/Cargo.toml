@@ -1,0 +1,30 @@
+[package]
+name = "sia_storage_ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "C interface to the sia_storage crate for the Go SDK"
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+# Swaps sia_storage's host transport for an in-memory mock. Test builds only;
+# never enable this for a distributed library.
+mock = ["sia_storage/mock", "dep:sia_core"]
+
+[dependencies]
+sia_storage = "0.10.0"
+sia_core = { version = "0.4.1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "time"] }
+tokio-util = "0.7"
+log = { version = "0.4", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

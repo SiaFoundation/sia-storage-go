@@ -1,0 +1,49 @@
+# Builds the prebuilt FFI static libraries for every supported platform and
+# uploads them as artifacts. Commit the refreshed libraries under ffi/lib/ to
+# keep the module `go get`-able.
+name: Build FFI Libraries
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - platform: darwin_arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - platform: darwin_amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - platform: linux_amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux_arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: windows_amd64
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: ffi
+      - name: Build
+        working-directory: ffi
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: ffi/target/${{ matrix.target }}/release/libsia_storage_ffi.a
+          if-no-files-found: error

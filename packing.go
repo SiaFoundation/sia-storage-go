@@ -1,18 +1,17 @@
 package siastorage
 
+/*
+#include "sia_storage_go.h"
+*/
+import "C"
+
 import (
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
-	"time"
-
-	proto4 "go.sia.tech/core/rhp/v4"
-	"go.sia.tech/coreutils/threadgroup"
-	"go.sia.tech/indexd/slabs"
-	"lukechampine.com/frand"
+	"unsafe"
 )
 
 var (
@@ -25,115 +24,148 @@ var (
 	ErrUploadFinalized = errors.New("upload already finalized")
 )
 
-type (
-	// A PackedUpload allows multiple objects to be uploaded together in a single
-	// upload. This can be more efficient than uploading each object separately
-	// if the size of the objects is less than the optimal data size.
-	PackedUpload struct {
-		// static upload options
-		dataShards   uint8
-		parityShards uint8
+// A PackedUpload allows multiple objects to be uploaded together in a single
+// upload. This can be more efficient than uploading each object separately
+// if the size of the objects is less than the optimal data size. A packed
+// upload is not thread-safe.
+type PackedUpload struct {
+	mu        sync.Mutex
+	finalized bool
+	closed    bool
+	closeCh   chan struct{}
+	closeOnce sync.Once
 
-		// upload state
-		reader       *io.PipeReader
-		writer       *io.PipeWriter
-		objects      []packedObject
-		totalWritten int64 // cumulative bytes written to pipe, including dead padding from errored reads
+	// adds counts objects registered on the Rust side; dead marks the
+	// indices of failed or empty adds, which are dropped from Finalize's
+	// result to preserve the "not added" contract.
+	adds int
+	dead map[int]bool
 
-		// orchestration
-		result        packedResult
-		resultAvailCh chan struct{}
-		once          sync.Once
+	ptr *C.sia_packed_upload_t
+	pid uintptr
+}
 
-		tg *threadgroup.ThreadGroup
+func newPackedUpload(ptr *C.sia_packed_upload_t, pid uintptr) *PackedUpload {
+	return &PackedUpload{
+		ptr:     ptr,
+		pid:     pid,
+		closeCh: make(chan struct{}),
+		dead:    make(map[int]bool),
 	}
+}
 
-	packedObject struct {
-		offset   int64
-		length   int64
-		dataKey  [32]byte
-		packedAt time.Time
+// checkState returns an error if the upload is closed or finalized.
+func (u *PackedUpload) checkState() error {
+	if u.closed {
+		return ErrUploadClosed
+	} else if u.finalized {
+		return ErrUploadFinalized
 	}
+	return nil
+}
 
-	packedResult struct {
-		slabs []slabs.SlabSlice
-		err   error
+// mapCloseErr translates a cancellation triggered by Close into
+// ErrUploadClosed to preserve the sentinel contract. Close signals closeCh
+// before it can take the mutex, so the channel is checked rather than the
+// closed flag.
+func (u *PackedUpload) mapCloseErr(err error) error {
+	if errors.Is(err, errCancelled) {
+		select {
+		case <-u.closeCh:
+			return ErrUploadClosed
+		default:
+		}
 	}
-)
+	return err
+}
+
+// addToken creates a cancellation token wired to both ctx and Close.
+func (u *PackedUpload) addToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
+	tok, cancel, free := newCancelToken()
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-u.closeCh:
+			cancel()
+		case <-done:
+		}
+	}()
+	return tok, func() {
+		close(done)
+		<-exited
+		free()
+	}
+}
 
 // Add adds a new object to the upload. The data will be read until EOF and
 // packed into the upload. The caller must call Finalize to get the resulting
 // objects after all objects have been added.
 func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
-	// return early if upload is finalized
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case <-u.resultAvailCh:
-		if u.result.err != nil {
-			return 0, u.result.err
-		}
-		return 0, ErrUploadFinalized
-	default:
-	}
-
-	// create encrypted reader
-	dataKey := frand.Entropy256()
-	r = encrypt(&dataKey, r, 0)
-
-	// spawn goroutine to interrupt io.Copy if context is cancelled
-	done := make(chan struct{})
-	addCtx, cancel, err := u.tg.AddContext(ctx)
-	if err != nil {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if err := u.checkState(); err != nil {
 		return 0, err
 	}
-	go func() {
-		defer cancel()
-		select {
-		case <-done:
-		case <-addCtx.Done():
-			u.finish(nil, context.Cause(addCtx))
-		}
-	}()
 
-	// pipe data into writer
-	offset := u.totalWritten
-	n, err := io.Copy(u.writer, r)
-	close(done) // stop the cancellation goroutine before processing the result
-	u.totalWritten += n
-	if err != nil {
-		if errors.Is(err, io.ErrClosedPipe) {
-			// if the pipe was closed the result is ready
-			<-u.resultAvailCh
-			if u.result.err != nil {
-				return 0, u.result.err
-			}
-			return 0, ErrUploadFinalized
+	var cerr *C.char
+	if code := C.sia_packed_upload_add_begin(u.ptr, &cerr); code != C.SIA_OK {
+		return 0, goError(ctx, code, cerr)
+	}
+	index := u.adds
+	u.adds++
+
+	tok, release := u.addToken(ctx)
+	defer release()
+
+	mapErr := u.mapCloseErr
+
+	finish := func() (int64, error) {
+		var written C.uint64_t
+		var cerr *C.char
+		code := C.sia_packed_upload_add_finish(u.ptr, tok, &written, &cerr)
+		if err := goError(ctx, code, cerr); err != nil {
+			u.dead[index] = true
+			return 0, mapErr(err)
 		}
-		// reader error: partial bytes become dead padding, upload stays usable
-		return 0, fmt.Errorf("failed to add object: %w", err)
-	} else if n == 0 {
-		return 0, ErrEmptyObject
+		return int64(written), nil
 	}
 
-	// create packed object
-	u.objects = append(u.objects, packedObject{
-		offset:   offset,
-		length:   n,
-		dataKey:  dataKey,
-		packedAt: time.Now(),
-	})
-	return n, nil
-}
+	buf := make([]byte, uploadBufferSize)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			var cerr *C.char
+			code := C.sia_packed_upload_add_write(u.ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(n), tok, &cerr)
+			if err := goError(ctx, code, cerr); err != nil {
+				u.dead[index] = true
+				return 0, mapErr(err)
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			break
+		} else if rerr != nil {
+			// reader error: flush the partial data as dead padding so
+			// the upload stays usable, then drop the object
+			if _, err := finish(); err != nil {
+				return 0, err
+			}
+			u.dead[index] = true
+			return 0, fmt.Errorf("failed to add object: %w", rerr)
+		}
+	}
 
-// Close closes the packed upload and releases any resources. The caller must
-// always call Close to ensure proper cleanup.
-func (u *PackedUpload) Close() error {
-	_ = u.reader.Close()
-	_ = u.writer.Close()
-	u.tg.Stop()
-	u.finish(nil, ErrUploadClosed)
-	return nil
+	written, err := finish()
+	if err != nil {
+		return 0, err
+	} else if written == 0 {
+		u.dead[index] = true
+		return 0, ErrEmptyObject
+	}
+	return written, nil
 }
 
 // Finalize finalizes the upload and returns the resulting objects. This will
@@ -142,88 +174,85 @@ func (u *PackedUpload) Close() error {
 // call PinObject for each returned object to pin the slabs and save the
 // object metadata to the indexer.
 func (u *PackedUpload) Finalize(ctx context.Context) ([]Object, error) {
-	// close the writer to signal EOF to the uploader
-	_ = u.writer.Close()
-
-	// wait for upload to complete
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-u.resultAvailCh:
-		if u.result.err != nil {
-			return nil, u.result.err
-		}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if err := u.checkState(); err != nil {
+		return nil, err
 	}
+	u.finalized = true
 
-	// build objects
-	slabSize := u.OptimalDataSize()
-	objects := make([]Object, len(u.objects))
-	for i, o := range u.objects {
-		// sanity check slab range to avoid panics
-		slabsStart, slabsEnd := o.slabRange(slabSize)
-		if slabsEnd > int64(len(u.result.slabs)) {
-			return nil, fmt.Errorf("packed upload incomplete: object %d references slab %d but only %d slabs uploaded", i, slabsEnd-1, len(u.result.slabs))
-		}
+	tok, release := u.addToken(ctx)
+	defer release()
 
-		// create object with relevant slabs
-		objects[i] = Object{
-			dataKey:   o.dataKey[:],
-			createdAt: o.packedAt,
-			updatedAt: o.packedAt,
-			slabs:     slices.Clone(u.result.slabs[slabsStart:slabsEnd]),
-		}
-
-		// adjust offset and length
-		objects[i].slabs[0].Offset = uint32(o.offset % slabSize)
-		if len(objects[i].slabs) > 1 {
-			// if spanning multiple slabs, adjust first slab's length
-			objects[i].slabs[0].Length = uint32(slabSize - int64(objects[i].slabs[0].Offset))
-		}
-		lastSlabIdx := len(objects[i].slabs) - 1
-		lastSlabOffset := int64(objects[i].slabs[lastSlabIdx].Offset)
-		objects[i].slabs[lastSlabIdx].Length = uint32(o.offset + o.length - (slabsEnd-1)*slabSize - lastSlabOffset)
+	var objs **C.sia_object_t
+	var count C.size_t
+	var cerr *C.char
+	code := C.sia_packed_upload_finalize(u.ptr, tok, &objs, &count, &cerr)
+	if err := goError(ctx, code, cerr); err != nil {
+		return nil, u.mapCloseErr(err)
 	}
+	defer C.sia_object_array_free(objs, count)
 
+	ptrs := unsafe.Slice(objs, int(count))
+	objects := make([]Object, 0, len(ptrs))
+	for i, ptr := range ptrs {
+		if u.dead[i] {
+			C.sia_object_free(ptr)
+			continue
+		}
+		objects = append(objects, newObject(ptr))
+	}
 	return objects, nil
 }
 
 // Length returns the cumulative number of bytes written to the upload pipeline,
 // including dead padding from errored reads.
 func (u *PackedUpload) Length() int64 {
-	return u.totalWritten
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.closed {
+		return 0
+	}
+	return int64(C.sia_packed_upload_length(u.ptr))
 }
 
 // Remaining returns the number of bytes remaining until reaching the optimal
 // packed size. Adding objects larger than this will span multiple slabs. To
 // minimize padding, prioritize objects that fit within the remaining size.
 func (u *PackedUpload) Remaining() int64 {
-	slabSize := u.OptimalDataSize()
-	if u.totalWritten == 0 {
-		return slabSize
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.closed {
+		return 0
 	}
-	return (slabSize - (u.totalWritten % slabSize)) % slabSize
+	return int64(C.sia_packed_upload_remaining(u.ptr))
 }
 
 // OptimalDataSize returns the data portion of a slab based on the number of
 // data shards.
 func (u *PackedUpload) OptimalDataSize() int64 {
-	return int64(u.dataShards) * proto4.SectorSize
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.closed {
+		return 0
+	}
+	return int64(C.sia_packed_upload_optimal_data_size(u.ptr))
 }
 
-// finish sets the result of the upload exactly once
-func (u *PackedUpload) finish(slabs []slabs.SlabSlice, err error) {
-	_ = u.writer.Close()
-	u.once.Do(func() {
-		u.result = packedResult{slabs: slabs, err: err}
-		close(u.resultAvailCh)
+// Close closes the packed upload and releases any resources. If the upload
+// has not been finalized, it is aborted. The caller must always call Close
+// to ensure proper cleanup.
+func (u *PackedUpload) Close() error {
+	u.closeOnce.Do(func() {
+		// unblock any in-flight Add or Finalize before taking the lock
+		close(u.closeCh)
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		u.closed = true
+		C.sia_packed_upload_free(u.ptr)
+		unregisterProgress(u.pid)
 	})
-}
-
-// slabRange returns the start and end slab indices for this object.
-func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
-	start = o.offset / slabSize
-	end = (o.offset + o.length + slabSize - 1) / slabSize
-	return
+	return nil
 }
 
 // UploadPacked creates a new packed upload. This allows multiple objects to be
@@ -231,46 +260,24 @@ func (o *packedObject) slabRange(slabSize int64) (start, end int64) {
 // used to add objects and then finalized to get the resulting objects. A packed
 // upload is not thread-safe.
 func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
-	// create upload options
-	uo, enc, err := newUploadOption(opts...)
+	var uo uploadOption
+	for _, opt := range opts {
+		opt(&uo)
+	}
+
+	ptr, unlock, err := s.acquire()
 	if err != nil {
 		return nil, err
 	}
+	defer unlock()
 
-	// create packed upload
-	reader, writer := io.Pipe()
-	u := &PackedUpload{
-		dataShards:   uo.dataShards,
-		parityShards: uo.parityShards,
-
-		reader: reader,
-		writer: writer,
-
-		resultAvailCh: make(chan struct{}),
-		tg:            threadgroup.New(),
-	}
-
-	// ensure proper goroutine cleanup on close
-	ctx, cancel, err := u.tg.AddContext(context.Background())
-	if err != nil {
+	copts, pid := uo.cOptions()
+	var up *C.sia_packed_upload_t
+	var cerr *C.char
+	code := C.sia_packed_upload_start(ptr, &copts, &up, &cerr)
+	if err := goError(nil, code, cerr); err != nil {
+		unregisterProgress(pid)
 		return nil, err
 	}
-
-	// upload slabs in background
-	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
-	go func() {
-		defer close(slabCh)
-		s.uploadSlabs(ctx, slabCh, reader, enc, uo)
-	}()
-
-	// collect uploaded slabs in the background, we have to do this to avoid a
-	// deadlock in PackedUpload.Add since it writes to an unbuffered io.Pipe and
-	// uploadSlabs reads from that pipe
-	go func() {
-		defer cancel()
-		uploaded, err := collectSlabs(ctx, slabCh, uo)
-		u.finish(uploaded, err)
-	}()
-
-	return u, nil
+	return newPackedUpload(up, pid), nil
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
-	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	siastorage "go.sia.tech/siastorage"
 	"go.uber.org/zap"
@@ -162,14 +161,6 @@ func formatBitrate(b uint64, d time.Duration) string {
 		v /= 1000.0
 	}
 	panic("unreachable")
-}
-
-func encodedSize(obj siastorage.Object) uint64 {
-	var n uint64
-	for _, s := range obj.Slabs() {
-		n += uint64(len(s.Sectors)) * proto4.SectorSize
-	}
-	return n
 }
 
 // newTransferBar adds an indicatif-style progress bar to the container. The
@@ -493,7 +484,7 @@ func listProfiles() error {
 	return nil
 }
 
-func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadMaxInflight, downloadMaxInflight int, hostSummary bool) error {
+func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, maxBufferedSlabs, maxBufferedChunks int, hostSummary bool) error {
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return fmt.Errorf("failed to generate seed: %w", err)
@@ -518,8 +509,8 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 			uploadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
 		}),
 	}
-	if uploadMaxInflight > 0 {
-		uploadOpts = append(uploadOpts, siastorage.WithUploadInflight(uploadMaxInflight))
+	if maxBufferedSlabs > 0 {
+		uploadOpts = append(uploadOpts, siastorage.WithMaxBufferedSlabs(maxBufferedSlabs))
 	}
 
 	obj := siastorage.NewEmptyObject()
@@ -561,8 +552,8 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 			downloadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
 		}),
 	}
-	if downloadMaxInflight > 0 {
-		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(downloadMaxInflight))
+	if maxBufferedChunks > 0 {
+		downloadOpts = append(downloadOpts, siastorage.WithMaxBufferedChunks(maxBufferedChunks))
 	}
 
 	downloadStart := time.Now()
@@ -588,7 +579,7 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 	downloadDuration := time.Since(downloadStart)
 	progress.Wait() // flush and stop rendering before printing the summary
 
-	encoded := encodedSize(obj)
+	encoded := obj.EncodedSize()
 	fmt.Printf("\n%-15s%s\n", "Size:", formatBytes(obj.Size()))
 	fmt.Printf("%-15s%s\n", "Encoded:", formatBytes(encoded))
 
@@ -637,8 +628,8 @@ func usage() {
 
 Usage:
   benchmark login    [--profile NAME] [--indexer URL] [--new]
-  benchmark run      [--profile NAME] [--size BYTES] [--upload-max-inflight N]
-                     [--download-max-inflight N] [--host-summary]
+  benchmark run      [--profile NAME] [--size BYTES] [--max-buffered-slabs N]
+                     [--max-buffered-chunks N] [--host-summary]
   benchmark profiles
 
 Each profile binds an app key to an indexer so subsequent runs can skip the
@@ -668,8 +659,8 @@ func main() {
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		profileName := fs.String("profile", defaultProfile, "profile to use")
 		size := fs.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
-		uploadMaxInflight := fs.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
-		downloadMaxInflight := fs.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
+		maxBufferedSlabs := fs.Int("max-buffered-slabs", 0, "maximum number of slabs buffered in memory during upload (0 = SDK default)")
+		maxBufferedChunks := fs.Int("max-buffered-chunks", 0, "maximum number of chunks buffered in memory during download (0 = SDK default)")
 		hostSummary := fs.Bool("host-summary", false, "print a per-host breakdown of shards and throughput after the run")
 		fs.Parse(os.Args[2:])
 
@@ -686,7 +677,7 @@ func main() {
 		}
 		defer sdk.Close()
 
-		if err := runBenchmark(ctx, sdk, *size, *uploadMaxInflight, *downloadMaxInflight, *hostSummary); err != nil {
+		if err := runBenchmark(ctx, sdk, *size, *maxBufferedSlabs, *maxBufferedChunks, *hostSummary); err != nil {
 			log.Fatal(err)
 		}
 

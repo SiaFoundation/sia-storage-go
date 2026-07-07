@@ -3,6 +3,9 @@ run:
   concurrency: 4
   issues-exit-code: 1
   tests: true
+  # lint the mock-transport test files too (requires `make testlib`)
+  build-tags:
+    - siastorage_mock
 linters:
   default: none
   enable:
@@ -15,6 +18,9 @@ linters:
   settings:
     gocritic:
       disabled-checks:
+        # dupImport and dupSubExpr misfire on cgo-generated code
+        - dupImport
+        - dupSubExpr
         - commentedOutCode
         - uncheckedInlineErr
         - emptyStringTest

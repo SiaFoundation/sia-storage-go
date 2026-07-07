@@ -19,44 +19,40 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: ffi
+      - name: Build FFI libraries
+        run: make lib testlib
       - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
           working-directory: ${{ matrix.dir }}
           skip-cache: true
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    env:
-      POSTGRES_USER: indexd_test
-      POSTGRES_PASSWORD: indexd_test
-      POSTGRES_DB: indexd_test
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_USER: indexd_test
-          POSTGRES_PASSWORD: indexd_test
-          POSTGRES_DB: indexd_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
-      - name: Cache GeoLite2 database
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
-          path: GeoLite2-City.mmdb
-          key: geolite2-city-mmdb-2026-04
+          workspaces: ffi
+      - name: Build FFI libraries
+        run: make lib testlib
       - name: Test
         uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
         with:
           args: -race;-failfast
+      - name: Test (mock transport)
+        uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
+        with:
+          args: -race;-failfast;-tags=siastorage_mock

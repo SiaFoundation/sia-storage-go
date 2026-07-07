@@ -4,6 +4,18 @@ The official Go SDK for storing and retrieving data on the Sia network.
 
 For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/siastorage).
 
+The SDK is a cgo binding over the [`sia_storage`](https://crates.io/crates/sia_storage)
+Rust crate: erasure coding, encryption, host transport, and the upload and
+download pipelines all run in Rust.
+
+## Requirements
+
+- cgo (`CGO_ENABLED=1`) and a C toolchain. Prebuilt static libraries are
+  committed under `ffi/lib/` for supported platforms, so `go get` works
+  without a Rust toolchain.
+- On other platforms, build the library from source with a
+  [Rust](https://rustup.rs) toolchain: `make lib`.
+
 ## Connecting to the Indexer
 
 Before uploading or downloading data, your application must connect to an
@@ -90,8 +102,8 @@ if _, err := io.Copy(out, rc); err != nil {
 
 The `Object` returned by `Upload` contains the encryption key and slab
 metadata required to download the data later. After uploading, call
-`PinObject` to persist the object on the indexer. Applications should store
-the sealed object (via `obj.Seal(appKey)`) so it can be reopened later.
+`PinObject` to persist the object on the indexer. Pinned objects can be
+retrieved later by their ID with `client.Object(ctx, obj.ID())`.
 
 ## Packed Uploads
 

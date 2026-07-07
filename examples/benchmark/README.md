@@ -6,32 +6,46 @@ seed, uploads it, pins the resulting object, downloads it back, and verifies the
 bytes match. It then prints throughput, TTFB, and the maximum gap between
 successive writes during the download.
 
-## How it works
+The `examples` directory is its own Go module; run the benchmark from inside
+it. The SDK links against the Rust FFI library, so build it first if it hasn't
+been already:
 
-1. Requests a connection to `sia.storage` and prints an authorization URL.
-2. Waits for the user to approve the connection in the browser.
-3. Prompts for the wallet recovery phrase on stdin and registers the app.
-4. Uploads `-size` bytes of seeded random data.
-5. Pins the uploaded object.
-6. Downloads the object, verifying each byte against the seeded stream.
-7. Prints upload/download elapsed time, throughput (raw and encoded), TTFB, and
-   the maximum inter-write gap observed during the download.
+```sh
+make lib        # from the repository root, requires a Rust toolchain
+cd examples
+```
 
-## Flags
+## Commands
 
-| Flag                      | Description                                         | Default               |
-|---------------------------|-----------------------------------------------------|-----------------------|
-| `-size`                   | Size of the data to upload and download, in bytes.  | `125829120` (120 MiB) |
-| `-upload-max-inflight`    | Maximum number of concurrent shard uploads.         | `0` (SDK default)     |
-| `-download-max-inflight`  | Maximum number of concurrent chunk downloads.       | `0` (SDK default)     |
+```
+benchmark login    [--profile NAME] [--indexer URL] [--new]
+benchmark run      [--profile NAME] [--size BYTES] [--max-buffered-slabs N]
+                   [--max-buffered-chunks N] [--host-summary]
+benchmark profiles
+```
+
+`login` walks through the connection approval flow once and stores the app key
+in a profile; `run` reuses it. Profiles are stored in the same location and
+format as the Rust benchmark (`sia-sdk-rs`), so profiles created by either tool
+work in the other.
+
+## Run flags
+
+| Flag                    | Description                                          | Default               |
+|-------------------------|------------------------------------------------------|-----------------------|
+| `--profile`             | Profile to use.                                      | `default`             |
+| `--size`                | Size of the data to upload and download, in bytes.   | `125829120` (120 MiB) |
+| `--max-buffered-slabs`  | Maximum number of slabs buffered during upload.      | `0` (SDK default)     |
+| `--max-buffered-chunks` | Maximum number of chunks buffered during download.   | `0` (SDK default)     |
+| `--host-summary`        | Print a per-host breakdown after the run.            | off                   |
 
 ## Example
 
-Run the benchmark with 10 GiB of data, 16 concurrent uploaders and 32 concurrent
-downloaders:
+Authorize once, then run the benchmark with 1 GiB of data:
 
 ```sh
-go run ./examples/benchmark -size $((10 * 1024 * 1024 * 1024)) -upload-max-inflight 16 -download-max-inflight 32
+go run ./benchmark login
+go run ./benchmark run --size $((1024 * 1024 * 1024)) --host-summary
 ```
 
 Follow the printed URL to authorize the app, then paste your recovery phrase

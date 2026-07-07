@@ -1,31 +1,29 @@
 package siastorage
 
+/*
+#include "sia_storage.h"
+*/
+import "C"
+
 import (
 	"context"
-	"crypto/cipher"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"slices"
+	"runtime"
 	"time"
+	"unsafe"
 
 	"go.sia.tech/core/types"
-	"go.sia.tech/indexd/keys"
-	"go.sia.tech/indexd/slabs"
-	"golang.org/x/crypto/chacha20poly1305"
-	"lukechampine.com/frand"
 )
 
-// A SealedObject is an object that has been locked with an app key.
-// It can be safely serialized and shared, but cannot be used to access
-// the underlying data until it has been unlocked with the app key.
-type SealedObject struct {
-	slabs.SealedObject
-}
+// errNilObject is returned when a zero-value Object is used. Objects must be
+// created with NewEmptyObject or returned by the SDK.
+var errNilObject = errors.New("object is not initialized")
 
-// Open decrypts the SealedObject using the given app key and returns an
-// Object.
-func (so *SealedObject) Open(appKey types.PrivateKey) (Object, error) {
-	return objectFromSealedObject(so.SealedObject, appKey)
+// objectHandle owns a Rust object and frees it once unreachable.
+type objectHandle struct {
+	ptr *C.sia_object_t
 }
 
 // An Object represents a collection of slabs that can be used to access
@@ -34,89 +32,7 @@ func (so *SealedObject) Open(appKey types.PrivateKey) (Object, error) {
 //
 // It has no public fields to prevent accidental leakage of unencrypted data.
 type Object struct {
-	dataKey   []byte
-	slabs     []slabs.SlabSlice
-	metadata  json.RawMessage
-	createdAt time.Time
-	updatedAt time.Time
-}
-
-// ID returns the object's ID, which is a hash of its slabs.
-func (o *Object) ID() types.Hash256 {
-	return slabs.ObjectID(o.slabs)
-}
-
-// CreatedAt returns the time the object was created.
-func (o *Object) CreatedAt() time.Time {
-	return o.createdAt
-}
-
-// UpdatedAt returns the time the object was last updated.
-func (o *Object) UpdatedAt() time.Time {
-	return o.updatedAt
-}
-
-// Seal returns a SealedObject that can be safely serialized and shared.
-func (o *Object) Seal(appKey types.PrivateKey) SealedObject {
-	objectID := o.ID()
-
-	seal := func(keyCipher cipher.AEAD, plaintext []byte) []byte {
-		nonce := frand.Bytes(keyCipher.NonceSize())
-		return keyCipher.Seal(nonce, nonce, plaintext, nil)
-	}
-	encryptedDataKey := seal(dataKeyCipher(appKey, objectID), o.dataKey)
-
-	var encryptedMetaKey, encryptedMetadata []byte
-	if len(o.metadata) > 0 {
-		metaDataKey := frand.Bytes(32)
-		encryptedMetaKey = seal(metadataKeyCipher(appKey, objectID), metaDataKey)
-		encryptedMetadata = seal(metadataCipher(metaDataKey), o.metadata)
-	}
-
-	so := SealedObject{slabs.SealedObject{
-		EncryptedDataKey:     encryptedDataKey,
-		Slabs:                o.slabs,
-		EncryptedMetadataKey: encryptedMetaKey,
-		EncryptedMetadata:    encryptedMetadata,
-		CreatedAt:            o.createdAt,
-		UpdatedAt:            o.updatedAt,
-	}}
-	so.Sign(appKey)
-	return so
-}
-
-// Size returns the total size of the object in bytes.
-func (o *Object) Size() uint64 {
-	var size uint64
-	for _, ss := range o.slabs {
-		size += uint64(ss.Length)
-	}
-	return size
-}
-
-// Slabs returns a copy of the object's slabs.
-func (o *Object) Slabs() []slabs.SlabSlice {
-	return slices.Clone(o.slabs)
-}
-
-// Metadata returns a copy of the object's metadata.
-func (o *Object) Metadata() json.RawMessage {
-	return slices.Clone(o.metadata)
-}
-
-// UpdateMetadata updates the object's metadata.
-func (o *Object) UpdateMetadata(meta json.RawMessage) {
-	o.metadata = slices.Clone(meta)
-}
-
-// NewEmptyObject creates a new Object to use in [Upload].
-func NewEmptyObject() Object {
-	now := time.Now()
-	return Object{
-		dataKey:   frand.Bytes(32),
-		createdAt: now,
-		updatedAt: now,
-	}
+	h *objectHandle
 }
 
 // ObjectEvent represents a change to an object. If the object was deleted,
@@ -128,28 +44,157 @@ type ObjectEvent struct {
 	Object    *Object
 }
 
+// A Cursor is used to paginate through object events. During pagination,
+// 'After' should be set to the 'UpdatedAt' value of the last event received
+// and 'Key' to the 'Key' of the last event received.
+type Cursor struct {
+	After time.Time
+	Key   types.Hash256
+}
+
+func newObjectHandle(ptr *C.sia_object_t) *objectHandle {
+	h := &objectHandle{ptr: ptr}
+	runtime.AddCleanup(h, func(p *C.sia_object_t) {
+		C.sia_object_free(p)
+	}, ptr)
+	return h
+}
+
+func newObject(ptr *C.sia_object_t) Object {
+	return Object{h: newObjectHandle(ptr)}
+}
+
+// ID returns the object's ID, which is a hash of its slabs.
+func (o *Object) ID() (id types.Hash256) {
+	if o.h == nil {
+		return types.Hash256{}
+	}
+	C.sia_object_id(o.h.ptr, cBytes32((*[32]byte)(&id)))
+	runtime.KeepAlive(o.h)
+	return id
+}
+
+// Size returns the total size of the object in bytes.
+func (o *Object) Size() uint64 {
+	if o.h == nil {
+		return 0
+	}
+	n := uint64(C.sia_object_size(o.h.ptr))
+	runtime.KeepAlive(o.h)
+	return n
+}
+
+// EncodedSize returns the total size of the object on the network after
+// erasure coding.
+func (o *Object) EncodedSize() uint64 {
+	if o.h == nil {
+		return 0
+	}
+	n := uint64(C.sia_object_encoded_size(o.h.ptr))
+	runtime.KeepAlive(o.h)
+	return n
+}
+
+// CreatedAt returns the time the object was created.
+func (o *Object) CreatedAt() time.Time {
+	if o.h == nil {
+		return time.Time{}
+	}
+	t := time.UnixMicro(int64(C.sia_object_created_at(o.h.ptr))).UTC()
+	runtime.KeepAlive(o.h)
+	return t
+}
+
+// UpdatedAt returns the time the object was last updated.
+func (o *Object) UpdatedAt() time.Time {
+	if o.h == nil {
+		return time.Time{}
+	}
+	t := time.UnixMicro(int64(C.sia_object_updated_at(o.h.ptr))).UTC()
+	runtime.KeepAlive(o.h)
+	return t
+}
+
+// Metadata returns a copy of the object's metadata.
+func (o *Object) Metadata() json.RawMessage {
+	if o.h == nil {
+		return nil
+	}
+	defer runtime.KeepAlive(o.h)
+	n := C.sia_object_metadata(o.h.ptr, nil, 0)
+	if n == 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	C.sia_object_metadata(o.h.ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n)
+	return buf
+}
+
+// UpdateMetadata updates the object's metadata.
+func (o *Object) UpdateMetadata(meta json.RawMessage) {
+	if o.h == nil {
+		return
+	}
+	var ptr *C.uint8_t
+	if len(meta) > 0 {
+		ptr = (*C.uint8_t)(unsafe.Pointer(&meta[0]))
+	}
+	C.sia_object_set_metadata(o.h.ptr, ptr, C.size_t(len(meta)))
+	runtime.KeepAlive(o.h)
+}
+
+// NewEmptyObject creates a new Object to use in [SDK.Upload].
+func NewEmptyObject() Object {
+	return newObject(C.sia_object_new())
+}
+
 // ObjectEvents returns object events from the indexer, starting from the
-// given cursor, up to the given limit. Unlike ListObjects, it preserves
-// deletion events.
-func (s *SDK) ObjectEvents(ctx context.Context, cursor slabs.Cursor, limit int) ([]ObjectEvent, error) {
-	raw, err := s.app.ListObjects(ctx, s.appKey, cursor, limit)
+// given cursor, up to the given limit. It preserves deletion events.
+func (s *SDK) ObjectEvents(ctx context.Context, cursor Cursor, limit int) ([]ObjectEvent, error) {
+	ptr, unlock, err := s.acquire()
 	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	hasCursor := cursor != (Cursor{})
+	var afterUS C.int64_t
+	var afterID [32]byte
+	if hasCursor {
+		afterUS = C.int64_t(cursor.After.UnixMicro())
+		afterID = cursor.Key
+	}
+	var limitC C.uint64_t
+	if limit > 0 {
+		limitC = C.uint64_t(limit)
+	}
+
+	var evs *C.sia_events_t
+	var cerr *C.char
+	code := C.sia_sdk_object_events(ptr, C.bool(hasCursor), afterUS, cBytes32(&afterID), limitC, tok, &evs, &cerr)
+	if err := goError(ctx, code, cerr); err != nil {
 		return nil, fmt.Errorf("failed to list object events: %w", err)
 	}
-	events := make([]ObjectEvent, len(raw))
-	for i, ev := range raw {
+	defer C.sia_events_free(evs)
+
+	events := make([]ObjectEvent, C.sia_events_len(evs))
+	for i := range events {
+		var id [32]byte
+		var deleted C.bool
+		var updatedUS C.int64_t
+		var obj *C.sia_object_t
+		C.sia_events_at(evs, C.size_t(i), cBytes32(&id), &deleted, &updatedUS, &obj)
 		events[i] = ObjectEvent{
-			Key:       ev.Key,
-			Deleted:   ev.Deleted,
-			UpdatedAt: ev.UpdatedAt,
+			Key:       types.Hash256(id),
+			Deleted:   bool(deleted),
+			UpdatedAt: time.UnixMicro(int64(updatedUS)).UTC(),
 		}
-		if ev.Object != nil {
-			so := SealedObject{*ev.Object}
-			obj, err := so.Open(s.appKey)
-			if err != nil {
-				return nil, fmt.Errorf("failed to unseal object: %w", err)
-			}
-			events[i].Object = &obj
+		if obj != nil {
+			o := newObject(obj)
+			events[i].Object = &o
 		}
 	}
 	return events, nil
@@ -157,12 +202,23 @@ func (s *SDK) ObjectEvents(ctx context.Context, cursor slabs.Cursor, limit int) 
 
 // Object retrieves the object with the given key.
 func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, error) {
-	lo, err := s.app.Object(ctx, s.appKey, objectKey)
+	ptr, unlock, err := s.acquire()
 	if err != nil {
-		return Object{}, fmt.Errorf("failed to get locked object: %w", err)
+		return Object{}, err
 	}
-	so := SealedObject{lo}
-	return so.Open(s.appKey)
+	defer unlock()
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	key := [32]byte(objectKey)
+	var obj *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_sdk_object(ptr, cBytes32(&key), tok, &obj, &cerr)
+	if err := goError(ctx, code, cerr); err != nil {
+		return Object{}, fmt.Errorf("failed to get object: %w", err)
+	}
+	return newObject(obj), nil
 }
 
 // CreateSharedObjectURL creates a URL that can be used to share the object
@@ -175,87 +231,21 @@ func (s *SDK) Object(ctx context.Context, objectKey types.Hash256) (Object, erro
 func (s *SDK) CreateSharedObjectURL(ctx context.Context, objectKey types.Hash256, validUntil time.Time) (string, error) {
 	obj, err := s.Object(ctx, objectKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to get object: %w", err)
+		return "", err
 	}
-	return s.app.CreateSharedObjectURL(ctx, s.appKey, obj.ID(), obj.dataKey, validUntil)
-}
 
-// dataKeyCipher derives the data key cipher from the app key and object ID.
-func dataKeyCipher(appKey types.PrivateKey, objectID types.Hash256) cipher.AEAD {
-	key := keys.Derive(appKey, objectID[:], []byte("dataKey"), 32)
-	cipher, _ := chacha20poly1305.NewX(key)
-	return cipher
-}
-
-// metadataKeyCipher derives the metadata key cipher from the app key and object ID.
-func metadataKeyCipher(appKey types.PrivateKey, objectID types.Hash256) cipher.AEAD {
-	key := keys.Derive(appKey, objectID[:], []byte("metadataKey"), 32)
-	cipher, _ := chacha20poly1305.NewX(key)
-	return cipher
-}
-
-// metadataCipher returns the cipher used to encrypt/decrypt metadata.
-func metadataCipher(metadataKey []byte) cipher.AEAD {
-	cipher, _ := chacha20poly1305.NewX(metadataKey)
-	return cipher
-}
-
-func unlockEncryptedMetadata(metadataKey, encryptedMeta []byte) (json.RawMessage, error) {
-	if len(encryptedMeta) == 0 {
-		return nil, nil
-	}
-	metadataCipher := metadataCipher(metadataKey)
-	if len(encryptedMeta) < metadataCipher.NonceSize() {
-		return nil, fmt.Errorf("encrypted metadata too short")
-	}
-	nonce := encryptedMeta[:metadataCipher.NonceSize()]
-	metadata, err := metadataCipher.Open(nil, nonce, encryptedMeta[metadataCipher.NonceSize():], nil)
+	ptr, unlock, err := s.acquire()
 	if err != nil {
-		return nil, fmt.Errorf("failed to unlock metadata: %w", err)
+		return "", err
 	}
-	return metadata, nil
-}
+	defer unlock()
 
-// objectFromSealedObject unlocks a SealedObject using the given app key.
-func objectFromSealedObject(so slabs.SealedObject, appKey types.PrivateKey) (Object, error) {
-	obj := Object{
-		slabs:     slices.Clone(so.Slabs),
-		createdAt: so.CreatedAt,
-		updatedAt: so.UpdatedAt,
+	var urlC *C.char
+	var cerr *C.char
+	code := C.sia_sdk_share_object(ptr, obj.h.ptr, C.int64_t(validUntil.UnixMicro()), &urlC, &cerr)
+	runtime.KeepAlive(obj.h)
+	if err := goError(ctx, code, cerr); err != nil {
+		return "", fmt.Errorf("failed to share object: %w", err)
 	}
-	objectID := obj.ID()
-	if so.ID() != objectID {
-		return Object{}, fmt.Errorf("object ID mismatch")
-	} else if err := so.VerifySignatures(appKey.PublicKey()); err != nil {
-		return Object{}, err
-	}
-
-	decryptKey := func(keyCipher cipher.AEAD, encryptedKey []byte) ([]byte, error) {
-		if len(encryptedKey) < keyCipher.NonceSize() {
-			return nil, fmt.Errorf("encrypted key is too short")
-		}
-		nonce := encryptedKey[:keyCipher.NonceSize()]
-		var err error
-		key, err := keyCipher.Open(nil, nonce, encryptedKey[keyCipher.NonceSize():], nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unlock key: %w", err)
-		}
-		return key, nil
-	}
-	var err error
-	obj.dataKey, err = decryptKey(dataKeyCipher(appKey, objectID), so.EncryptedDataKey)
-	if err != nil {
-		return Object{}, fmt.Errorf("failed to unlock data key: %w", err)
-	}
-	if len(so.EncryptedMetadata) > 0 {
-		metaDataKey, err := decryptKey(metadataKeyCipher(appKey, objectID), so.EncryptedMetadataKey)
-		if err != nil {
-			return Object{}, fmt.Errorf("failed to unlock metadata key: %w", err)
-		}
-		obj.metadata, err = unlockEncryptedMetadata(metaDataKey, so.EncryptedMetadata)
-		if err != nil {
-			return Object{}, fmt.Errorf("failed to unlock metadata: %w", err)
-		}
-	}
-	return obj, nil
+	return goString(urlC), nil
 }
