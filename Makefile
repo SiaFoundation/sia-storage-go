@@ -22,12 +22,14 @@ lib:
 	cd ffi && cargo build --release
 	mkdir -p $(LIB_DIR)
 	cp ffi/target/release/libsia_storage_ffi.a $(LIB_DIR)/
+	go clean -cache
 
 .PHONY: testlib
 testlib:
 	cd ffi && cargo build --release --features mock
 	mkdir -p $(LIB_DIR)
 	cp ffi/target/release/libsia_storage_ffi.a $(LIB_DIR)/libsia_storage_ffi_mock.a
+	go clean -cache
 
 .PHONY: test
 test: lib testlib
