@@ -272,7 +272,9 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	results := make(chan writeResult, 8)
 
 	var initialDone atomic.Bool
+	var active int
 	launchWrite := func(host types.PublicKey, release func(), canRetry bool) {
+		active++
 		go func() {
 			defer func() { <-su.sema }()
 			start := time.Now()
@@ -304,7 +306,6 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	}
 
 	launchWrite(initialHost, initialRelease, initialAttempts < maxHostAttempts)
-	active := 1
 
 	// race timer scales with active attempts to avoid stampeding
 	raceTimer := time.NewTimer(time.Second)
@@ -375,7 +376,6 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 					return
 				}
 				launchWrite(host, release, attempts < maxHostAttempts)
-				active++
 			}
 
 			// timer may have fired while processing results but the
@@ -392,7 +392,6 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 					continue
 				}
 				launchWrite(host, release, attempts < maxHostAttempts)
-				active++
 			default:
 			}
 
