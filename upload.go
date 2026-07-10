@@ -276,11 +276,11 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	launchWrite := func(host types.PublicKey, release func(), canRetry bool) {
 		active++
 		go func() {
-			defer func() { <-su.sema }()
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
-			// the write is done, so release the inflight reservation before the
-			// host can re-enter the pool, keeping the inflight accounting accurate
+			// the write is done, so release the inflight reservation and the
+			// semaphore slot before the host can re-enter the pool, keeping the
+			// inflight accounting accurate
 			release()
 			if host == initialHost {
 				initialDone.Store(true)
@@ -305,7 +305,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 		}()
 	}
 
-	launchWrite(initialHost, initialRelease, initialAttempts < maxHostAttempts)
+	launchWrite(initialHost, func() { initialRelease(); <-su.sema }, initialAttempts < maxHostAttempts)
 
 	// race timer scales with active attempts to avoid stampeding
 	raceTimer := time.NewTimer(time.Second)
@@ -375,7 +375,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
 					return
 				}
-				launchWrite(host, release, attempts < maxHostAttempts)
+				launchWrite(host, func() { release(); <-su.sema }, attempts < maxHostAttempts)
 			}
 
 			// timer may have fired while processing results but the
@@ -391,7 +391,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 					<-su.sema
 					continue
 				}
-				launchWrite(host, release, attempts < maxHostAttempts)
+				launchWrite(host, func() { release(); <-su.sema }, attempts < maxHostAttempts)
 			default:
 			}
 
