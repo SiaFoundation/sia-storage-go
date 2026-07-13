@@ -52,6 +52,8 @@ type mockHostClient struct {
 	sectorDelayMu sync.Mutex
 	sectorDelays  map[types.Hash256]time.Duration
 
+	readJitter func() time.Duration // set before issuing reads; nil for none
+
 	errHostsMu sync.Mutex
 	errHosts   map[types.PublicKey]hostErr
 
@@ -189,6 +191,8 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 		return rhp.RPCReadSectorResult{}, err
 	} else if err := m.sectorDelay(ctx, sectorRoot); err != nil {
 		return rhp.RPCReadSectorResult{}, err
+	} else if err := m.jitterDelay(ctx); err != nil {
+		return rhp.RPCReadSectorResult{}, err
 	}
 
 	m.sectorsMu.Lock()
@@ -280,6 +284,29 @@ func (m *mockHostClient) SetSlowHosts(tb testing.TB, n int, d time.Duration) []t
 		slow = append(slow, hi.PublicKey)
 	}
 	return slow
+}
+
+func (m *mockHostClient) jitterDelay(ctx context.Context) error {
+	if m.readJitter == nil {
+		return nil
+	}
+	d := m.readJitter()
+	if d <= 0 {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+	return context.Cause(ctx)
+}
+
+// SetReadJitter delays every sector read by a duration drawn from fn. It
+// affects all hosts equally, so prioritization and racing cannot route around
+// it. It must be set before issuing reads.
+func (m *mockHostClient) SetReadJitter(fn func() time.Duration) {
+	m.readJitter = fn
 }
 
 func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration) {

@@ -714,6 +714,50 @@ func BenchmarkDownload(b *testing.B) {
 	}
 }
 
+// BenchmarkDownloadJitter models hosts whose read latency varies per request —
+// including occasional stragglers — which, unlike the fixed per-host delays in
+// BenchmarkDownload, prioritization and racing cannot route around.
+func BenchmarkDownloadJitter(b *testing.B) {
+	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	defer sdk.Close()
+
+	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
+	data := frand.Bytes(benchmarkSize)
+	obj := NewEmptyObject()
+	err := sdk.Upload(b.Context(), &obj, bytes.NewReader(data))
+	if err != nil {
+		b.Fatalf("failed to upload: %v", err)
+	}
+
+	// every read takes a few ms; a small fraction straggle past the 500ms hedge
+	hosts.SetReadJitter(func() time.Duration {
+		if frand.Intn(200) == 0 {
+			return 2 * time.Second
+		}
+		return time.Duration(frand.Intn(20)) * time.Millisecond
+	})
+
+	for _, inflight := range []int{30, 80} {
+		b.Run(fmt.Sprintf("inflight %d", inflight), func(b *testing.B) {
+			buf := bytes.NewBuffer(nil)
+			b.SetBytes(benchmarkSize)
+			b.ResetTimer()
+			for b.Loop() {
+				buf.Reset()
+				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
+				if err != nil {
+					b.Fatalf("failed to download: %v", err)
+				}
+				if _, err := io.Copy(buf, rc); err != nil {
+					rc.Close()
+					b.Fatalf("failed to download: %v", err)
+				}
+				rc.Close()
+			}
+		})
+	}
+}
+
 func newTestObject(t *testing.T, numSlabs int) Object {
 	t.Helper()
 
