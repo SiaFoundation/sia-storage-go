@@ -605,18 +605,20 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 	}, nil
 }
 
-// chunkResult is the decrypted plaintext of a chunk.
+// chunkResult is the decrypted plaintext of a chunk, or the error that
+// prevented recovery.
 type chunkResult struct {
-	data []byte // pooled; returned via bufs.put once consumed
-	err  error
+	index int
+	data  []byte // pooled; returned via bufs.put once consumed
+	err   error
 }
 
 // chunkDownloader recovers and decrypts chunks concurrently and yields their
 // plaintext in order via nextChunk. Each chunk recovers in its own goroutine
-// (chacha20 is seekable, so decryption parallelizes); the dispatcher publishes
-// one single-use result channel per chunk in order, so nextChunk reads them back
-// in order. A recovery error cancels the context to abort in-flight work but is
-// still reported in chunk order as context.Cause, not a bare context.Canceled.
+// (chacha20 is seekable, so decryption parallelizes); nextChunk reorders the
+// results, buffering ready chunks so a straggler never idles the other slots.
+// A recovery error cancels the context but is reported as context.Cause, not a
+// bare context.Canceled.
 type chunkDownloader struct {
 	s           *SDK
 	ctx         context.Context
@@ -628,12 +630,16 @@ type chunkDownloader struct {
 	chunks      *chunkIter
 	cipherOff   uint64
 
-	sema    chan struct{}         // bounds concurrent chunk recoveries to maxInflight
-	results chan chan chunkResult // result channels in chunk order
+	sema    chan struct{}    // bounds concurrent chunk recoveries to maxInflight
+	results chan chunkResult // recovered chunks, in completion order
 
 	once sync.Once
-	err  error         // terminal error, cached for repeat nextChunk calls; consumer goroutine only
 	done chan struct{} // closed once the dispatcher and all chunk goroutines exit
+
+	// consumer state, owned by the nextChunk caller
+	next      int                 // index of the next chunk to yield
+	completed map[int]chunkResult // out-of-order results awaiting their turn
+	err       error               // terminal error, cached for repeat nextChunk calls
 }
 
 // chunkBufPool pools full-size plaintext buffers reused across chunk downloads,
@@ -670,8 +676,9 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		chunks:      newChunkIter(ss, do.offset, do.length),
 		cipherOff:   do.offset,
 		sema:        make(chan struct{}, do.maxInflight),
-		results:     make(chan chan chunkResult, do.maxInflight),
+		results:     make(chan chunkResult, do.maxInflight),
 		done:        make(chan struct{}),
+		completed:   make(map[int]chunkResult),
 	}
 }
 
@@ -679,16 +686,15 @@ func (c *chunkDownloader) start() {
 	c.once.Do(func() { go c.run() })
 }
 
-// run walks the chunks in order, acquiring a sema slot and publishing a result
-// channel for each before spawning a goroutine to fill it. Publishing in order
-// keeps the output ordered; sema bounds how many chunks recover ahead of the
-// consumer.
+// run walks the chunks in order, acquiring a sema slot for each before spawning
+// a goroutine to recover it. The slot is held until the result is handed off,
+// so a stalled consumer backpressures recoveries.
 func (c *chunkDownloader) run() {
 	var wg sync.WaitGroup
 	defer close(c.done)
 	defer close(c.results)
 	defer wg.Wait()
-	for {
+	for index := 0; ; index++ {
 		// bail out promptly if the download was cancelled
 		if c.ctx.Err() != nil {
 			return
@@ -697,17 +703,9 @@ func (c *chunkDownloader) run() {
 		if !ok {
 			return
 		}
-		// acquire a slot before publishing so recoveries never exceed maxInflight.
 		select {
 		case c.sema <- struct{}{}:
 		case <-c.ctx.Done():
-			return
-		}
-		res := make(chan chunkResult, 1)
-		select {
-		case c.results <- res:
-		case <-c.ctx.Done():
-			<-c.sema // release the slot we just acquired
 			return
 		}
 		offset := c.cipherOff
@@ -720,17 +718,14 @@ func (c *chunkDownloader) run() {
 				// waiting behind slower in-order chunks; first cause wins.
 				c.cancel(err)
 			}
-			res <- chunkResult{data: data, err: err}
+			select {
+			case c.results <- chunkResult{index: index, data: data, err: err}:
+			case <-c.ctx.Done():
+				if data != nil {
+					c.bufs.put(data)
+				}
+			}
 		})
-	}
-}
-
-func (c *chunkDownloader) drainResults() {
-	for res := range c.results {
-		r := <-res
-		if r.data != nil {
-			c.bufs.put(r.data)
-		}
 	}
 }
 
@@ -757,39 +752,49 @@ func (c *chunkDownloader) nextChunk() ([]byte, error) {
 		return nil, c.err
 	}
 	c.start()
-	res, ok := <-c.results
-	if !ok {
-		// dispatcher exited: nil cause means it finished cleanly, else cancelled
-		if c.err = context.Cause(c.ctx); c.err == nil {
-			c.err = io.EOF
-			c.cancel(nil)
-		}
-		return nil, c.err
-	}
-	// block on this chunk's result rather than racing ctx.Done, so a later
-	// failure can't preempt earlier data; the worker always sends one result.
-	r := <-res
-	if r.err != nil {
-		c.err = r.err
-		// prefer the cancellation cause over a bare context.Canceled
-		if errors.Is(r.err, context.Canceled) {
-			if cause := context.Cause(c.ctx); cause != nil {
-				c.err = cause
+	for {
+		if r, ok := c.completed[c.next]; ok {
+			delete(c.completed, c.next)
+			if r.err != nil {
+				return nil, c.fail(r.err)
 			}
+			c.next++
+			return r.data, nil
 		}
-		c.close()
-		return nil, c.err
+		r, ok := <-c.results
+		if !ok {
+			// dispatcher exited: nil cause means it finished cleanly, else cancelled
+			if c.err = context.Cause(c.ctx); c.err == nil {
+				c.err = io.EOF
+				c.cancel(nil)
+			}
+			return nil, c.err
+		}
+		c.completed[r.index] = r
 	}
-	return r.data, nil
 }
 
+// fail records the download's terminal error, preferring the cancellation
+// cause over a bare context.Canceled, and reaps the download goroutines.
+func (c *chunkDownloader) fail(err error) error {
+	c.err = err
+	if errors.Is(err, context.Canceled) {
+		if cause := context.Cause(c.ctx); cause != nil {
+			c.err = cause
+		}
+	}
+	c.close()
+	return c.err
+}
+
+// close cancels the download and waits for its goroutines to exit; outstanding
+// buffers are left for the GC.
 func (c *chunkDownloader) close() {
 	c.cancel(nil)
 	// ensure the dispatcher was launched so done is guaranteed to close; if it
 	// never ran, run observes the cancelled context and exits immediately.
 	c.start()
 	<-c.done
-	c.drainResults()
 }
 
 func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
