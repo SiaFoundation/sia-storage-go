@@ -67,28 +67,52 @@ type (
 )
 
 // uploadPool holds the candidate hosts for a slab, shared by all of its shard
-// goroutines. pick reserves an inflight write slot on the best host and retry
-// returns a host to the pool so it can be picked again.
+// goroutines. It reserves one candidate for each shard's initial attempt while
+// allowing retries and racers to use any surplus hosts.
 type uploadPool struct {
 	hosts hostClient
 
-	mu        sync.Mutex
-	available []types.PublicKey
-	attempts  map[types.PublicKey]int
+	mu             sync.Mutex
+	available      []types.PublicKey
+	attempts       map[types.PublicKey]int
+	pendingInitial int
 }
 
-func newUploadPool(hosts hostClient, candidates []types.PublicKey) *uploadPool {
+func newUploadPool(hosts hostClient, candidates []types.PublicKey, pendingInitial int) *uploadPool {
 	return &uploadPool{
-		hosts:     hosts,
-		available: candidates,
-		attempts:  make(map[types.PublicKey]int),
+		hosts:          hosts,
+		available:      candidates,
+		attempts:       make(map[types.PublicKey]int),
+		pendingInitial: pendingInitial,
 	}
 }
 
-// pick reserves an inflight write slot on the best available host. The returned
-// attempt count starts at 1 and increases each time the same host is picked.
+// pickInitial reserves an inflight write slot for a shard's first attempt.
+// pendingInitial ensures racers cannot consume hosts needed by shards that
+// have not acquired the global upload semaphore yet.
+func (p *uploadPool) pickInitial() (types.PublicKey, func(), int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pendingInitial == 0 {
+		return types.PublicKey{}, nil, 0, false
+	}
+	p.pendingInitial--
+	return p.pick()
+}
+
+// pick reserves an inflight write slot from the pool's surplus capacity. The
+// caller must hold p.mu.
 func (p *uploadPool) pick() (types.PublicKey, func(), int, bool) {
-	return p.swap(types.PublicKey{}, false)
+	if len(p.available) <= p.pendingInitial {
+		return types.PublicKey{}, nil, 0, false
+	}
+	host, release, remaining, ok := p.hosts.PickWrite(p.available)
+	if !ok {
+		return types.PublicKey{}, nil, 0, false
+	}
+	p.available = remaining
+	p.attempts[host]++
+	return host, release, p.attempts[host], true
 }
 
 // retry returns host to the pool so a later pick can choose it again.
@@ -109,13 +133,15 @@ func (p *uploadPool) swap(oldHost types.PublicKey, returnOld bool) (types.Public
 	if returnOld {
 		p.available = append(p.available, oldHost)
 	}
-	host, release, remaining, ok := p.hosts.PickWrite(p.available)
-	if !ok {
-		return types.PublicKey{}, nil, 0, false
-	}
-	p.available = remaining
-	p.attempts[host]++
-	return host, release, p.attempts[host], true
+	return p.pick()
+}
+
+// pickRacer reserves an inflight write slot without consuming capacity
+// reserved for shards that have not started their initial attempt.
+func (p *uploadPool) pickRacer() (types.PublicKey, func(), int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pick()
 }
 
 // maxConcurrentSlabs returns the number of slabs that can be uploading at the
@@ -217,7 +243,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			encryptionKey: frand.Entropy256(),
 			slabIndex:     i,
 			sema:          shardSema,
-			pool:          newUploadPool(s.hosts, candidates),
+			pool:          newUploadPool(s.hosts, candidates, totalShards),
 			shardsCh:      make(chan shard, totalShards),
 		}
 		for shardIdx, data := range slab.Shards {
@@ -251,7 +277,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	case su.sema <- struct{}{}:
 	}
 
-	initialHost, initialRelease, initialAttempts, ok := su.pool.pick()
+	initialHost, initialRelease, initialAttempts, ok := su.pool.pickInitial()
 	if !ok {
 		<-su.sema
 		su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
@@ -386,7 +412,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 			// race a slow host
 			select {
 			case su.sema <- struct{}{}:
-				host, release, attempts, ok := su.pool.pick()
+				host, release, attempts, ok := su.pool.pickRacer()
 				if !ok {
 					<-su.sema
 					continue
