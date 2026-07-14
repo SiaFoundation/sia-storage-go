@@ -8,14 +8,14 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
-	"go.sia.tech/indexd/client/v2"
 	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
 
-// racingShardUpload builds a shardUpload whose first host is slow and whose
-// queue is all fast hosts. the write estimate is seeded small so a racer easily
-// beats the slow host.
+// racingShardUpload builds a shardUpload whose pool holds one slow host and
+// five fast hosts. Only the fast hosts have write samples, and the picker
+// prefers unsampled hosts, so the slow host wins the initial pick while the
+// seeded samples keep the race timeout small enough for a racer to beat it.
 func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCounter) (*shardUpload, types.PublicKey) {
 	t.Helper()
 	sdk, hosts := newTestSDK(t, 6, zaptest.NewLogger(t))
@@ -34,11 +34,12 @@ func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCou
 	}
 	hosts.SetSlowHostKeys([]types.PublicKey{slow}, slowDelay)
 
+	candidates := append([]types.PublicKey{slow}, fast...)
 	su := &shardUpload{
 		hosts:      hosts,
 		accountKey: sdk.appKey,
 		sema:       make(chan struct{}, 4),
-		queue:      client.NewHostQueue(fast),
+		pool:       newUploadPool(hosts, candidates, 1),
 		shardsCh:   make(chan shard, 1),
 		waiting:    waiting,
 	}
@@ -110,7 +111,7 @@ func TestUploadRacing(t *testing.T) {
 	waiting.add(1) // this shard's own pending attempt
 	sector := make([]byte, proto.SectorSize)
 	start := time.Now()
-	go su.uploadShard(t.Context(), 0, slow, true, sector)
+	go su.uploadShard(t.Context(), 0, sector)
 	res := <-su.shardsCh
 
 	// assert it waited for the slow host instead of racing
@@ -130,7 +131,7 @@ func TestUploadRacing(t *testing.T) {
 	time.AfterFunc(150*time.Millisecond, func() { waiting.add(-1) })
 	sector = make([]byte, proto.SectorSize)
 	start = time.Now()
-	go su.uploadShard(t.Context(), 0, slow, true, sector)
+	go su.uploadShard(t.Context(), 0, sector)
 	res = <-su.shardsCh
 
 	// assert a racer won once the gate opened
@@ -147,7 +148,7 @@ func TestUploadRacing(t *testing.T) {
 
 func TestUploadGateReleasedOnCancel(t *testing.T) {
 	waiting := newChangeCounter(0)
-	su, slow := racingShardUpload(t, 600*time.Millisecond, waiting)
+	su, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
 
 	// fill the semaphore so the initial permit acquire blocks
 	for range cap(su.sema) {
@@ -159,7 +160,7 @@ func TestUploadGateReleasedOnCancel(t *testing.T) {
 	sector := make([]byte, proto.SectorSize)
 	done := make(chan struct{})
 	go func() {
-		su.uploadShard(ctx, 0, slow, true, sector)
+		su.uploadShard(ctx, 0, sector)
 		close(done)
 	}()
 
@@ -171,5 +172,50 @@ func TestUploadGateReleasedOnCancel(t *testing.T) {
 		t.Fatal("expected cancellation error")
 	} else if waiting.load() != 0 {
 		t.Fatal("waiting gate leaked", waiting.load())
+	}
+}
+
+// TestUploadInflight asserts uploads release their inflight
+// reservations and avoid busy hosts.
+func TestUploadInflight(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 40, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// saturate 5 hosts with inflight writes so PickWrite steers the upload
+	// onto the 35 idle ones
+	usable, _ := hosts.hosts.UsableHosts()
+	busy := make(map[types.PublicKey]bool)
+	var releases []func()
+	for _, hi := range usable[:5] {
+		busy[hi.PublicKey] = true
+		for range 5 {
+			releases = append(releases, hosts.provider.TrackInflightWrite(hi.PublicKey))
+		}
+	}
+
+	data := frand.Bytes(int(proto.SectorSize) * 10) // one slab, 30 shards
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// the upload's own reservations must all be released
+	hosts.waitInflightDrained(t)
+
+	// the slab's shards should land mostly on idle hosts
+	var onBusy int
+	for _, slab := range obj.Slabs() {
+		for _, sector := range slab.Sectors {
+			if busy[sector.HostKey] {
+				onBusy++
+			}
+		}
+	}
+	if onBusy > 5 {
+		t.Fatal("too many shards on busy hosts, inflight not respected", onBusy)
+	}
+
+	for _, r := range releases {
+		r()
 	}
 }

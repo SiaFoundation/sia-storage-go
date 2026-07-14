@@ -49,8 +49,10 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
 
 	ss := []slabs.SlabSlice{
-		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{}},
-		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{}},
+		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
+			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
+		}},
+		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
 	}
 	obj := Object{
 		dataKey:  frand.Bytes(32),

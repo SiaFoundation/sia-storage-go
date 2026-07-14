@@ -12,6 +12,28 @@ import (
 	"lukechampine.com/frand"
 )
 
+// TestDownloadInflight asserts downloads release their inflight
+// reservations.
+func TestDownloadInflight(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 40, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 10)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	hosts.waitInflightDrained(t)
+
+	got, err := readAll(sdk.Download(obj))
+	if err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+	hosts.waitInflightDrained(t)
+}
+
 func TestOutOfOrderDownload(t *testing.T) {
 	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()

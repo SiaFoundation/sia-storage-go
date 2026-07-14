@@ -45,6 +45,7 @@ type hostErr struct {
 type mockHostClient struct {
 	provider *client.Provider
 	hosts    *hostCache
+	inflight atomic.Int64
 
 	delayMu   sync.Mutex
 	slowHosts map[types.PublicKey]time.Duration
@@ -93,6 +94,43 @@ func (m *mockHostClient) ReadEstimate(bytes uint64) time.Duration {
 // WriteEstimate implements the [hostClient] interface.
 func (m *mockHostClient) WriteEstimate(bytes uint64) time.Duration {
 	return m.provider.WriteEstimate(bytes)
+}
+
+// PickWrite implements the [hostClient] interface.
+func (m *mockHostClient) PickWrite(candidates []types.PublicKey) (types.PublicKey, func(), []types.PublicKey, bool) {
+	host, release, remaining, ok := m.provider.PickWrite(candidates)
+	if !ok {
+		return host, release, remaining, ok
+	}
+	m.inflight.Add(1)
+	return host, func() { m.inflight.Add(-1); release() }, remaining, ok
+}
+
+// TrackInflightRead implements the [hostClient] interface.
+func (m *mockHostClient) TrackInflightRead(hostKey types.PublicKey) func() {
+	release := m.provider.TrackInflightRead(hostKey)
+	m.inflight.Add(1)
+	return func() { m.inflight.Add(-1); release() }
+}
+
+// OutstandingInflight returns the number of inflight reservations whose
+// release has not yet been called.
+func (m *mockHostClient) OutstandingInflight() int64 {
+	return m.inflight.Load()
+}
+
+// waitInflightDrained waits for all inflight reservations to be released.
+// Releases happen asynchronously as racing goroutines exit, so a completed
+// upload or download may still hold reservations for a brief window.
+func (m *mockHostClient) waitInflightDrained(t testing.TB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.OutstandingInflight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("leaked inflight reservations", m.OutstandingInflight())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // SetSlowHostKeys marks the given hosts slow, each delaying its RPCs by d.

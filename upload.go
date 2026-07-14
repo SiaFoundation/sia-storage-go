@@ -12,7 +12,6 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"go.sia.tech/core/types"
-	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
 	"lukechampine.com/frand"
@@ -20,9 +19,8 @@ import (
 
 const (
 	// maxHostAttempts is the maximum number of upload attempts per host
-	// before it is permanently removed from the upload queue. The attempt
-	// counter is tracked by the shared HostQueue across all shards, not
-	// per shard.
+	// before it is permanently removed from the pool. The attempt counter is
+	// tracked by the per-slab uploadPool across all shard goroutines.
 	maxHostAttempts = 3
 
 	// uploadTimeout is the per-attempt timeout for uploading a single
@@ -56,7 +54,7 @@ type (
 		slabIndex     int
 
 		sema     chan struct{}
-		queue    *client.HostQueue
+		pool     *uploadPool
 		shardsCh chan shard
 
 		// waiting counts shards that still need their first upload attempt,
@@ -73,6 +71,84 @@ type (
 		onProgress   func(ShardProgress)
 	}
 )
+
+// uploadPool holds the candidate hosts for a slab, shared by all of its shard
+// goroutines. It reserves one candidate for each shard's initial attempt while
+// allowing retries and racers to use any surplus hosts.
+type uploadPool struct {
+	hosts hostClient
+
+	mu             sync.Mutex
+	available      []types.PublicKey
+	attempts       map[types.PublicKey]int
+	pendingInitial int
+}
+
+func newUploadPool(hosts hostClient, candidates []types.PublicKey, pendingInitial int) *uploadPool {
+	return &uploadPool{
+		hosts:          hosts,
+		available:      candidates,
+		attempts:       make(map[types.PublicKey]int),
+		pendingInitial: pendingInitial,
+	}
+}
+
+// pickInitial reserves an inflight write slot for a shard's first attempt.
+// pendingInitial ensures racers cannot consume hosts needed by shards that
+// have not acquired the global upload semaphore yet.
+func (p *uploadPool) pickInitial() (types.PublicKey, func(), int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pendingInitial == 0 {
+		return types.PublicKey{}, nil, 0, false
+	}
+	p.pendingInitial--
+	return p.pick()
+}
+
+// pick reserves an inflight write slot from the pool's surplus capacity. The
+// caller must hold p.mu.
+func (p *uploadPool) pick() (types.PublicKey, func(), int, bool) {
+	if len(p.available) <= p.pendingInitial {
+		return types.PublicKey{}, nil, 0, false
+	}
+	host, release, remaining, ok := p.hosts.PickWrite(p.available)
+	if !ok {
+		return types.PublicKey{}, nil, 0, false
+	}
+	p.available = remaining
+	p.attempts[host]++
+	return host, release, p.attempts[host], true
+}
+
+// retry returns host to the pool so a later pick can choose it again.
+func (p *uploadPool) retry(host types.PublicKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.available = append(p.available, host)
+}
+
+// swap returns oldHost to the pool and picks a replacement under a single
+// lock. Doing both atomically prevents another shard's racer from stealing
+// the reclaimed host in the window between returning and re-picking, which
+// would leave this shard with no host to retry. If returnOld is false the
+// old host is not returned, making swap equivalent to pick.
+func (p *uploadPool) swap(oldHost types.PublicKey, returnOld bool) (types.PublicKey, func(), int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if returnOld {
+		p.available = append(p.available, oldHost)
+	}
+	return p.pick()
+}
+
+// pickRacer reserves an inflight write slot without consuming capacity
+// reserved for shards that have not started their initial attempt.
+func (p *uploadPool) pickRacer() (types.PublicKey, func(), int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pick()
+}
 
 // maxConcurrentSlabs returns the number of slabs that can be uploading at the
 // same time. If one slow host is holding up the upload of a slab, we read
@@ -139,13 +215,18 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 
 	// read slabs in a loop
 	for i := 0; ctx.Err() == nil; i++ {
-		// fetch hosts
+		// fetch hosts and drain into a candidate pool for PickWrite
 		queue, err := s.hosts.UploadQueue()
 		if err != nil {
 			send(slabUpload{err: fmt.Errorf("failed to get upload queue for slab %d: %w", i, err)})
 			return
-		} else if queue.Available() < totalShards {
-			send(slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d: %d < %d", i, queue.Available(), totalShards)})
+		}
+		candidates := make([]types.PublicKey, 0, queue.Available())
+		for host := range queue.Iter() {
+			candidates = append(candidates, host)
+		}
+		if len(candidates) < totalShards {
+			send(slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d: %d < %d", i, len(candidates), totalShards)})
 			return
 		}
 
@@ -172,18 +253,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			encryptionKey: frand.Entropy256(),
 			slabIndex:     i,
 			sema:          shardSema,
-			queue:         queue,
+			pool:          newUploadPool(s.hosts, candidates, totalShards),
 			shardsCh:      make(chan shard, totalShards),
 			waiting:       waiting,
 		}
 		for shardIdx, data := range slab.Shards {
-			host, attempts, ok := queue.Next()
-			if !ok {
-				send(slabUpload{err: ErrNoMoreHosts})
-				return
-			}
 			waiting.add(1) // count this shard until it gets its first slot
-			go su.uploadShard(ctx, shardIdx, host, attempts < maxHostAttempts, data)
+			go su.uploadShard(ctx, shardIdx, data)
 		}
 
 		// send slab off for collection
@@ -195,9 +271,10 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 	}
 }
 
-// uploadShard encrypts and uploads a single shard to a host, racing slow hosts
-// by spawning additional upload attempts after a timeout.
-func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialHost types.PublicKey, canRetry bool, sector []byte) {
+// uploadShard encrypts and uploads a single shard, racing slow hosts by
+// spawning additional attempts after a timeout. Hosts are chosen from the
+// shared pool, which reserves an inflight write slot per attempt.
+func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector []byte) {
 	// encrypt the sector
 	nonce := make([]byte, 24)
 	nonce[0] = byte(shardIndex)
@@ -221,6 +298,13 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	// got a slot, so this shard no longer holds racing back
 	releaseWaiting()
 
+	initialHost, initialRelease, initialAttempts, ok := su.pool.pickInitial()
+	if !ok {
+		<-su.sema
+		su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
+		return
+	}
+
 	// shardCtx is cancelled when a write succeeds, aborting any racers
 	shardCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -235,27 +319,40 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	results := make(chan writeResult, 8)
 
 	var initialDone atomic.Bool
-	launchWrite := func(host types.PublicKey, canRetry bool) {
+	var active int
+	launchWrite := func(host types.PublicKey, release func(), canRetry bool) {
+		active++
 		go func() {
-			defer func() { <-su.sema }()
 			start := time.Now()
 			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
+			// the write is done, so release the inflight reservation and the
+			// semaphore slot before the host can re-enter the pool, keeping the
+			// inflight accounting accurate
+			release()
 			if host == initialHost {
 				initialDone.Store(true)
+			}
+			// if the shard already completed, this result is stale: return the
+			// host to the pool instead of racing to enqueue a result nobody
+			// will read, which would leak the host out of the pool
+			if shardCtx.Err() != nil {
+				if ctx.Err() == nil && canRetry {
+					su.pool.retry(host)
+				}
+				return
 			}
 			select {
 			case results <- writeResult{host, root, err, time.Since(start), canRetry}:
 			case <-shardCtx.Done():
 				// a write won, return this host so other shards can use it
 				if ctx.Err() == nil && canRetry {
-					su.queue.Retry(host)
+					su.pool.retry(host)
 				}
 			}
 		}()
 	}
 
-	launchWrite(initialHost, canRetry)
-	active := 1
+	launchWrite(initialHost, func() { initialRelease(); <-su.sema }, initialAttempts < maxHostAttempts)
 
 	// only race a host once it is clearly slower than normal. before we have
 	// timing data the estimate is large, so racing stays off until it warms up.
@@ -263,8 +360,11 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 	lastEvent := time.Now()
 
 	for {
-		// only race when no shard is still waiting for its first try and a host is free
-		eligible := su.waiting.load() == 0 && su.queue.Available() > 0
+		// only race when no shard is still waiting for its first try. whether
+		// a host is free is checked when the timer fires by attempting a pick,
+		// so the timer polls the pool instead of waiting on an availability
+		// signal that might never come
+		eligible := su.waiting.load() == 0
 		var raceCh <-chan time.Time
 		var idleCh <-chan struct{}
 		if eligible {
@@ -276,12 +376,16 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 
 		select {
 		case <-ctx.Done():
+			// defer cancel() unblocks the write goroutines, which release
+			// their inflight reservations as they exit
 			su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 			return
 
 		case res := <-results:
 			lastEvent = time.Now()
 			if res.err == nil {
+				// cancel the racers; they release their reservations as
+				// they exit, so completion can be reported immediately
 				cancel()
 
 				// penalize the original host if a racer beat it while it was
@@ -309,26 +413,32 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 
 			active--
 
-			// requeue failed host so other shards can try it
-			if res.canRetry {
-				su.queue.Retry(res.host)
-			}
-
-			// if all active writes failed, start a new one
-			if active == 0 {
-				host, attempts, ok := su.queue.Next()
-				if !ok {
-					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
-					return
+			if active > 0 {
+				// another write is still in flight; requeue the failed host so
+				// it or another shard can retry it later
+				if res.canRetry {
+					su.pool.retry(res.host)
 				}
+			} else {
+				// all active writes failed. acquire the semaphore before
+				// touching the pool so we don't hold an inflight reservation
+				// while blocked on it
 				select {
 				case <-ctx.Done():
 					su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 					return
 				case su.sema <- struct{}{}:
 				}
-				launchWrite(host, attempts < maxHostAttempts)
-				active++
+				// atomically requeue the failed host and pick a replacement so
+				// the reclaimed host cannot be stolen by another shard's racer
+				// in the window between the two
+				host, release, attempts, ok := su.pool.swap(res.host, res.canRetry)
+				if !ok {
+					<-su.sema
+					su.shardsCh <- shard{index: shardIndex, err: ErrNoMoreHosts}
+					return
+				}
+				launchWrite(host, func() { release(); <-su.sema }, attempts < maxHostAttempts)
 			}
 
 		case <-raceCh:
@@ -340,13 +450,12 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, initialH
 			// race a slow host
 			select {
 			case su.sema <- struct{}{}:
-				host, attempts, ok := su.queue.Next()
+				host, release, attempts, ok := su.pool.pickRacer()
 				if !ok {
 					<-su.sema
 					continue
 				}
-				launchWrite(host, attempts < maxHostAttempts)
-				active++
+				launchWrite(host, func() { release(); <-su.sema }, attempts < maxHostAttempts)
 			default:
 			}
 
