@@ -6,7 +6,9 @@
 version: 2
 updates:
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/examples"
     schedule:
       interval: "weekly"
     groups:
