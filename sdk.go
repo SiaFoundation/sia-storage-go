@@ -368,11 +368,9 @@ type downloadStream struct {
 
 // release returns cur to the pool once it is fully consumed.
 func (d *downloadStream) release() {
-	if d.off == len(d.cur) {
-		d.chunks.bufs.put(d.cur)
-		d.cur = nil
-		d.off = 0
-	}
+	d.chunks.bufs.put(d.cur)
+	d.cur = nil
+	d.off = 0
 }
 
 // fill ensures d.cur holds an unconsumed chunk, fetching the next one only once
@@ -409,7 +407,9 @@ func (d *downloadStream) Read(p []byte) (int, error) {
 	}
 	n := copy(p, d.cur[d.off:])
 	d.off += n
-	d.release()
+	if d.off == len(d.cur) {
+		d.release()
+	}
 	return n, nil
 }
 
@@ -424,16 +424,7 @@ func (d *downloadStream) WriteTo(w io.Writer) (int64, error) {
 		}
 		n, err := w.Write(d.cur[d.off:])
 		total += int64(n)
-		d.off += n
 		d.release()
-		if d.cur != nil {
-			// cur wasn't fully consumed, so w short-wrote; surface the write's
-			// own error if it reported one, else a bare short write.
-			if err == nil {
-				err = io.ErrShortWrite
-			}
-			return total, err
-		}
 		if err != nil {
 			return total, err
 		}
