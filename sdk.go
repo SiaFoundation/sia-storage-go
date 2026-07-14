@@ -416,17 +416,29 @@ func (d *downloadStream) Read(p []byte) (int, error) {
 func (d *downloadStream) WriteTo(w io.Writer) (int64, error) {
 	var total int64
 	for {
-		err := d.fill()
-		if errors.Is(err, io.EOF) {
-			return total, nil
-		} else if err != nil {
+		if err := d.fill(); err != nil {
+			if errors.Is(err, io.EOF) {
+				return total, nil
+			}
 			return total, err
 		}
-		n, err := w.Write(d.cur[d.off:])
-		total += int64(n)
-		d.release()
-		if err != nil {
-			return total, err
+		for d.off < len(d.cur) {
+			p := d.cur[d.off:]
+			n, err := w.Write(p)
+			if n < 0 || n > len(p) {
+				return total, fmt.Errorf("invalid Write count %d", n)
+			}
+
+			d.off += n
+			total += int64(n)
+			if d.off == len(d.cur) {
+				d.release()
+			}
+			if err != nil {
+				return total, err
+			} else if n == 0 {
+				return total, io.ErrShortWrite
+			}
 		}
 	}
 }
