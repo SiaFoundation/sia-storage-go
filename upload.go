@@ -239,8 +239,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
+		// count this slab's shards as waiting before encoding so the racing
+		// gate cannot open between buffering and the first upload attempts
+		waiting.add(len(slab.Shards))
+
 		// encode shards
 		if err := enc.Encode(slab.Shards); err != nil {
+			waiting.add(-len(slab.Shards))
 			send(slabUpload{err: fmt.Errorf("failed to encode slab %d shards: %w", i, err)})
 			return
 		}
@@ -258,7 +263,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			waiting:       waiting,
 		}
 		for shardIdx, data := range slab.Shards {
-			waiting.add(1) // count this shard until it gets its first slot
 			go su.uploadShard(ctx, shardIdx, data)
 		}
 
