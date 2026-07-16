@@ -162,7 +162,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 	}
 	responseCh := make(chan result, len(slab.Sectors))
 	var outstanding int
-	tryDownloadSector := func(d sectorDownload, initial bool) {
+	tryDownloadSector := func(d sectorDownload) {
 		outstanding++
 		release := s.hosts.TrackInflightRead(d.sector.HostKey)
 		wg.Go(func() {
@@ -182,18 +182,21 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 				elapsed: time.Since(start),
 			}:
 			}
-			// a host gets demoted if either
-			// 1. it hit the shard timeout
-			// 2. it was part of the initial batch of hosts and was interrupted
-			if (timeoutCtx.Err() != nil && ctx.Err() == nil) || (initial && ctx.Err() != nil) {
+			// a host only gets demoted when it hits the shard timeout. reads
+			// cancelled because the chunk completed without them are expected
+			// with overprovisioning and do not count against the host
+			if timeoutCtx.Err() != nil && ctx.Err() == nil {
 				s.hosts.AddFailedRPC(d.sector.HostKey)
 			}
 		})
 	}
 
-	// launch minShards downloads right away
-	for range slab.MinShards {
-		tryDownloadSector(slabSectors[slabHosts[0]], true)
+	// overprovision the initial reads to avoid waiting on the slowest of
+	// exactly minShards hosts; the chunk completes on the first minShards
+	// successes and the leftover reads are cancelled
+	initial := min(int(slab.MinShards)*3/2, len(slabHosts))
+	for range initial {
+		tryDownloadSector(slabSectors[slabHosts[0]])
 		slabHosts = slabHosts[1:]
 	}
 
@@ -245,7 +248,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 				return nil, ErrNotEnoughShards
 			}
 			if res.err != nil && len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]], false)
+				tryDownloadSector(slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
 
@@ -253,7 +256,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			lastEvent = time.Now()
 			// periodically launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]], false)
+				tryDownloadSector(slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
 
