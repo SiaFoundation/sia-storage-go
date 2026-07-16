@@ -352,7 +352,14 @@ func TestProgressCallbacks(t *testing.T) {
 		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
-		if expected := int(slabSize) / chunkSize * dataShards * numSlabs; count != expected {
+		// the chunk ramp makes the chunk count schedule dependent, so derive
+		// the expected count from a fresh iterator
+		ci := newChunkIter(obj.Slabs(), 0, uint64(len(data)))
+		var chunks int
+		for _, _, ok := ci.next(); ok; _, _, ok = ci.next() {
+			chunks++
+		}
+		if expected := chunks * dataShards; count != expected {
 			t.Fatalf("expected %d download callbacks, got %d", expected, count)
 		}
 	})

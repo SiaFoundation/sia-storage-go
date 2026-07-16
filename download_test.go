@@ -74,8 +74,8 @@ func TestChunkIter(t *testing.T) {
 		t.Helper()
 		var total uint64
 		for i, c := range chunks {
-			if uint64(c.Length) > chunkSize {
-				t.Fatalf("chunk %d exceeds chunkSize: %d", i, c.Length)
+			if uint64(c.Length) > maxChunkSize {
+				t.Fatalf("chunk %d exceeds maxChunkSize: %d", i, c.Length)
 			}
 			if i > 0 && c.EncryptionKey == chunks[i-1].EncryptionKey {
 				if c.Offset != chunks[i-1].Offset+chunks[i-1].Length {
@@ -103,37 +103,37 @@ func TestChunkIter(t *testing.T) {
 		},
 		{
 			name:   "partial offset",
-			slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
+			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2)},
 			offset: 100,
-			length: chunkSize + 50,
+			length: maxChunkSize + 50,
 		},
 		{
 			name:   "multiple slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 2), makeSlab(chunkSize * 3)},
+			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2), makeSlab(maxChunkSize * 3)},
 			offset: 0,
-			length: chunkSize*2 + chunkSize*3,
+			length: maxChunkSize*2 + maxChunkSize*3,
 		},
 		{
 			name:   "offset skips first slab",
-			slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(chunkSize * 2)},
+			slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(maxChunkSize * 2)},
 			offset: 1000,
-			length: chunkSize * 2,
+			length: maxChunkSize * 2,
 		},
 		{
 			name:   "span across slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize), makeSlab(chunkSize)},
-			offset: chunkSize / 2,
-			length: chunkSize,
+			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize), makeSlab(maxChunkSize)},
+			offset: maxChunkSize / 2,
+			length: maxChunkSize,
 		},
 		{
 			name:   "small request",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 4)},
+			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 4)},
 			offset: 0,
 			length: 100,
 		},
 		{
 			name:   "zero length",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize)},
+			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize)},
 			offset: 0,
 			length: 0,
 		},

@@ -459,22 +459,34 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
-const chunkSize = 1 << 18 // 256 KiB
+const (
+	// initialChunkSize is the size of a download's first chunk. Starting
+	// small keeps the time to first byte low, since the first chunk only
+	// needs a tiny read from each host.
+	initialChunkSize = 1 << 15 // 32 KiB
 
-// chunkIter splits slabs into fixed-size chunks for parallel recovery.
-// It handles byte-range selection internally: offset is a byte offset into
-// the logical stream of all slabs and length limits total output.
+	// maxChunkSize caps the per-chunk doubling. Larger chunks amortize the
+	// fixed cost of a read RPC over more bytes.
+	maxChunkSize = 1 << 20 // 1 MiB
+)
+
+// chunkIter splits slabs into chunks for parallel recovery. Chunks start at
+// initialChunkSize for a fast first byte and double per chunk up to
+// maxChunkSize. It handles byte-range selection internally: offset is a byte
+// offset into the logical stream of all slabs and length limits total output.
 type chunkIter struct {
 	slabs     []slabs.SlabSlice
 	slabIdx   int
 	offset    uint64 // position within current slab
 	remaining uint64 // total bytes left to yield
+	chunkSize uint64 // doubles per chunk up to maxChunkSize
 }
 
 func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	ci := &chunkIter{
 		slabs:     ss,
 		remaining: length,
+		chunkSize: initialChunkSize,
 	}
 	for ci.slabIdx < len(ci.slabs) {
 		slabLength := uint64(ci.slabs[ci.slabIdx].Length)
@@ -497,7 +509,7 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 			ci.offset = 0
 			continue
 		}
-		chunkLen := min(available, ci.remaining, chunkSize)
+		chunkLen := min(available, ci.remaining, ci.chunkSize)
 		chunk := slab
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
@@ -508,6 +520,7 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 			ci.slabIdx++
 		}
 		ci.remaining -= chunkLen
+		ci.chunkSize = min(ci.chunkSize*2, maxChunkSize)
 		return chunk, slabIdx, true
 	}
 	return slabs.SlabSlice{}, 0, false
