@@ -342,16 +342,17 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do)
 }
 
-// downloadReader streams recovered chunks directly to the reader. Closing the
+// downloadReader starts recovering chunks immediately and streams them to the
+// reader, so the first bytes are ready as early as possible. Closing the
 // returned reader cancels any chunk downloads in flight.
 func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) (io.ReadCloser, error) {
 	if do.maxInflight <= 0 {
 		return nil, errors.New("download inflight must be greater than 0")
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
-	return &downloadStream{
-		chunks: newChunkDownloader(ctx, cancel, s, key, ss, do),
-	}, nil
+	chunks := newChunkDownloader(ctx, cancel, s, key, ss, do)
+	chunks.start()
+	return &downloadStream{chunks: chunks}, nil
 }
 
 // downloadStream is an [io.ReadCloser] over the recovered, decrypted plaintext
@@ -661,8 +662,8 @@ func (p *chunkBufPool) put(buf []byte) {
 	p.pool.Put((*[chunkSize]byte)(buf[:chunkSize]))
 }
 
-// newChunkDownloader builds a chunkDownloader whose dispatcher starts lazily on
-// the first nextChunk call, so construction issues no host reads.
+// newChunkDownloader builds a chunkDownloader; the caller launches its
+// dispatcher via start.
 func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *SDK, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) *chunkDownloader {
 	return &chunkDownloader{
 		s:           s,
@@ -687,7 +688,9 @@ func (c *chunkDownloader) start() {
 
 // run walks the chunks in order, acquiring a sema slot for each before spawning
 // a goroutine to recover it. The slot is held until the result is handed off,
-// so a stalled consumer backpressures recoveries.
+// so a stalled consumer backpressures recoveries. The first chunk is recovered
+// synchronously for fast TTFB, so its host reads never queue behind reads for
+// the other inflight chunks.
 func (c *chunkDownloader) run() {
 	var wg sync.WaitGroup
 	defer close(c.done)
@@ -702,29 +705,41 @@ func (c *chunkDownloader) run() {
 		if !ok {
 			return
 		}
+		offset := c.cipherOff
+		c.cipherOff += uint64(chunk.Length)
+		if index == 0 {
+			// nothing else is in flight and results has a free slot, so
+			// this neither needs a sema slot nor blocks on the handoff
+			c.deliverChunk(index, chunk, slabIdx, offset)
+			continue
+		}
 		select {
 		case c.sema <- struct{}{}:
 		case <-c.ctx.Done():
 			return
 		}
-		offset := c.cipherOff
-		c.cipherOff += uint64(chunk.Length)
 		wg.Go(func() {
 			defer func() { <-c.sema }()
-			data, err := c.recoverAndDecrypt(chunk, slabIdx, offset)
-			if err != nil {
-				// surface the error promptly via the cause instead of
-				// waiting behind slower in-order chunks; first cause wins.
-				c.cancel(err)
-			}
-			select {
-			case c.results <- chunkResult{index: index, data: data, err: err}:
-			case <-c.ctx.Done():
-				if data != nil {
-					c.bufs.put(data)
-				}
-			}
+			c.deliverChunk(index, chunk, slabIdx, offset)
 		})
+	}
+}
+
+// deliverChunk recovers and decrypts one chunk and hands its result off,
+// returning the pooled buffer if the download was cancelled before the handoff.
+func (c *chunkDownloader) deliverChunk(index int, chunk slabs.SlabSlice, slabIdx int, offset uint64) {
+	data, err := c.recoverAndDecrypt(chunk, slabIdx, offset)
+	if err != nil {
+		// surface the error promptly via the cause instead of
+		// waiting behind slower in-order chunks; first cause wins.
+		c.cancel(err)
+	}
+	select {
+	case c.results <- chunkResult{index: index, data: data, err: err}:
+	case <-c.ctx.Done():
+		if data != nil {
+			c.bufs.put(data)
+		}
 	}
 }
 
