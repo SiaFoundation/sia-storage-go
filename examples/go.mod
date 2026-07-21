@@ -6,8 +6,8 @@ replace go.sia.tech/siastorage => ../
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/vbauerster/mpb/v8 v8.12.1
-	go.sia.tech/core v0.21.6
+	github.com/vbauerster/mpb/v8 v8.13.0
+	go.sia.tech/core v0.21.7
 	go.sia.tech/siastorage v0.0.0-00010101000000-000000000000
 	go.uber.org/zap v1.28.0
 	golang.org/x/term v0.45.0
@@ -21,7 +21,7 @@ require (
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.1 // indirect
-	github.com/mattn/go-runewidth v0.0.23 // indirect
+	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
@@ -30,13 +30,13 @@ require (
 	go.sia.tech/coreutils v0.23.5 // indirect
 	go.sia.tech/indexd v0.4.0 // indirect
 	go.sia.tech/jape v0.14.1 // indirect
-	go.sia.tech/mux v1.5.2 // indirect
+	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	lukechampine.com/frand v1.5.1 // indirect
 )
