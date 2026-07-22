@@ -84,6 +84,46 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	}
 }
 
+func TestNewObject(t *testing.T) {
+	ss := []slabs.SlabSlice{
+		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
+			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
+		}},
+		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
+	}
+	obj := Object{
+		dataKey: frand.Bytes(32),
+		slabs:   ss,
+	}
+
+	// reconstruct the object from its data key and slabs
+	obj2 := NewObject(obj.DataKey(), obj.Slabs())
+	if !bytes.Equal(obj2.dataKey, obj.dataKey) {
+		t.Fatalf("unexpected data key: got %x, want %x", obj2.dataKey, obj.dataKey)
+	} else if obj2.ID() != obj.ID() {
+		t.Fatalf("unexpected ID: got %v, want %v", obj2.ID(), obj.ID())
+	} else if !reflect.DeepEqual(obj2.slabs, obj.slabs) {
+		t.Fatalf("slab mismatch: got %+v, want %+v", obj2.slabs, obj.slabs)
+	}
+
+	// the reconstructed object should seal and open like the original
+	appKey := types.GeneratePrivateKey()
+	sealed := obj2.Seal(appKey)
+	obj3, err := sealed.Open(appKey)
+	if err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(obj3.dataKey, obj.dataKey) {
+		t.Fatalf("unexpected data key after roundtrip: got %x, want %x", obj3.dataKey, obj.dataKey)
+	}
+
+	// mutating the returned key must not affect the object
+	key := obj.DataKey()
+	key[0] ^= 0xff
+	if !bytes.Equal(obj.dataKey, obj2.dataKey) {
+		t.Fatal("mutating the returned key modified the object")
+	}
+}
+
 func TestObjectEvents(t *testing.T) {
 	const metadata = `{"foo":"bar"}`
 
