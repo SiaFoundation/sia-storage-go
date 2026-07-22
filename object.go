@@ -75,7 +75,7 @@ func (o *Object) Seal(appKey types.PrivateKey) SealedObject {
 
 	so := SealedObject{slabs.SealedObject{
 		EncryptedDataKey:     encryptedDataKey,
-		Slabs:                o.slabs,
+		Slabs:                cloneSlabs(o.slabs),
 		EncryptedMetadataKey: encryptedMetaKey,
 		EncryptedMetadata:    encryptedMetadata,
 		CreatedAt:            o.createdAt,
@@ -106,14 +106,6 @@ func (o *Object) DataKey() [32]byte {
 // Slabs returns a copy of the object's slabs.
 func (o *Object) Slabs() []slabs.SlabSlice {
 	return cloneSlabs(o.slabs)
-}
-
-func cloneSlabs(ss []slabs.SlabSlice) []slabs.SlabSlice {
-	cloned := slices.Clone(ss)
-	for i := range cloned {
-		cloned[i].Sectors = slices.Clone(cloned[i].Sectors)
-	}
-	return cloned
 }
 
 // Metadata returns a copy of the object's metadata.
@@ -210,6 +202,16 @@ func (s *SDK) CreateSharedObjectURL(ctx context.Context, objectKey types.Hash256
 	return s.app.CreateSharedObjectURL(ctx, s.appKey, obj.ID(), obj.dataKey, validUntil)
 }
 
+// cloneSlabs returns a deep copy of the given slabs, cloning each slab's
+// sectors so the returned slabs share no backing arrays with the originals.
+func cloneSlabs(ss []slabs.SlabSlice) []slabs.SlabSlice {
+	cloned := slices.Clone(ss)
+	for i := range cloned {
+		cloned[i].Sectors = slices.Clone(cloned[i].Sectors)
+	}
+	return cloned
+}
+
 // dataKeyCipher derives the data key cipher from the app key and object ID.
 func dataKeyCipher(appKey types.PrivateKey, objectID types.Hash256) cipher.AEAD {
 	key := keys.Derive(appKey, objectID[:], []byte("dataKey"), 32)
@@ -249,7 +251,7 @@ func unlockEncryptedMetadata(metadataKey, encryptedMeta []byte) (json.RawMessage
 // objectFromSealedObject unlocks a SealedObject using the given app key.
 func objectFromSealedObject(so slabs.SealedObject, appKey types.PrivateKey) (Object, error) {
 	obj := Object{
-		slabs:     slices.Clone(so.Slabs),
+		slabs:     cloneSlabs(so.Slabs),
 		createdAt: so.CreatedAt,
 		updatedAt: so.UpdatedAt,
 	}
