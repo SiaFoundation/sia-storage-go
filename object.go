@@ -94,9 +94,12 @@ func (o *Object) Size() uint64 {
 	return size
 }
 
-// DataKey returns the key used to encrypt the object's data. Anyone with
-// the data key and the object's slabs can decrypt the data, so it should be
-// kept secret.
+// DataKey returns the key used to encrypt the object's data.
+//
+// The data key alone decrypts the object's data. Never store it in plaintext
+// and do not reuse it for new objects.
+//
+// Prefer sealing the object with [Object.Seal] instead.
 func (o *Object) DataKey() [32]byte {
 	var key [32]byte
 	copy(key[:], o.dataKey)
@@ -131,6 +134,23 @@ func NewEmptyObject() Object {
 // NewObject creates an Object from a data key and slabs. It can be used
 // together with [Object.DataKey] and [Object.Slabs] to reconstruct an object
 // whose key and slabs were stored outside the indexer.
+//
+// This is useful for interoperability with systems such as IPFS or LBRY,
+// where an object's components are persisted separately and the object must
+// be reconstructed from them.
+//
+// Objects produced by [SDK.Upload] are guaranteed to be safe to reconstruct.
+// Others, not so much. Here be dragons.
+//
+// Invariants:
+//   - The data key must be the one that encrypted the slabs. A mismatched key
+//     fails silently: downloads succeed but return garbage.
+//   - Slab keys must never be reused. Reuse compromises encryption.
+//   - Each slab's version must match the version it was encrypted with. A
+//     mislabeled slab decrypts to garbage without error.
+//   - Each slab's offset and length must match how the data was encrypted:
+//     offset seeks the keystream, and slab order defines the object's byte
+//     stream. Wrong values silently corrupt or reorder the data.
 //
 // The returned object has empty metadata and sets CreatedAt/UpdatedAt to time.Now.
 func NewObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
