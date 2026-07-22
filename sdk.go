@@ -208,16 +208,18 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 	var successful int
 	shards := make([][]byte, len(slab.Sectors))
 	for {
-		// only race while this chunk is near the read head and a spare host is
-		// free. the spare check stops a tiny estimate from spinning the timer.
-		eligible := len(slabHosts) > 0 && seq < popped.load()+raceWindow
+		// snapshot the read head once so the eligibility test and the wakeup
+		// channel stay consistent. only race while this chunk is near the read
+		// head and a spare host is free. the spare check stops a tiny estimate
+		// from spinning the timer.
+		head, windowCh := popped.snapshot()
+		eligible := len(slabHosts) > 0 && seq < head+raceWindow
 		var raceCh <-chan time.Time
-		var windowCh <-chan struct{}
 		if eligible {
 			// Go cleans up this timer even if we never read the channel
 			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
-		} else {
-			_, windowCh = popped.snapshot()
+			// while racing we wait on the timer, not read-head moves
+			windowCh = nil
 		}
 
 		select {
