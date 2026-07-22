@@ -94,6 +94,15 @@ func (o *Object) Size() uint64 {
 	return size
 }
 
+// DataKey returns the key used to encrypt the object's data. Anyone with
+// the data key and the object's slabs can decrypt the data, so it should be
+// kept secret.
+func (o *Object) DataKey() [32]byte {
+	var key [32]byte
+	copy(key[:], o.dataKey)
+	return key
+}
+
 // Slabs returns a copy of the object's slabs.
 func (o *Object) Slabs() []slabs.SlabSlice {
 	return slices.Clone(o.slabs)
@@ -114,6 +123,19 @@ func NewEmptyObject() Object {
 	now := time.Now()
 	return Object{
 		dataKey:   frand.Bytes(32),
+		createdAt: now,
+		updatedAt: now,
+	}
+}
+
+// NewObject creates an Object from a data key and slabs. It can be used
+// together with [Object.DataKey] and [Object.Slabs] to reconstruct an object
+// whose key and slabs were stored outside the indexer.
+func NewObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
+	now := time.Now()
+	return Object{
+		dataKey:   dataKey[:],
+		slabs:     slices.Clone(ss),
 		createdAt: now,
 		updatedAt: now,
 	}
