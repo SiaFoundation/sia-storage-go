@@ -131,6 +131,8 @@ func NewEmptyObject() Object {
 // NewObject creates an Object from a data key and slabs. It can be used
 // together with [Object.DataKey] and [Object.Slabs] to reconstruct an object
 // whose key and slabs were stored outside the indexer.
+//
+// The returned object has empty metadata and sets CreatedAt/UpdatedAt to time.Now.
 func NewObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
 	now := time.Now()
 	return Object{
