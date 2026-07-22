@@ -105,7 +105,15 @@ func (o *Object) DataKey() [32]byte {
 
 // Slabs returns a copy of the object's slabs.
 func (o *Object) Slabs() []slabs.SlabSlice {
-	return slices.Clone(o.slabs)
+	return cloneSlabs(o.slabs)
+}
+
+func cloneSlabs(ss []slabs.SlabSlice) []slabs.SlabSlice {
+	cloned := slices.Clone(ss)
+	for i := range cloned {
+		cloned[i].Sectors = slices.Clone(cloned[i].Sectors)
+	}
+	return cloned
 }
 
 // Metadata returns a copy of the object's metadata.
@@ -135,7 +143,7 @@ func NewObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
 	now := time.Now()
 	return Object{
 		dataKey:   dataKey[:],
-		slabs:     slices.Clone(ss),
+		slabs:     cloneSlabs(ss),
 		createdAt: now,
 		updatedAt: now,
 	}
