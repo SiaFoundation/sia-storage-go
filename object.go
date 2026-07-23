@@ -100,7 +100,7 @@ func (o *Object) Size() uint64 {
 // and do not reuse it for new objects.
 //
 // Prefer sealing the object with [Object.Seal] instead.
-func (o *Object) DataKey() [32]byte {
+func (o *Object) UnsafeDataKey() [32]byte {
 	var key [32]byte
 	copy(key[:], o.dataKey)
 	return key
@@ -131,7 +131,7 @@ func NewEmptyObject() Object {
 	}
 }
 
-// NewObject creates an Object from a data key and slabs. It can be used
+// NewUnsafeObject creates an Object from a data key and slabs. It can be used
 // together with [Object.DataKey] and [Object.Slabs] to reconstruct an object
 // whose key and slabs were stored outside the indexer.
 //
@@ -153,7 +153,7 @@ func NewEmptyObject() Object {
 //     stream. Wrong values silently corrupt or reorder the data.
 //
 // The returned object has empty metadata and sets CreatedAt/UpdatedAt to time.Now.
-func NewObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
+func NewUnsafeObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
 	now := time.Now()
 	return Object{
 		dataKey:   dataKey[:],
