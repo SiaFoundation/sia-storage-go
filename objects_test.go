@@ -84,7 +84,7 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	}
 }
 
-func TestNewObject(t *testing.T) {
+func TestNewUnsafeObject(t *testing.T) {
 	ss := []slabs.SlabSlice{
 		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
 			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
@@ -97,7 +97,7 @@ func TestNewObject(t *testing.T) {
 	}
 
 	// reconstruct the object from its data key and slabs
-	obj2 := NewObject(obj.DataKey(), obj.Slabs())
+	obj2 := NewUnsafeObject(obj.UnsafeDataKey(), obj.Slabs())
 	if !bytes.Equal(obj2.dataKey, obj.dataKey) {
 		t.Fatalf("unexpected data key: got %x, want %x", obj2.dataKey, obj.dataKey)
 	} else if obj2.ID() != obj.ID() {
@@ -117,7 +117,7 @@ func TestNewObject(t *testing.T) {
 	}
 
 	// mutating the returned key must not affect the object
-	key := obj.DataKey()
+	key := obj.UnsafeDataKey()
 	key[0] ^= 0xff
 	if !bytes.Equal(obj.dataKey, obj2.dataKey) {
 		t.Fatal("mutating the returned key modified the object")
