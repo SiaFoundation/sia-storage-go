@@ -2,6 +2,7 @@ package siastorage
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -141,11 +142,102 @@ func TestChunkIter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ci := newChunkIter(tt.slabs, tt.offset, tt.length)
 			var chunks []slabs.SlabSlice
-			for c, _, ok := ci.next(); ok; c, _, ok = ci.next() {
-				chunks = append(chunks, c)
+			objectOffset := tt.offset
+			for c, ok := ci.next(); ok; c, ok = ci.next() {
+				if c.objectOffset != objectOffset {
+					t.Fatalf("expected object offset %d, got %d", objectOffset, c.objectOffset)
+				}
+				chunks = append(chunks, c.slab)
+				objectOffset += uint64(c.slab.Length)
 			}
 			check(t, chunks, tt.length)
 		})
+	}
+}
+
+func TestChunkWriterBuffered(t *testing.T) {
+	var output bytes.Buffer
+	counted := &countWriter{w: &output}
+	dataKey := frand.Entropy256()
+	cw := newChunkWriter(counted, &dataKey)
+	recovered := recoveredChunk{
+		shards:   [][]byte{make([]byte, chunkSize)},
+		writeLen: chunkSize,
+	}
+
+	if err := cw.writeChunk(chunkSlab{}, recovered); err != nil {
+		t.Fatal(err)
+	} else if output.Len() != chunkSize {
+		t.Fatalf("expected %d output bytes, got %d", chunkSize, output.Len())
+	} else if expected := chunkSize / downloadWriteBufferSize; counted.count != expected {
+		t.Fatalf("expected %d buffered writes, got %d", expected, counted.count)
+	}
+}
+
+func TestDownloadV0(t *testing.T) {
+	sdk, _ := newTestSDK(t, 12, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// build a legacy object by applying the v0 object-wide cipher
+	// before sending the data through the unchanged shard upload layer
+	const dataShards = 3
+	slabSize := uint64(proto.SectorSize) * dataShards
+	data := frand.Bytes(int(slabSize) + 4096)
+	obj := NewEmptyObject()
+	uo, enc, err := newUploadOption(WithRedundancy(dataShards, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	slabKeys := &slabKeySource{}
+	encrypted := encrypt((*[32]byte)(obj.dataKey), bytes.NewReader(data), 0)
+	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	go func() {
+		defer close(slabsCh)
+		sdk.uploadSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
+	}()
+	obj.slabs, err = collectSlabs(t.Context(), slabsCh, uo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range obj.slabs {
+		obj.slabs[i].Version = 0
+	}
+
+	tests := []struct {
+		name   string
+		offset uint64
+		length uint64
+	}{
+		{"full object", 0, uint64(len(data))},
+		{"within slab", 12345, 54321},
+		{"across slabs", slabSize - 1000, 2000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readAll(sdk.Download(obj, WithDownloadRange(tt.offset, tt.length)))
+			if err != nil {
+				t.Fatal(err)
+			} else if !bytes.Equal(got, data[tt.offset:tt.offset+tt.length]) {
+				t.Fatal("data mismatch")
+			}
+		})
+	}
+}
+
+func TestDownloadUnsupportedSlabVersion(t *testing.T) {
+	sdk, _ := newTestSDK(t, 12, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(4096)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(3, 9)); err != nil {
+		t.Fatal(err)
+	}
+	obj.slabs[0].Version = 2
+
+	// the download must fail fast, before any sectors are fetched
+	if _, err := sdk.Download(obj); !errors.Is(err, slabs.ErrUnsupportedSlabVersion) {
+		t.Fatalf("expected ErrUnsupportedSlabVersion, got %v", err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"go.sia.tech/core/types"
@@ -32,15 +33,21 @@ func TestUploadPacked(t *testing.T) {
 	}
 
 	// prepare 3 objects
-	data1 := frand.Bytes(1024)
+	data1 := frand.Bytes(1023)
 	data2 := frand.Bytes(2048)
 	data3 := frand.Bytes(512)
 	datas := [][]byte{data1, data2, data3}
 
 	// add those objects
 	var total int
-	for _, data := range datas {
-		n, err := u.Add(t.Context(), bytes.NewReader(data))
+	for i, data := range datas {
+		var r io.Reader = bytes.NewReader(data)
+		if i == 1 {
+			// exercise an object that begins at an unaligned slab offset and
+			// supplies data in short reads
+			r = iotest.OneByteReader(r)
+		}
+		n, err := u.Add(t.Context(), r)
 		if err != nil {
 			t.Fatal(err)
 		} else if n != int64(len(data)) {
@@ -75,6 +82,8 @@ func TestUploadPacked(t *testing.T) {
 			t.Fatalf("expected 1 slab, got %d", len(obj.Slabs()))
 		} else if slabs[0].Offset != uint32(offset) {
 			t.Fatalf("unexpected offset: %d != %d", slabs[0].Offset, offset)
+		} else if slabs[0].Version != 1 {
+			t.Fatalf("expected slab version 1, got %d", slabs[0].Version)
 		} else {
 			offset += len(datas[i])
 		}

@@ -286,14 +286,21 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 		return err
 	}
 
-	// encrypt the reader on the fly
-	r = encrypt((*[32]byte)(obj.dataKey), r, obj.Size())
+	if len(obj.dataKey) != 32 {
+		return fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
+	}
+
+	// encrypt the object data with a distinct nonce for each slab; the same
+	// slab key is then used to encrypt the individual shards
+	slabKeys := &slabKeySource{}
+	slabSize := uint64(uo.dataShards) * proto4.SectorSize
+	r = encryptV1((*[32]byte)(obj.dataKey), r, slabKeys, slabSize, 0)
 
 	// start uploading slabs
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
-		s.uploadSlabs(ctx, slabsCh, r, enc, uo)
+		s.uploadSlabs(ctx, slabsCh, r, slabKeys, enc, uo)
 	}()
 
 	// collect uploaded slabs
@@ -321,6 +328,8 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 
 	if len(obj.dataKey) != 32 {
 		return nil, fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
+	} else if err := validateSlabVersions((*[32]byte)(obj.dataKey), obj.slabs); err != nil {
+		return nil, err
 	}
 
 	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do), nil
@@ -344,6 +353,10 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
+	if err := validateSlabVersions((*[32]byte)(encryptionKey), obj.Slabs); err != nil {
+		return nil, err
+	}
+
 	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do), nil
 }
 
@@ -352,12 +365,11 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 // the download and unblocks the goroutine.
 func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
 	pr, pw := io.Pipe()
-	sw := decrypt(key, pw, uint64(do.offset))
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err := s.downloadSlabs(context.Background(), sw, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress)
+		err := s.downloadSlabs(context.Background(), pw, key, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress)
 		pw.CloseWithError(err)
 	}()
 
@@ -408,6 +420,7 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
 		params[i] = slabs.SlabPinParams{
+			Version:       slab.Version,
 			EncryptionKey: slab.EncryptionKey,
 			MinShards:     slab.MinShards,
 			Sectors:       slab.Sectors,
@@ -435,22 +448,33 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
-const chunkSize = 1 << 18 // 256 KiB
+const (
+	chunkSize               = 1 << 18 // 256 KiB
+	downloadWriteBufferSize = 1 << 16 // 64 KiB
+)
 
 // chunkIter splits slabs into fixed-size chunks for parallel recovery.
 // It handles byte-range selection internally: offset is a byte offset into
 // the logical stream of all slabs and length limits total output.
 type chunkIter struct {
-	slabs     []slabs.SlabSlice
-	slabIdx   int
-	offset    uint64 // position within current slab
-	remaining uint64 // total bytes left to yield
+	slabs        []slabs.SlabSlice
+	slabIdx      int
+	offset       uint64 // position within current slab
+	objectOffset uint64 // position within the object's logical stream
+	remaining    uint64 // total bytes left to yield
+}
+
+type chunkSlab struct {
+	slab         slabs.SlabSlice
+	slabIdx      int
+	objectOffset uint64
 }
 
 func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	ci := &chunkIter{
-		slabs:     ss,
-		remaining: length,
+		slabs:        ss,
+		objectOffset: offset,
+		remaining:    length,
 	}
 	for ci.slabIdx < len(ci.slabs) {
 		slabLength := uint64(ci.slabs[ci.slabIdx].Length)
@@ -464,7 +488,7 @@ func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	return ci
 }
 
-func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
+func (ci *chunkIter) next() (chunkSlab, bool) {
 	for ci.remaining > 0 && ci.slabIdx < len(ci.slabs) {
 		slab := ci.slabs[ci.slabIdx]
 		available := uint64(slab.Length) - ci.offset
@@ -477,16 +501,21 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 		chunk := slab
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
-		slabIdx := ci.slabIdx
+		result := chunkSlab{
+			slab:         chunk,
+			slabIdx:      ci.slabIdx,
+			objectOffset: ci.objectOffset,
+		}
 		ci.offset += chunkLen
+		ci.objectOffset += chunkLen
 		if ci.offset >= uint64(slab.Length) {
 			ci.offset = 0
 			ci.slabIdx++
 		}
 		ci.remaining -= chunkLen
-		return chunk, slabIdx, true
+		return result, true
 	}
-	return slabs.SlabSlice{}, 0, false
+	return chunkSlab{}, false
 }
 
 type recoveredChunk struct {
@@ -530,7 +559,62 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 	}, nil
 }
 
-func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) error {
+// slabDecryptWriter wraps w in a writer that decrypts the given slab's data,
+// returning ErrUnsupportedSlabVersion for versions this SDK cannot decrypt.
+// It is the single source of truth for which slab versions are supported.
+func slabDecryptWriter(dataKey *[32]byte, chunk chunkSlab, w io.Writer) (io.Writer, error) {
+	switch chunk.slab.Version {
+	case 0:
+		return decrypt(dataKey, w, chunk.objectOffset), nil
+	case 1:
+		return decryptV1(dataKey, (*[32]byte)(&chunk.slab.EncryptionKey), w, uint64(chunk.slab.Offset)), nil
+	default:
+		return nil, fmt.Errorf("%w: %d", slabs.ErrUnsupportedSlabVersion, chunk.slab.Version)
+	}
+}
+
+// validateSlabVersions rejects slabs this SDK cannot decrypt so downloads fail
+// fast, before any sectors are fetched.
+func validateSlabVersions(dataKey *[32]byte, ss []slabs.SlabSlice) error {
+	for i, slab := range ss {
+		if _, err := slabDecryptWriter(dataKey, chunkSlab{slab: slab}, io.Discard); err != nil {
+			return fmt.Errorf("slab %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// chunkWriter decrypts recovered chunks and writes them to the underlying
+// writer, reusing a single write buffer across chunks.
+type chunkWriter struct {
+	w       io.Writer
+	bw      *bufio.Writer
+	dataKey *[32]byte
+}
+
+func newChunkWriter(w io.Writer, dataKey *[32]byte) *chunkWriter {
+	return &chunkWriter{
+		w:       w,
+		bw:      bufio.NewWriterSize(nil, downloadWriteBufferSize),
+		dataKey: dataKey,
+	}
+}
+
+func (cw *chunkWriter) writeChunk(chunk chunkSlab, recovered recoveredChunk) error {
+	dst, err := slabDecryptWriter(cw.dataKey, chunk, cw.w)
+	if err != nil {
+		return err
+	}
+
+	// stripedJoin writes one 64-byte leaf at a time; buffer those before the cipher.
+	cw.bw.Reset(dst)
+	if err := stripedJoin(cw.bw, recovered.shards, recovered.skip, recovered.writeLen); err != nil {
+		return err
+	}
+	return cw.bw.Flush()
+}
+
+func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, dataKey *[32]byte, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if maxInflight <= 0 {
@@ -538,28 +622,28 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	}
 
 	chunks := newChunkIter(ss, offset, length)
-	bw := bufio.NewWriterSize(w, 1<<16)
+	cw := newChunkWriter(w, dataKey)
 
 	// recover first chunk synchronously for fast TTFB
-	chunk, slabIdx, ok := chunks.next()
+	chunk, ok := chunks.next()
 	if !ok {
-		return bw.Flush()
+		return nil
 	}
-	rc, err := s.recoverChunk(ctx, chunk, slabIdx, hostTimeout, onProgress)
+	rc, err := s.recoverChunk(ctx, chunk.slab, chunk.slabIdx, hostTimeout, onProgress)
 	if err != nil {
 		return err
 	}
-	if err := stripedJoin(bw, rc.shards, rc.skip, rc.writeLen); err != nil {
+	if err := cw.writeChunk(chunk, rc); err != nil {
 		return err
 	}
 
 	type chunkWork struct {
-		index     int
-		slabIndex int
-		chunk     slabs.SlabSlice
+		index int
+		chunk chunkSlab
 	}
 	type chunkResult struct {
 		index int
+		chunk chunkSlab
 		recoveredChunk
 		err error
 	}
@@ -572,9 +656,9 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	for range maxInflight {
 		wg.Go(func() {
 			for w := range workCh {
-				rc, err := s.recoverChunk(ctx, w.chunk, w.slabIndex, hostTimeout, onProgress)
+				rc, err := s.recoverChunk(ctx, w.chunk.slab, w.chunk.slabIdx, hostTimeout, onProgress)
 				select {
-				case resultCh <- chunkResult{index: w.index, recoveredChunk: rc, err: err}:
+				case resultCh <- chunkResult{index: w.index, chunk: w.chunk, recoveredChunk: rc, err: err}:
 				case <-ctx.Done():
 					return
 				}
@@ -590,12 +674,12 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			close(resultCh)
 		}()
 		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, slabIdx, ok := chunks.next()
+			chunk, ok := chunks.next()
 			if !ok {
 				return
 			}
 			select {
-			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, chunk: chunk}:
+			case workCh <- chunkWork{index: chunkIdx, chunk: chunk}:
 			case <-ctx.Done():
 				return
 			}
@@ -609,7 +693,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			return res.err
 		}
 		if res.index == nextWrite {
-			if err := stripedJoin(bw, res.shards, res.skip, res.writeLen); err != nil {
+			if err := cw.writeChunk(res.chunk, res.recoveredChunk); err != nil {
 				return err
 			}
 			nextWrite++
@@ -619,7 +703,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 					break
 				}
 				delete(completed, nextWrite)
-				if err := stripedJoin(bw, r.shards, r.skip, r.writeLen); err != nil {
+				if err := cw.writeChunk(r.chunk, r.recoveredChunk); err != nil {
 					return err
 				}
 				nextWrite++
@@ -635,7 +719,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	if len(completed) > 0 {
 		panic(fmt.Sprintf("%d chunks remaining but no tasks in flight", len(completed)))
 	}
-	return bw.Flush()
+	return nil
 }
 
 func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
