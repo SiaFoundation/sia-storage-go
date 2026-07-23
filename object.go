@@ -94,7 +94,7 @@ func (o *Object) Size() uint64 {
 	return size
 }
 
-// DataKey returns the key used to encrypt the object's data.
+// UnsafeDataKey returns the key used to encrypt the object's data.
 //
 // The data key alone decrypts the object's data. Never store it in plaintext
 // and do not reuse it for new objects.
