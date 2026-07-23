@@ -353,6 +353,9 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
+	if len(encryptionKey) != 32 {
+		return nil, fmt.Errorf("invalid encryption key length: %d", len(encryptionKey))
+	}
 	if err := validateSlabVersions((*[32]byte)(encryptionKey), obj.Slabs); err != nil {
 		return nil, err
 	}
