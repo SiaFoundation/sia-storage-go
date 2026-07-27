@@ -663,18 +663,23 @@ func BenchmarkDownload(b *testing.B) {
 			// NOTE: refreshing hosts makes all benchmarks roughly equal
 			sdk.refreshHosts(b.Context(), true)
 
-			buf := bytes.NewBuffer(nil)
+			// discard output through a small reusable buffer to mirror the sink
+			// used by the Rust benchmarks
+			buf := make([]byte, 1<<20) // 1 MiB
 			b.SetBytes(benchmarkSize)
 			b.ResetTimer()
 			for b.Loop() {
-				buf.Reset()
 				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
-				if _, err := io.Copy(buf, rc); err != nil {
-					rc.Close()
-					b.Fatalf("failed to download: %v", err)
+				for {
+					if _, err := rc.Read(buf); err == io.EOF {
+						break
+					} else if err != nil {
+						rc.Close()
+						b.Fatalf("failed to download: %v", err)
+					}
 				}
 				rc.Close()
 			}
