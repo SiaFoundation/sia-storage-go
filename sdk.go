@@ -285,14 +285,11 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 		return err
 	}
 
-	// encrypt the reader on the fly
-	r = encrypt((*[32]byte)(obj.dataKey), r, obj.Size())
-
-	// start uploading slabs
+	// start uploading slabs; the workers encrypt each slab in place
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
-		s.uploadSlabs(ctx, slabsCh, r, enc, uo)
+		s.uploadSlabs(ctx, slabsCh, r, (*[32]byte)(obj.dataKey), obj.Size(), enc, uo)
 	}()
 
 	// collect uploaded slabs

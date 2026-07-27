@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
@@ -180,11 +181,12 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 	return uo, enc, nil
 }
 
-func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, enc reedsolomon.Encoder, uo uploadOption) {
+func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, key *[32]byte, offset uint64, enc reedsolomon.Encoder, uo uploadOption) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
 	totalShards := dataShards + parityShards
+	dataSize := dataShards * proto4.SectorSize
 
 	// create semaphore to limit concurrent shard uploads
 	shardSema := make(chan struct{}, uo.maxInflight)
@@ -197,8 +199,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		case respCh <- su:
 		}
 	}
-
-	sr := NewSlabReader(dataShards, parityShards)
 
 	// read slabs in a loop
 	for i := 0; ctx.Err() == nil; i++ {
@@ -217,22 +217,18 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// read next slab
-		slab, err := sr.ReadSlab(r)
-		if slab.Length == 0 && errors.Is(err, io.EOF) {
+		// read the next raw slab; the loop only reads, everything expensive
+		// happens in the per slab goroutine below
+		buf := make([]byte, dataSize)
+		n, err := io.ReadFull(r, buf)
+		last := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+		if n == 0 && last {
 			return
-		} else if err != nil && !errors.Is(err, io.EOF) {
+		} else if err != nil && !last {
 			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
 			return
 		}
 
-		// encode shards
-		if err := enc.Encode(slab.Shards); err != nil {
-			send(slabUpload{err: fmt.Errorf("failed to encode slab %d shards: %w", i, err)})
-			return
-		}
-
-		// launch uploads for all shards
 		su := shardUpload{
 			hosts:         s.hosts,
 			accountKey:    s.appKey,
@@ -243,16 +239,38 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			pool:          newUploadPool(s.hosts, candidates, totalShards),
 			shardsCh:      make(chan shard, totalShards),
 		}
-		for shardIdx, data := range slab.Shards {
-			go su.uploadShard(ctx, shardIdx, data)
-		}
+
+		// encrypt, stripe, and encode off the read loop, then launch the
+		// shard uploads. A nil key means the reader already carries
+		// ciphertext. Encoding failures surface through the shard channel.
+		go func(buf []byte, offset uint64) {
+			if key != nil {
+				newRekeyStream(key, offset).XORKeyStream(buf, buf)
+			}
+			shards := make([][]byte, totalShards)
+			for j := range shards {
+				shards[j] = make([]byte, proto4.SectorSize)
+			}
+			splitShards(shards[:dataShards], buf)
+			if err := enc.Encode(shards); err != nil {
+				su.shardsCh <- shard{err: fmt.Errorf("failed to encode slab shards: %w", err)}
+				return
+			}
+			for shardIdx, data := range shards {
+				go su.uploadShard(ctx, shardIdx, data)
+			}
+		}(buf[:n], offset)
+		offset += uint64(n)
 
 		// send slab off for collection
 		send(slabUpload{
 			encryptionKey: su.encryptionKey,
-			length:        uint32(slab.Length),
+			length:        uint32(n),
 			shardsCh:      su.shardsCh,
 		})
+		if last {
+			return
+		}
 	}
 }
 
