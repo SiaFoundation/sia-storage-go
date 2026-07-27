@@ -60,14 +60,10 @@ func TestEncryptRoundtrip(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			var buf bytes.Buffer
-			decrypted := decrypt(&key, &buf, offset)
-			if _, err := decrypted.Write(read); err != nil {
-				t.Fatal(err)
-			}
+			newRekeyStream(&key, offset).XORKeyStream(read, read)
 
-			if !bytes.Equal(data[:], buf.Bytes()) {
-				t.Fatalf("data mismatch: expected %v, got %v", data[:], buf.Bytes())
+			if !bytes.Equal(data[:], read) {
+				t.Fatalf("data mismatch: expected %v, got %v", data[:], read)
 			}
 		})
 	}

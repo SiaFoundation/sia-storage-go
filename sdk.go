@@ -1,7 +1,6 @@
 package siastorage
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -352,12 +351,11 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 // the download and unblocks the goroutine.
 func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) io.ReadCloser {
 	pr, pw := io.Pipe()
-	sw := decrypt(key, pw, uint64(do.offset))
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err := s.downloadSlabs(context.Background(), sw, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress)
+		err := s.downloadSlabs(context.Background(), pw, key, do.maxInflight, do.hostTimeout, ss, do.offset, do.length, do.onProgress)
 		pw.CloseWithError(err)
 	}()
 
@@ -444,12 +442,14 @@ type chunkIter struct {
 	slabs     []slabs.SlabSlice
 	slabIdx   int
 	offset    uint64 // position within current slab
+	streamOff uint64 // position within the logical stream
 	remaining uint64 // total bytes left to yield
 }
 
 func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	ci := &chunkIter{
 		slabs:     ss,
+		streamOff: offset,
 		remaining: length,
 	}
 	for ci.slabIdx < len(ci.slabs) {
@@ -464,7 +464,7 @@ func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	return ci
 }
 
-func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
+func (ci *chunkIter) next() (slabs.SlabSlice, int, uint64, bool) {
 	for ci.remaining > 0 && ci.slabIdx < len(ci.slabs) {
 		slab := ci.slabs[ci.slabIdx]
 		available := uint64(slab.Length) - ci.offset
@@ -478,27 +478,23 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
 		slabIdx := ci.slabIdx
+		streamOff := ci.streamOff
 		ci.offset += chunkLen
 		if ci.offset >= uint64(slab.Length) {
 			ci.offset = 0
 			ci.slabIdx++
 		}
+		ci.streamOff += chunkLen
 		ci.remaining -= chunkLen
-		return chunk, slabIdx, true
+		return chunk, slabIdx, streamOff, true
 	}
-	return slabs.SlabSlice{}, 0, false
+	return slabs.SlabSlice{}, 0, 0, false
 }
 
-type recoveredChunk struct {
-	shards   [][]byte
-	skip     int
-	writeLen int
-}
-
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex int, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+func (s *SDK) recoverChunk(ctx context.Context, key *[32]byte, chunk slabs.SlabSlice, slabIndex int, streamOff uint64, hostTimeout time.Duration, onProgress func(ShardProgress)) ([]byte, error) {
 	shards, err := s.downloadSlab(ctx, chunk, slabIndex, hostTimeout, onProgress)
 	if err != nil {
-		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
+		return nil, fmt.Errorf("failed to download slab: %w", err)
 	}
 
 	// decrypt shards
@@ -517,20 +513,24 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 	// reconstruct data shards
 	enc, err := reedsolomon.New(int(chunk.MinShards), len(shards)-int(chunk.MinShards))
 	if err != nil {
-		return recoveredChunk{}, fmt.Errorf("failed to create reedsolomon coder: %w", err)
+		return nil, fmt.Errorf("failed to create reedsolomon coder: %w", err)
 	}
 	if err := enc.ReconstructData(shards); err != nil {
-		return recoveredChunk{}, fmt.Errorf("failed to reconstruct data shards: %w", err)
+		return nil, fmt.Errorf("failed to reconstruct data shards: %w", err)
 	}
 
-	return recoveredChunk{
-		shards:   shards[:int(chunk.MinShards)],
-		skip:     int(chunk.Offset) % (proto4.LeafSize * int(chunk.MinShards)),
-		writeLen: int(chunk.Length),
-	}, nil
+	// assemble the chunk and strip the object encryption here in the worker,
+	// so the ordered writer hands whole plaintext buffers to the pipe
+	data := make([]byte, chunk.Length)
+	skip := int(chunk.Offset) % (proto4.LeafSize * int(chunk.MinShards))
+	if err := joinShards(data, shards[:int(chunk.MinShards)], skip); err != nil {
+		return nil, err
+	}
+	newRekeyStream(key, streamOff).XORKeyStream(data, data)
+	return data, nil
 }
 
-func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) error {
+func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, maxInflight int, hostTimeout time.Duration, ss []slabs.SlabSlice, offset, length uint64, onProgress func(ShardProgress)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if maxInflight <= 0 {
@@ -538,30 +538,30 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	}
 
 	chunks := newChunkIter(ss, offset, length)
-	bw := bufio.NewWriterSize(w, 1<<16)
 
 	// recover first chunk synchronously for fast TTFB
-	chunk, slabIdx, ok := chunks.next()
+	chunk, slabIdx, streamOff, ok := chunks.next()
 	if !ok {
-		return bw.Flush()
+		return nil
 	}
-	rc, err := s.recoverChunk(ctx, chunk, slabIdx, hostTimeout, onProgress)
+	data, err := s.recoverChunk(ctx, key, chunk, slabIdx, streamOff, hostTimeout, onProgress)
 	if err != nil {
 		return err
 	}
-	if err := stripedJoin(bw, rc.shards, rc.skip, rc.writeLen); err != nil {
+	if _, err := w.Write(data); err != nil {
 		return err
 	}
 
 	type chunkWork struct {
 		index     int
 		slabIndex int
+		streamOff uint64
 		chunk     slabs.SlabSlice
 	}
 	type chunkResult struct {
 		index int
-		recoveredChunk
-		err error
+		data  []byte
+		err   error
 	}
 
 	workCh := make(chan chunkWork, maxInflight)
@@ -571,10 +571,10 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	var wg sync.WaitGroup
 	for range maxInflight {
 		wg.Go(func() {
-			for w := range workCh {
-				rc, err := s.recoverChunk(ctx, w.chunk, w.slabIndex, hostTimeout, onProgress)
+			for cw := range workCh {
+				data, err := s.recoverChunk(ctx, key, cw.chunk, cw.slabIndex, cw.streamOff, hostTimeout, onProgress)
 				select {
-				case resultCh <- chunkResult{index: w.index, recoveredChunk: rc, err: err}:
+				case resultCh <- chunkResult{index: cw.index, data: data, err: err}:
 				case <-ctx.Done():
 					return
 				}
@@ -590,12 +590,12 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			close(resultCh)
 		}()
 		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, slabIdx, ok := chunks.next()
+			chunk, slabIdx, streamOff, ok := chunks.next()
 			if !ok {
 				return
 			}
 			select {
-			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, chunk: chunk}:
+			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, streamOff: streamOff, chunk: chunk}:
 			case <-ctx.Done():
 				return
 			}
@@ -609,7 +609,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 			return res.err
 		}
 		if res.index == nextWrite {
-			if err := stripedJoin(bw, res.shards, res.skip, res.writeLen); err != nil {
+			if _, err := w.Write(res.data); err != nil {
 				return err
 			}
 			nextWrite++
@@ -619,7 +619,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 					break
 				}
 				delete(completed, nextWrite)
-				if err := stripedJoin(bw, r.shards, r.skip, r.writeLen); err != nil {
+				if _, err := w.Write(r.data); err != nil {
 					return err
 				}
 				nextWrite++
@@ -635,7 +635,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, maxInflight int, h
 	if len(completed) > 0 {
 		panic(fmt.Sprintf("%d chunks remaining but no tasks in flight", len(completed)))
 	}
-	return bw.Flush()
+	return nil
 }
 
 func (s *SDK) fetchHosts(ctx context.Context) (all []hosts.HostInfo, _ error) {
@@ -740,11 +740,11 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	return nil
 }
 
-// stripedJoin joins the striped data shards, writing them to dst. The first 'skip'
-// bytes of the recovered data are skipped, and 'writeLen' bytes are written in
-// total.
-func stripedJoin(dst io.Writer, dataShards [][]byte, skip, writeLen int) error {
-	for off := 0; writeLen > 0; off += proto4.LeafSize {
+// joinShards interleaves the striped data shards into dst, skipping the
+// first 'skip' bytes of the recovered data and filling all of dst.
+func joinShards(dst []byte, dataShards [][]byte, skip int) error {
+	n := 0
+	for off := 0; n < len(dst); off += proto4.LeafSize {
 		for _, shard := range dataShards {
 			if len(shard[off:]) < proto4.LeafSize {
 				return reedsolomon.ErrShortData
@@ -757,14 +757,10 @@ func stripedJoin(dst io.Writer, dataShards [][]byte, skip, writeLen int) error {
 				shard = shard[skip:]
 				skip = 0
 			}
-			if writeLen < len(shard) {
-				shard = shard[:writeLen]
+			n += copy(dst[n:], shard)
+			if n == len(dst) {
+				break
 			}
-			n, err := dst.Write(shard)
-			if err != nil {
-				return err
-			}
-			writeLen -= n
 		}
 	}
 	return nil

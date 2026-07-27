@@ -81,28 +81,20 @@ func nonce(offset uint64) (nonce [24]byte, nonce64 uint64) {
 	return
 }
 
+// newRekeyStream returns a keystream for key positioned at the given byte
+// offset of the plaintext.
+func newRekeyStream(key *[32]byte, offset uint64) *rekeyStream {
+	n, n64 := nonce(offset)
+	offset %= maxBytesPerNonce
+	skip := int(offset % 64)
+
+	c, _ := chacha20.NewUnauthenticatedCipher(key[:], n[:])
+	c.SetCounter(uint32(offset / 64))
+	return &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64, skip: skip}
+}
+
 // encrypt returns a cipher.StreamReader that encrypts r with k starting at the
 // given offset.
 func encrypt(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
-	n, n64 := nonce(offset)
-	offset %= maxBytesPerNonce
-	skip := int(offset % 64)
-
-	c, _ := chacha20.NewUnauthenticatedCipher(key[:], n[:])
-	c.SetCounter(uint32(offset / 64))
-	rs := &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64, skip: skip}
-	return cipher.StreamReader{S: rs, R: r}
-}
-
-// decrypt returns a cipher.StreamWriter that decrypts w with k, starting at the
-// specified offset.
-func decrypt(key *[32]byte, w io.Writer, offset uint64) cipher.StreamWriter {
-	n, n64 := nonce(offset)
-	offset %= maxBytesPerNonce
-	skip := int(offset % 64)
-
-	c, _ := chacha20.NewUnauthenticatedCipher(key[:], n[:])
-	c.SetCounter(uint32(offset / 64))
-	rs := &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64, skip: skip}
-	return cipher.StreamWriter{S: rs, W: w}
+	return cipher.StreamReader{S: newRekeyStream(key, offset), R: r}
 }
