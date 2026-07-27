@@ -19,6 +19,7 @@ type ReadSlab struct {
 type SlabReader struct {
 	dataShards int
 	shards     [][]byte
+	buf        []byte
 	length     int
 }
 
@@ -50,29 +51,34 @@ func (sr *SlabReader) OptimalDataSize() int {
 // were buffered at EOF, Length is 0. The caller should check Length > 0
 // before using the slab.
 func (sr *SlabReader) ReadSlab(r io.Reader) (ReadSlab, error) {
-	optimal := sr.OptimalDataSize()
+	// read the whole slab into one contiguous buffer, so the source sees
+	// large reads, then interleave it with plain copies
+	if sr.buf == nil {
+		sr.buf = make([]byte, sr.OptimalDataSize())
+	}
+	n, err := io.ReadFull(r, sr.buf)
+	sr.length = n
+	splitShards(sr.shards[:sr.dataShards], sr.buf[:n])
 
-	for sr.length < optimal {
-		// calculate current position in the interleaved layout
-		stripeSize := proto4.LeafSize * sr.dataShards
-		shardIndex := (sr.length % stripeSize) / proto4.LeafSize
-		byteInSeg := sr.length % proto4.LeafSize
-		segStart := (sr.length / stripeSize) * proto4.LeafSize
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return sr.take(), io.EOF
+	} else if err != nil {
+		return ReadSlab{}, err
+	}
+	return sr.take(), nil
+}
 
-		segment := sr.shards[shardIndex][segStart+byteInSeg : segStart+proto4.LeafSize]
-		n, err := r.Read(segment)
-		sr.length += n
-
-		if errors.Is(err, io.EOF) {
-			return sr.take(), io.EOF
-		} else if err != nil {
-			return ReadSlab{}, err
-		} else if n == 0 {
-			continue
+// splitShards interleaves src across the data shards in LeafSize segments.
+func splitShards(dataShards [][]byte, src []byte) {
+	n := 0
+	for off := 0; n < len(src); off += proto4.LeafSize {
+		for _, shard := range dataShards {
+			n += copy(shard[off:off+proto4.LeafSize], src[n:])
+			if n == len(src) {
+				return
+			}
 		}
 	}
-
-	return sr.take(), nil
 }
 
 // take returns the current slab and resets the internal buffers.

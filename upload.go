@@ -1,7 +1,6 @@
 package siastorage
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -199,8 +198,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		}
 	}
 
-	// buffer the reader since SlabReader reads 64 bytes at a time
-	br := bufio.NewReader(r)
 	sr := NewSlabReader(dataShards, parityShards)
 
 	// read slabs in a loop
@@ -221,7 +218,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		}
 
 		// read next slab
-		slab, err := sr.ReadSlab(br)
+		slab, err := sr.ReadSlab(r)
 		if slab.Length == 0 && errors.Is(err, io.EOF) {
 			return
 		} else if err != nil && !errors.Is(err, io.EOF) {
