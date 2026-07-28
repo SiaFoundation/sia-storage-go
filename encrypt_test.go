@@ -44,6 +44,41 @@ func TestDeriveAppKeyGolden(t *testing.T) {
 	}
 }
 
+func TestRekeyStreamSeek(t *testing.T) {
+	// a stream positioned at an interior offset must continue the keystream
+	// of one that streamed continuously from the start, so chunks and slabs
+	// can be encrypted and decrypted independently of how the object was
+	// originally streamed
+	var data [1 << 16]byte // 64 KiB
+	frand.Read(data[:])
+
+	var key [32]byte
+	frand.Read(key[:])
+
+	// segment sizes chosen to misalign with the 64 byte block size
+	sizes := []int{1, 13, 63, 64, 65, 100, 1000, 4096, 16384}
+
+	for _, base := range []uint64{0, 16, 2061, maxBytesPerNonce - 1<<15, maxBytesPerNonce - 63, 3*maxBytesPerNonce - 1000} {
+		t.Run(fmt.Sprint(base), func(t *testing.T) {
+			// encrypt with one continuous stream
+			enc := make([]byte, len(data))
+			newRekeyStream(&key, base).XORKeyStream(enc, data[:])
+
+			// decrypt piecewise with a fresh stream per segment
+			dec := make([]byte, len(data))
+			for pos, i := 0, 0; pos < len(data); i++ {
+				n := min(sizes[i%len(sizes)], len(data)-pos)
+				newRekeyStream(&key, base+uint64(pos)).XORKeyStream(dec[pos:pos+n], enc[pos:pos+n])
+				pos += n
+			}
+
+			if !bytes.Equal(dec, data[:]) {
+				t.Fatal("mismatch")
+			}
+		})
+	}
+}
+
 func TestEncryptRoundtrip(t *testing.T) {
 	var data [4096]byte
 	frand.Read(data[:])
