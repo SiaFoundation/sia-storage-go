@@ -217,8 +217,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// read the next raw slab; the loop only reads, everything expensive
-		// happens in the per slab goroutine below
+		// read the next raw slab
 		buf := make([]byte, dataSize)
 		n, err := io.ReadFull(r, buf)
 		last := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
@@ -240,10 +239,11 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			shardsCh:      make(chan shard, totalShards),
 		}
 
-		// encrypt, stripe, and encode off the read loop, then launch the
-		// shard uploads. A nil key means the reader already carries
-		// ciphertext. Encoding failures surface through the shard channel.
-		go func(buf []byte, offset uint64) {
+		// encrypt, stripe, and encode off the read loop; a nil key means the
+		// reader already carries ciphertext and encode errors surface through
+		// the shard channel
+		buf = buf[:n]
+		go func(offset uint64) {
 			if key != nil {
 				newRekeyStream(key, offset).XORKeyStream(buf, buf)
 			}
@@ -253,13 +253,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			}
 			splitShards(shards[:dataShards], buf)
 			if err := enc.Encode(shards); err != nil {
-				su.shardsCh <- shard{err: fmt.Errorf("failed to encode slab shards: %w", err)}
+				su.shardsCh <- shard{err: fmt.Errorf("failed to encode slab %d shards: %w", su.slabIndex, err)}
 				return
 			}
 			for shardIdx, data := range shards {
 				go su.uploadShard(ctx, shardIdx, data)
 			}
-		}(buf[:n], offset)
+		}(offset)
 		offset += uint64(n)
 
 		// send slab off for collection

@@ -93,8 +93,8 @@ func newRekeyStream(key *[32]byte, offset uint64) *rekeyStream {
 	return &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64, skip: skip}
 }
 
-// encrypt returns a cipher.StreamReader that encrypts r with k starting at the
-// given offset.
+// encrypt returns a cipher.StreamReader that encrypts r with key starting at
+// the given offset.
 func encrypt(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
 	return cipher.StreamReader{S: newRekeyStream(key, offset), R: r}
 }

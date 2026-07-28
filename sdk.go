@@ -461,7 +461,14 @@ func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	return ci
 }
 
-func (ci *chunkIter) next() (slabs.SlabSlice, int, uint64, bool) {
+// a chunk is a slab slice positioned within the object stream
+type chunk struct {
+	slabs.SlabSlice
+	slabIndex int
+	streamOff uint64
+}
+
+func (ci *chunkIter) next() (chunk, bool) {
 	for ci.remaining > 0 && ci.slabIdx < len(ci.slabs) {
 		slab := ci.slabs[ci.slabIdx]
 		available := uint64(slab.Length) - ci.offset
@@ -471,11 +478,9 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, uint64, bool) {
 			continue
 		}
 		chunkLen := min(available, ci.remaining, chunkSize)
-		chunk := slab
-		chunk.Offset = slab.Offset + uint32(ci.offset)
-		chunk.Length = uint32(chunkLen)
-		slabIdx := ci.slabIdx
-		streamOff := ci.streamOff
+		c := chunk{SlabSlice: slab, slabIndex: ci.slabIdx, streamOff: ci.streamOff}
+		c.Offset = slab.Offset + uint32(ci.offset)
+		c.Length = uint32(chunkLen)
 		ci.offset += chunkLen
 		if ci.offset >= uint64(slab.Length) {
 			ci.offset = 0
@@ -483,32 +488,32 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, uint64, bool) {
 		}
 		ci.streamOff += chunkLen
 		ci.remaining -= chunkLen
-		return chunk, slabIdx, streamOff, true
+		return c, true
 	}
-	return slabs.SlabSlice{}, 0, 0, false
+	return chunk{}, false
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, key *[32]byte, chunk slabs.SlabSlice, slabIndex int, streamOff uint64, hostTimeout time.Duration, onProgress func(ShardProgress)) ([]byte, error) {
-	shards, err := s.downloadSlab(ctx, chunk, slabIndex, hostTimeout, onProgress)
+func (s *SDK) recoverChunk(ctx context.Context, key *[32]byte, c chunk, hostTimeout time.Duration, onProgress func(ShardProgress)) ([]byte, error) {
+	shards, err := s.downloadSlab(ctx, c.SlabSlice, c.slabIndex, hostTimeout, onProgress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download slab: %w", err)
 	}
 
 	// decrypt shards
-	counter := chunk.Offset / (proto4.LeafSize * uint32(chunk.MinShards))
+	counter := c.Offset / (proto4.LeafSize * uint32(c.MinShards))
 	var nonce [24]byte
 	for i, shard := range shards {
 		if shard == nil {
 			continue
 		}
 		nonce[0] = byte(i)
-		c, _ := chacha20.NewUnauthenticatedCipher(chunk.EncryptionKey[:], nonce[:])
-		c.SetCounter(counter)
-		c.XORKeyStream(shard, shard)
+		cipher, _ := chacha20.NewUnauthenticatedCipher(c.EncryptionKey[:], nonce[:])
+		cipher.SetCounter(counter)
+		cipher.XORKeyStream(shard, shard)
 	}
 
 	// reconstruct data shards
-	enc, err := reedsolomon.New(int(chunk.MinShards), len(shards)-int(chunk.MinShards))
+	enc, err := reedsolomon.New(int(c.MinShards), len(shards)-int(c.MinShards))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reedsolomon coder: %w", err)
 	}
@@ -516,14 +521,14 @@ func (s *SDK) recoverChunk(ctx context.Context, key *[32]byte, chunk slabs.SlabS
 		return nil, fmt.Errorf("failed to reconstruct data shards: %w", err)
 	}
 
-	// assemble the chunk and strip the object encryption here in the worker,
-	// so the ordered writer hands whole plaintext buffers to the pipe
-	data := make([]byte, chunk.Length)
-	skip := int(chunk.Offset) % (proto4.LeafSize * int(chunk.MinShards))
-	if err := joinShards(data, shards[:int(chunk.MinShards)], skip); err != nil {
-		return nil, err
+	// join the data shards into one buffer and strip the object encryption
+	// in place
+	data := make([]byte, c.Length)
+	skip := int(c.Offset) % (proto4.LeafSize * int(c.MinShards))
+	if err := joinShards(data, shards[:int(c.MinShards)], skip); err != nil {
+		return nil, fmt.Errorf("failed to join shards: %w", err)
 	}
-	newRekeyStream(key, streamOff).XORKeyStream(data, data)
+	newRekeyStream(key, c.streamOff).XORKeyStream(data, data)
 	return data, nil
 }
 
@@ -537,11 +542,11 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, max
 	chunks := newChunkIter(ss, offset, length)
 
 	// recover first chunk synchronously for fast TTFB
-	chunk, slabIdx, streamOff, ok := chunks.next()
+	c, ok := chunks.next()
 	if !ok {
 		return nil
 	}
-	data, err := s.recoverChunk(ctx, key, chunk, slabIdx, streamOff, hostTimeout, onProgress)
+	data, err := s.recoverChunk(ctx, key, c, hostTimeout, onProgress)
 	if err != nil {
 		return err
 	}
@@ -550,10 +555,8 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, max
 	}
 
 	type chunkWork struct {
-		index     int
-		slabIndex int
-		streamOff uint64
-		chunk     slabs.SlabSlice
+		index int
+		chunk chunk
 	}
 	type chunkResult struct {
 		index int
@@ -569,7 +572,7 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, max
 	for range maxInflight {
 		wg.Go(func() {
 			for cw := range workCh {
-				data, err := s.recoverChunk(ctx, key, cw.chunk, cw.slabIndex, cw.streamOff, hostTimeout, onProgress)
+				data, err := s.recoverChunk(ctx, key, cw.chunk, hostTimeout, onProgress)
 				select {
 				case resultCh <- chunkResult{index: cw.index, data: data, err: err}:
 				case <-ctx.Done():
@@ -587,12 +590,12 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, max
 			close(resultCh)
 		}()
 		for chunkIdx := 0; ; chunkIdx++ {
-			chunk, slabIdx, streamOff, ok := chunks.next()
+			c, ok := chunks.next()
 			if !ok {
 				return
 			}
 			select {
-			case workCh <- chunkWork{index: chunkIdx, slabIndex: slabIdx, streamOff: streamOff, chunk: chunk}:
+			case workCh <- chunkWork{index: chunkIdx, chunk: c}:
 			case <-ctx.Done():
 				return
 			}
@@ -605,24 +608,17 @@ func (s *SDK) downloadSlabs(ctx context.Context, w io.Writer, key *[32]byte, max
 		if res.err != nil {
 			return res.err
 		}
-		if res.index == nextWrite {
-			if _, err := w.Write(res.data); err != nil {
+		completed[res.index] = res
+		for {
+			r, ok := completed[nextWrite]
+			if !ok {
+				break
+			}
+			delete(completed, nextWrite)
+			if _, err := w.Write(r.data); err != nil {
 				return err
 			}
 			nextWrite++
-			for {
-				r, ok := completed[nextWrite]
-				if !ok {
-					break
-				}
-				delete(completed, nextWrite)
-				if _, err := w.Write(r.data); err != nil {
-					return err
-				}
-				nextWrite++
-			}
-		} else {
-			completed[res.index] = res
 		}
 	}
 
@@ -734,32 +730,6 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	wg.Wait()
 
 	s.log.Debug("warmed up hosts", zap.Uint64("n", warmed.Load()))
-	return nil
-}
-
-// joinShards interleaves the striped data shards into dst, skipping the
-// first 'skip' bytes of the recovered data and filling all of dst.
-func joinShards(dst []byte, dataShards [][]byte, skip int) error {
-	n := 0
-	for off := 0; n < len(dst); off += proto4.LeafSize {
-		for _, shard := range dataShards {
-			if len(shard[off:]) < proto4.LeafSize {
-				return reedsolomon.ErrShortData
-			}
-			shard = shard[off:][:proto4.LeafSize]
-			if skip >= len(shard) {
-				skip -= len(shard)
-				continue
-			} else if skip > 0 {
-				shard = shard[skip:]
-				skip = 0
-			}
-			n += copy(dst[n:], shard)
-			if n == len(dst) {
-				break
-			}
-		}
-	}
 	return nil
 }
 

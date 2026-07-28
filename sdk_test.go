@@ -663,8 +663,7 @@ func BenchmarkDownload(b *testing.B) {
 			// NOTE: refreshing hosts makes all benchmarks roughly equal
 			sdk.refreshHosts(b.Context(), true)
 
-			// discard output through a small reusable buffer to mirror the sink
-			// used by the Rust benchmarks
+			// discard through a reusable buffer like the Rust benchmark's sink
 			buf := make([]byte, 1<<20) // 1 MiB
 			b.SetBytes(benchmarkSize)
 			b.ResetTimer()

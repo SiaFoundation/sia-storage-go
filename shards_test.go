@@ -1,8 +1,6 @@
 package siastorage
 
 import (
-	"bytes"
-	"io"
 	"reflect"
 	"testing"
 
@@ -11,44 +9,21 @@ import (
 	"lukechampine.com/frand"
 )
 
-func TestStripedRead(t *testing.T) {
+func TestSplitShards(t *testing.T) {
 	const dataShards = 3
-	const parityShards = 2
 	const slabSize = proto4.SectorSize * dataShards
 
-	testCases := []struct {
-		// (data size, expected size)
-		dataSize     int
-		expectedSize int
-	}{
-		{100, 100},               // under
-		{slabSize, slabSize},     // exact
-		{2 * slabSize, slabSize}, // over
-	}
+	// under and exact
+	for _, dataSize := range []int{100, slabSize} {
+		data := frand.Bytes(dataSize)
 
-	for _, tc := range testCases {
-		data := frand.Bytes(tc.dataSize)
-
-		reader := NewSlabReader(dataShards, parityShards)
-		slab, err := reader.ReadSlab(bytes.NewReader(data))
-
-		if tc.dataSize >= slabSize {
-			if err != nil {
-				t.Fatalf("data size %d: unexpected error: %v", tc.dataSize, err)
-			}
-		} else {
-			if err != io.EOF {
-				t.Fatalf("data size %d: expected io.EOF, got %v", tc.dataSize, err)
-			}
+		shards := make([][]byte, dataShards)
+		for i := range shards {
+			shards[i] = make([]byte, proto4.SectorSize)
 		}
+		splitShards(shards, data)
 
-		if slab.Length != tc.expectedSize {
-			t.Fatalf("data size %d: read mismatch: %d", tc.dataSize, slab.Length)
-		} else if len(slab.Shards) != dataShards+parityShards {
-			t.Fatalf("data size %d: shard count mismatch: %d", tc.dataSize, len(slab.Shards))
-		}
-
-		for i, chunk := range chunks(data[:slab.Length], proto4.LeafSize) {
+		for i, chunk := range chunks(data, proto4.LeafSize) {
 			// pad it out with zeros
 			var padded [proto4.LeafSize]byte
 			copy(padded[:], chunk)
@@ -56,15 +31,15 @@ func TestStripedRead(t *testing.T) {
 			index := i % dataShards
 			offset := (i / dataShards) * proto4.LeafSize
 
-			actual := slab.Shards[index][offset : offset+proto4.LeafSize]
+			actual := shards[index][offset : offset+proto4.LeafSize]
 			if !reflect.DeepEqual(actual, padded[:]) {
-				t.Fatalf("data size %d: shard %d mismatch at offset %d", tc.dataSize, index, offset)
+				t.Fatalf("data size %d: shard %d mismatch at offset %d", dataSize, index, offset)
 			}
 		}
 	}
 }
 
-func TestStripedReadWrite(t *testing.T) {
+func TestSplitJoinShards(t *testing.T) {
 	const dataShards = 4
 	const parityShards = 1
 
@@ -88,29 +63,18 @@ func TestStripedReadWrite(t *testing.T) {
 		data[3*proto4.SectorSize+i] = 4
 	}
 
-	reader := NewSlabReader(dataShards, parityShards)
-	slab, err := reader.ReadSlab(bytes.NewReader(data))
-	if err != io.EOF {
-		t.Fatalf("expected io.EOF, got %v", err)
-	} else if slab.Length != len(data) {
-		t.Fatalf("expected length %d, got %d", len(data), slab.Length)
+	shards := make([][]byte, dataShards+parityShards)
+	for i := range shards {
+		shards[i] = make([]byte, proto4.SectorSize)
 	}
+	splitShards(shards[:dataShards], data)
 
-	// we expect 5 shards and the last one is an empty parity shard
-	if len(slab.Shards) != 5 {
-		t.Fatalf("expected 5 shards, got %d", len(slab.Shards))
-	} else if slab.Length != proto4.SectorSize*7/2 {
-		t.Fatalf("expected length %d, got %d", proto4.SectorSize*7/2, slab.Length)
-	} else if !reflect.DeepEqual(slab.Shards[4], make([]byte, proto4.SectorSize)) {
+	// the last shard is an empty parity shard
+	if !reflect.DeepEqual(shards[4], make([]byte, proto4.SectorSize)) {
 		t.Fatal("parity shard should be empty")
 	}
 
-	for _, s := range slab.Shards[:4] {
-		// every shard should be of SectorSize
-		if len(s) != proto4.SectorSize {
-			t.Fatalf("expected shard size %d, got %d", proto4.SectorSize, len(s))
-		}
-
+	for _, s := range shards[:4] {
 		quarter := proto4.SectorSize / 4
 
 		// first quarter of every shard is 1s
@@ -151,15 +115,15 @@ func TestStripedReadWrite(t *testing.T) {
 
 	// encoding the read shards should succeed without errors and cause the
 	// parity shard to be filled
-	if err := coder.Encode(slab.Shards); err != nil {
+	if err := coder.Encode(shards); err != nil {
 		t.Fatal(err)
-	} else if reflect.DeepEqual(slab.Shards[4], make([]byte, proto4.SectorSize)) {
+	} else if reflect.DeepEqual(shards[4], make([]byte, proto4.SectorSize)) {
 		t.Fatal("parity shard should be filled after encoding")
 	}
 
 	// joining the shards back together should result in the original data
 	joined := make([]byte, len(data))
-	if err := joinShards(joined, slab.Shards[:dataShards], 0); err != nil {
+	if err := joinShards(joined, shards[:dataShards], 0); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data) {
 		t.Fatal("mismatch")
@@ -167,7 +131,7 @@ func TestStripedReadWrite(t *testing.T) {
 
 	// join only the first half
 	joined = make([]byte, len(data)/2)
-	if err := joinShards(joined, slab.Shards[:dataShards], 0); err != nil {
+	if err := joinShards(joined, shards[:dataShards], 0); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data[:len(data)/2]) {
 		t.Fatal("mismatch")
@@ -175,7 +139,7 @@ func TestStripedReadWrite(t *testing.T) {
 
 	// join only the second half
 	joined = make([]byte, len(data)/2)
-	if err := joinShards(joined, slab.Shards[:dataShards], len(data)/2); err != nil {
+	if err := joinShards(joined, shards[:dataShards], len(data)/2); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data[len(data)/2:]) {
 		t.Fatal("mismatch")
