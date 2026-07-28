@@ -82,6 +82,17 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	if !reflect.DeepEqual(obj, obj2) {
 		t.Fatalf("object mismatch: expected %+v, got %+v", obj, obj2)
 	}
+
+	// mutating the sealed object's slabs must not affect the original object
+	originalOffset := obj.slabs[0].Offset
+	originalRoot := obj.slabs[0].Sectors[0].Root
+	locked.Slabs[0].Offset++
+	locked.Slabs[0].Sectors[0].Root[0]++
+	if obj.slabs[0].Offset != originalOffset {
+		t.Fatal("mutating the sealed slab modified the original object")
+	} else if obj.slabs[0].Sectors[0].Root != originalRoot {
+		t.Fatal("mutating the sealed slab's sectors modified the original object")
+	}
 }
 
 func TestNewUnsafeObject(t *testing.T) {
