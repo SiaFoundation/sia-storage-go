@@ -132,8 +132,8 @@ func NewEmptyObject() Object {
 }
 
 // NewUnsafeObject creates an Object from a data key and slabs. It can be used
-// together with [Object.DataKey] and [Object.Slabs] to reconstruct an object
-// whose key and slabs were stored outside the indexer.
+// together with [Object.UnsafeDataKey] and [Object.Slabs] to reconstruct an
+// object whose key and slabs were stored outside the indexer.
 //
 // This is useful for interoperability with systems such as IPFS or LBRY,
 // where an object's components are persisted separately and the object must
