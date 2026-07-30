@@ -10,9 +10,8 @@ import (
 )
 
 type rekeyStream struct {
-	key  []byte
-	c    *chacha20.Cipher
-	skip int
+	key []byte
+	c   *chacha20.Cipher
 
 	counter uint64
 	nonce   uint64
@@ -25,30 +24,6 @@ const (
 )
 
 func (rs *rekeyStream) XORKeyStream(dst, src []byte) {
-	if len(src) == 0 {
-		return
-	}
-
-	if rs.skip > 0 {
-		// determine how many bytes we can process from the first block.
-		n := min(64-rs.skip, len(src))
-
-		// generate the full 64-byte keystream for the initial block.
-		var keyStream [64]byte
-		rs.c.XORKeyStream(keyStream[:], keyStream[:])
-
-		// XOR the relevant part of the keystream with the source data.
-		for i := 0; i < n; i++ {
-			dst[i] = src[i] ^ keyStream[rs.skip+i]
-		}
-
-		// update state and slice pointers for the rest of the operation
-		rs.counter += uint64(n)
-		src = src[n:]
-		dst = dst[n:]
-		// only run once
-		rs.skip = 0
-	}
 	if len(src) == 0 {
 		return
 	}
@@ -81,8 +56,6 @@ func nonce(offset uint64) (nonce [24]byte, nonce64 uint64) {
 	return
 }
 
-// newRekeyStream returns a keystream for key positioned at the given byte
-// offset of the plaintext.
 func newRekeyStream(key *[32]byte, offset uint64) *rekeyStream {
 	n, n64 := nonce(offset)
 	offset %= maxBytesPerNonce
@@ -90,11 +63,15 @@ func newRekeyStream(key *[32]byte, offset uint64) *rekeyStream {
 
 	c, _ := chacha20.NewUnauthenticatedCipher(key[:], n[:])
 	c.SetCounter(uint32(offset / 64))
-	return &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64, skip: skip}
+	if skip > 0 {
+		var discard [64]byte
+		c.XORKeyStream(discard[:skip], discard[:skip])
+	}
+	return &rekeyStream{key: key[:], c: c, counter: offset, nonce: n64}
 }
 
-// encrypt returns a cipher.StreamReader that encrypts r with key starting at
-// the given offset.
+// encrypt returns a cipher.StreamReader that encrypts r with k starting at the
+// given offset.
 func encrypt(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
 	return cipher.StreamReader{S: newRekeyStream(key, offset), R: r}
 }

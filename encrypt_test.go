@@ -95,10 +95,15 @@ func TestEncryptRoundtrip(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			newRekeyStream(&key, offset).XORKeyStream(read, read)
+			// chacha20 is symmetric, so encrypting the ciphertext again with
+			// the same key and offset recovers the plaintext.
+			decrypted, err := io.ReadAll(encrypt(&key, bytes.NewReader(read), offset))
+			if err != nil {
+				t.Fatal(err)
+			}
 
-			if !bytes.Equal(data[:], read) {
-				t.Fatalf("data mismatch: expected %v, got %v", data[:], read)
+			if !bytes.Equal(data[:], decrypted) {
+				t.Fatalf("data mismatch: expected %v, got %v", data[:], decrypted)
 			}
 		})
 	}

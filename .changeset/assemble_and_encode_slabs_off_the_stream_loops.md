@@ -2,6 +2,6 @@
 default: patch
 ---
 
-# Assemble and encode slabs off the stream loops
+# Assemble and encode slabs off the upload read loop
 
-Downloads now assemble and decrypt each chunk inside the recovery workers and write whole plaintext buffers to the stream. Uploads read whole slabs and move encryption and erasure coding into per slab goroutines. This removes the 64 byte striped writes and the single threaded cipher from both hot paths.
+Uploads read whole slabs and move encryption and erasure coding into per slab goroutines. This removes the 64 byte striped reads and the single threaded cipher from the upload hot path.

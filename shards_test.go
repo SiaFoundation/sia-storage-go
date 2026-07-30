@@ -123,7 +123,7 @@ func TestSplitJoinShards(t *testing.T) {
 
 	// joining the shards back together should result in the original data
 	joined := make([]byte, len(data))
-	if err := joinShards(joined, shards[:dataShards], 0); err != nil {
+	if err := stripedJoin(joined, shards[:dataShards], 0); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data) {
 		t.Fatal("mismatch")
@@ -131,7 +131,7 @@ func TestSplitJoinShards(t *testing.T) {
 
 	// join only the first half
 	joined = make([]byte, len(data)/2)
-	if err := joinShards(joined, shards[:dataShards], 0); err != nil {
+	if err := stripedJoin(joined, shards[:dataShards], 0); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data[:len(data)/2]) {
 		t.Fatal("mismatch")
@@ -139,7 +139,7 @@ func TestSplitJoinShards(t *testing.T) {
 
 	// join only the second half
 	joined = make([]byte, len(data)/2)
-	if err := joinShards(joined, shards[:dataShards], len(data)/2); err != nil {
+	if err := stripedJoin(joined, shards[:dataShards], len(data)/2); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(joined, data[len(data)/2:]) {
 		t.Fatal("mismatch")
