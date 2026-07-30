@@ -75,7 +75,7 @@ type Builder struct {
 	ephemeralKey types.PrivateKey
 	client       *app.Client
 
-	request      app.RegisterAppRequest
+	info         app.Info
 	registerResp *app.RegisterAppResponse
 	sharedSecret types.Hash256
 
@@ -170,7 +170,7 @@ func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
 		return nil, ErrNotApproved
 	}
 
-	appKey, err := deriveAppKey(mnemonic, b.request.AppID, b.sharedSecret)
+	appKey, err := deriveAppKey(mnemonic, b.info.AppID, b.sharedSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive app key: %w", err)
 	} else if err := b.client.RegisterApp(ctx, b.registerResp.RegisterURL, b.ephemeralKey, appKey); err != nil {
@@ -194,7 +194,7 @@ func (b *Builder) RequestConnection(ctx context.Context) (string, error) {
 	if err := b.checkConsumed(); err != nil {
 		return "", err
 	}
-	resp, err := b.client.RequestAppConnection(ctx, b.ephemeralKey, b.request)
+	resp, err := b.client.RequestAppConnection(ctx, b.ephemeralKey, b.info)
 	if err != nil {
 		return "", fmt.Errorf("failed to request app connection: %w", err)
 	}
@@ -265,7 +265,7 @@ func deriveAppKey(mnemonic string, appID types.Hash256, sharedSecret types.Hash2
 func NewBuilder(indexerURL string, metadata AppMetadata) *Builder {
 	return &Builder{
 		ephemeralKey: types.GeneratePrivateKey(),
-		request: app.RegisterAppRequest{
+		info: app.Info{
 			AppID:       metadata.ID,
 			Name:        metadata.Name,
 			Description: metadata.Description,
