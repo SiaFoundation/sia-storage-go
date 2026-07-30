@@ -604,13 +604,17 @@ func TestRefreshHosts(t *testing.T) {
 // spent ramping the inflight limit rather than at steady state
 var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")
 
+// host pool for the transfer benchmarks. the default scheme is 10 data and 20
+// parity shards, so a pool of 30 leaves upload no host to choose between
+const benchHosts = 90
+
 func BenchmarkUpload(b *testing.B) {
 	data := frand.Bytes(*benchSize)
 
 	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
-			sdk, hosts := newTestSDK(b, 30+timeout, zap.NewNop())
+			sdk, hosts := newTestSDK(b, benchHosts+timeout, zap.NewNop())
 			defer sdk.Close()
 
 			hosts.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
@@ -646,7 +650,7 @@ func BenchmarkUpload(b *testing.B) {
 }
 
 func BenchmarkDownload(b *testing.B) {
-	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	sdk, hosts := newTestSDK(b, benchHosts, zap.NewNop())
 	defer sdk.Close()
 
 	data := frand.Bytes(*benchSize)
