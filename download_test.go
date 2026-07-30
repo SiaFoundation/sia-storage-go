@@ -155,25 +155,6 @@ func TestChunkIter(t *testing.T) {
 	}
 }
 
-func TestChunkWriterBuffered(t *testing.T) {
-	var output bytes.Buffer
-	counted := &countWriter{w: &output}
-	dataKey := frand.Entropy256()
-	cw := newChunkWriter(counted, &dataKey)
-	recovered := recoveredChunk{
-		shards:   [][]byte{make([]byte, chunkSize)},
-		writeLen: chunkSize,
-	}
-
-	if err := cw.writeChunk(chunkSlab{}, recovered); err != nil {
-		t.Fatal(err)
-	} else if output.Len() != chunkSize {
-		t.Fatalf("expected %d output bytes, got %d", chunkSize, output.Len())
-	} else if expected := chunkSize / downloadWriteBufferSize; counted.count != expected {
-		t.Fatalf("expected %d buffered writes, got %d", expected, counted.count)
-	}
-}
-
 func TestDownloadV0(t *testing.T) {
 	sdk, _ := newTestSDK(t, 12, zaptest.NewLogger(t))
 	defer sdk.Close()

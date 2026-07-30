@@ -91,18 +91,6 @@ func encrypt(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
 	return cipher.StreamReader{S: newV0CipherStream(key, offset), R: r}
 }
 
-// decrypt returns a cipher.StreamWriter that decrypts w with k, starting at the
-// specified offset.
-func decrypt(key *[32]byte, w io.Writer, offset uint64) cipher.StreamWriter {
-	return cipher.StreamWriter{S: newV0CipherStream(key, offset), W: w}
-}
-
-// decryptV1 returns a cipher.StreamWriter that decrypts a v1 slab using the
-// slab key as the nonce for the object's data key.
-func decryptV1(dataKey, slabKey *[32]byte, w io.Writer, offset uint64) cipher.StreamWriter {
-	return cipher.StreamWriter{S: newV1CipherStream(dataKey, slabKey, offset), W: w}
-}
-
 // slabKeySource coordinates the random encryption keys used to encrypt both a
 // slab's object data and its individual shards.
 type slabKeySource struct {

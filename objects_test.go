@@ -82,6 +82,57 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	if !reflect.DeepEqual(obj, obj2) {
 		t.Fatalf("object mismatch: expected %+v, got %+v", obj, obj2)
 	}
+
+	// mutating the sealed object's slabs must not affect the original object
+	originalOffset := obj.slabs[0].Offset
+	originalRoot := obj.slabs[0].Sectors[0].Root
+	locked.Slabs[0].Offset++
+	locked.Slabs[0].Sectors[0].Root[0]++
+	if obj.slabs[0].Offset != originalOffset {
+		t.Fatal("mutating the sealed slab modified the original object")
+	} else if obj.slabs[0].Sectors[0].Root != originalRoot {
+		t.Fatal("mutating the sealed slab's sectors modified the original object")
+	}
+}
+
+func TestNewUnsafeObject(t *testing.T) {
+	ss := []slabs.SlabSlice{
+		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
+			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
+		}},
+		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
+	}
+	obj := Object{
+		dataKey: frand.Bytes(32),
+		slabs:   ss,
+	}
+
+	// reconstruct the object from its data key and slabs
+	obj2 := NewUnsafeObject(obj.UnsafeDataKey(), obj.Slabs())
+	if !bytes.Equal(obj2.dataKey, obj.dataKey) {
+		t.Fatalf("unexpected data key: got %x, want %x", obj2.dataKey, obj.dataKey)
+	} else if obj2.ID() != obj.ID() {
+		t.Fatalf("unexpected ID: got %v, want %v", obj2.ID(), obj.ID())
+	} else if !reflect.DeepEqual(obj2.slabs, obj.slabs) {
+		t.Fatalf("slab mismatch: got %+v, want %+v", obj2.slabs, obj.slabs)
+	}
+
+	// the reconstructed object should seal and open like the original
+	appKey := types.GeneratePrivateKey()
+	sealed := obj2.Seal(appKey)
+	obj3, err := sealed.Open(appKey)
+	if err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(obj3.dataKey, obj.dataKey) {
+		t.Fatalf("unexpected data key after roundtrip: got %x, want %x", obj3.dataKey, obj.dataKey)
+	}
+
+	// mutating the returned key must not affect the object
+	key := obj.UnsafeDataKey()
+	key[0] ^= 0xff
+	if !bytes.Equal(obj.dataKey, obj2.dataKey) {
+		t.Fatal("mutating the returned key modified the object")
+	}
 }
 
 func TestObjectEvents(t *testing.T) {

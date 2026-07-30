@@ -60,14 +60,15 @@ func TestEncryptRoundtrip(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			var buf bytes.Buffer
-			decrypted := decrypt(&key, &buf, offset)
-			if _, err := decrypted.Write(read); err != nil {
+			// chacha20 is symmetric, so encrypting the ciphertext again with
+			// the same key and offset recovers the plaintext.
+			decrypted, err := io.ReadAll(encrypt(&key, bytes.NewReader(read), offset))
+			if err != nil {
 				t.Fatal(err)
 			}
 
-			if !bytes.Equal(data[:], buf.Bytes()) {
-				t.Fatalf("data mismatch: expected %v, got %v", data[:], buf.Bytes())
+			if !bytes.Equal(data[:], decrypted) {
+				t.Fatalf("data mismatch: expected %v, got %v", data[:], decrypted)
 			}
 		})
 	}
