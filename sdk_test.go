@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"runtime"
@@ -599,9 +600,12 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
+// object size for the transfer benchmarks. at the default most of a run is
+// spent ramping the inflight limit rather than at steady state
+var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")
+
 func BenchmarkUpload(b *testing.B) {
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-	data := frand.Bytes(benchmarkSize)
+	data := frand.Bytes(*benchSize)
 
 	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
 		b.Helper()
@@ -616,7 +620,7 @@ func BenchmarkUpload(b *testing.B) {
 			sdk.refreshHosts(b.Context(), true)
 
 			r := bytes.NewReader(data)
-			b.SetBytes(benchmarkSize)
+			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
 				r.Reset(data)
@@ -645,8 +649,7 @@ func BenchmarkDownload(b *testing.B) {
 	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
 	defer sdk.Close()
 
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-	data := frand.Bytes(benchmarkSize)
+	data := frand.Bytes(*benchSize)
 	obj := NewEmptyObject()
 	err := sdk.Upload(b.Context(), &obj, bytes.NewReader(data))
 	if err != nil {
@@ -665,7 +668,7 @@ func BenchmarkDownload(b *testing.B) {
 
 			// discard through a reusable buffer like the Rust benchmark's sink
 			buf := make([]byte, 1<<20) // 1 MiB
-			b.SetBytes(benchmarkSize)
+			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
 				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
