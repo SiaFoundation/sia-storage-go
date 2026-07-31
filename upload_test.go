@@ -2,6 +2,8 @@ package siastorage
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"go.sia.tech/core/types"
@@ -10,6 +12,60 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 )
+
+// erroringReader returns err on the read that consumes the last of its data,
+// then io.EOF, which io.Reader allows but io.ReadFull hides.
+type erroringReader struct {
+	data []byte
+	err  error
+}
+
+func (r *erroringReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+// TestUploadReaderError asserts a failing reader is not mistaken for the end
+// of the stream, which would silently truncate the object.
+func TestUploadReaderError(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+
+	sdk, _ := newTestSDK(t, dataShards+parityShards, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// a truncated stream surfaces io.ErrUnexpectedEOF instead of being
+	// uploaded as a short final slab
+	obj := NewEmptyObject()
+	err := sdk.Upload(t.Context(), &obj, &erroringReader{
+		data: frand.Bytes(1000),
+		err:  io.ErrUnexpectedEOF,
+	}, WithRedundancy(dataShards, parityShards))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal("unexpected", err)
+	} else if obj.Size() != 0 {
+		t.Fatal("unexpected", obj.Size())
+	}
+
+	// an error returned by the read that filled the slab is not discarded
+	readErr := errors.New("read failed")
+	obj = NewEmptyObject()
+	err = sdk.Upload(t.Context(), &obj, &erroringReader{
+		data: make([]byte, dataShards*proto.SectorSize),
+		err:  readErr,
+	}, WithRedundancy(dataShards, parityShards))
+	if !errors.Is(err, readErr) {
+		t.Fatal("unexpected", err)
+	} else if obj.Size() != 0 {
+		t.Fatal("unexpected", obj.Size())
+	}
+}
 
 // TestUploadInflight asserts uploads release their inflight
 // reservations and avoid busy hosts.

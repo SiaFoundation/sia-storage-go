@@ -2,7 +2,6 @@ package siastorage
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -181,6 +180,23 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 	return uo, enc, nil
 }
 
+// readSlab fills buf and returns the number of bytes read along with the
+// error that ended the read. Unlike io.ReadFull it never rewrites a short read
+// as io.ErrUnexpectedEOF, so a reader failing with that error is not mistaken
+// for a clean io.EOF, and it preserves an error returned by the same read that
+// filled buf.
+func readSlab(r io.Reader, buf []byte) (int, error) {
+	var n int
+	for n < len(buf) {
+		nn, err := r.Read(buf[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
 func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, key *[32]byte, offset uint64, enc reedsolomon.Encoder, uo uploadOption) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
@@ -217,14 +233,15 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// read the next raw slab
+		// read the next raw slab; io.EOF means the stream ended, every other
+		// error is fatal
 		buf := make([]byte, dataSize)
-		n, err := io.ReadFull(r, buf)
-		last := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-		if n == 0 && last {
-			return
-		} else if err != nil && !last {
+		n, err := readSlab(r, buf)
+		last := err == io.EOF
+		if err != nil && !last {
 			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
+			return
+		} else if n == 0 {
 			return
 		}
 
