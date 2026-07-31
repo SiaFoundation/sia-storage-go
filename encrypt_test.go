@@ -2,6 +2,7 @@ package siastorage
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -44,7 +45,13 @@ func TestDeriveAppKeyGolden(t *testing.T) {
 	}
 }
 
-func TestEncryptRoundtrip(t *testing.T) {
+// encryptV0 returns a cipher.StreamReader that encrypts r with key starting at
+// the given offset using the legacy object-wide cipher.
+func encryptV0(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
+	return cipher.StreamReader{S: newV0CipherStream(key, offset), R: r}
+}
+
+func TestEncryptRoundtripV0(t *testing.T) {
 	var data [4096]byte
 	frand.Read(data[:])
 
@@ -53,7 +60,7 @@ func TestEncryptRoundtrip(t *testing.T) {
 
 	for _, offset := range []uint64{0, 16, 31, 63, 64, 96, 128, 2048, 4096, maxBytesPerNonce - 127, maxBytesPerNonce - 128, maxBytesPerNonce - 63, maxBytesPerNonce - 64, maxBytesPerNonce, 2 * maxBytesPerNonce} {
 		t.Run(fmt.Sprint(offset), func(t *testing.T) {
-			r := encrypt(&key, bytes.NewReader(data[:]), offset)
+			r := encryptV0(&key, bytes.NewReader(data[:]), offset)
 
 			read, err := io.ReadAll(r)
 			if err != nil {
@@ -62,7 +69,7 @@ func TestEncryptRoundtrip(t *testing.T) {
 
 			// chacha20 is symmetric, so encrypting the ciphertext again with
 			// the same key and offset recovers the plaintext.
-			decrypted, err := io.ReadAll(encrypt(&key, bytes.NewReader(read), offset))
+			decrypted, err := io.ReadAll(encryptV0(&key, bytes.NewReader(read), offset))
 			if err != nil {
 				t.Fatal(err)
 			}

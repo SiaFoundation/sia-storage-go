@@ -85,12 +85,6 @@ func newV1CipherStream(dataKey, slabKey *[32]byte, offset uint64) *rekeyStream {
 	return newCipherStream(dataKey, nonce, offset)
 }
 
-// encrypt returns a cipher.StreamReader that encrypts r with k starting at the
-// given offset.
-func encrypt(key *[32]byte, r io.Reader, offset uint64) cipher.StreamReader {
-	return cipher.StreamReader{S: newV0CipherStream(key, offset), R: r}
-}
-
 // slabKeySource coordinates the random encryption keys used to encrypt both a
 // slab's object data and its individual shards.
 type slabKeySource struct {

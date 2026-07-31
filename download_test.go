@@ -3,6 +3,7 @@ package siastorage
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -62,95 +63,102 @@ func TestOutOfOrderDownload(t *testing.T) {
 }
 
 func TestChunkIter(t *testing.T) {
-	makeSlab := func(length uint32) slabs.SlabSlice {
-		return slabs.SlabSlice{
-			EncryptionKey: frand.Entropy256(),
-			MinShards:     10,
-			Length:        length,
-		}
-	}
-
-	check := func(t *testing.T, chunks []slabs.SlabSlice, length uint64) {
-		t.Helper()
-		var total uint64
-		for i, c := range chunks {
-			if uint64(c.Length) > chunkSize {
-				t.Fatalf("chunk %d exceeds chunkSize: %d", i, c.Length)
-			}
-			if i > 0 && c.EncryptionKey == chunks[i-1].EncryptionKey {
-				if c.Offset != chunks[i-1].Offset+chunks[i-1].Length {
-					t.Fatalf("chunk %d not contiguous", i)
+	for _, version := range []uint8{0, 1} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			makeSlab := func(length uint32) slabs.SlabSlice {
+				return slabs.SlabSlice{
+					Version:       version,
+					EncryptionKey: frand.Entropy256(),
+					MinShards:     10,
+					Length:        length,
 				}
 			}
-			total += uint64(c.Length)
-		}
-		if total != length {
-			t.Fatalf("total chunk length %d != expected %d", total, length)
-		}
-	}
 
-	tests := []struct {
-		name   string
-		slabs  []slabs.SlabSlice
-		offset uint64
-		length uint64
-	}{
-		{
-			name:   "single slab full",
-			slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
-			offset: 0,
-			length: 1 << 20,
-		},
-		{
-			name:   "partial offset",
-			slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
-			offset: 100,
-			length: chunkSize + 50,
-		},
-		{
-			name:   "multiple slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 2), makeSlab(chunkSize * 3)},
-			offset: 0,
-			length: chunkSize*2 + chunkSize*3,
-		},
-		{
-			name:   "offset skips first slab",
-			slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(chunkSize * 2)},
-			offset: 1000,
-			length: chunkSize * 2,
-		},
-		{
-			name:   "span across slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize), makeSlab(chunkSize)},
-			offset: chunkSize / 2,
-			length: chunkSize,
-		},
-		{
-			name:   "small request",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 4)},
-			offset: 0,
-			length: 100,
-		},
-		{
-			name:   "zero length",
-			slabs:  []slabs.SlabSlice{makeSlab(chunkSize)},
-			offset: 0,
-			length: 0,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ci := newChunkIter(tt.slabs, tt.offset, tt.length)
-			var chunks []slabs.SlabSlice
-			objectOffset := tt.offset
-			for c, ok := ci.next(); ok; c, ok = ci.next() {
-				if c.objectOffset != objectOffset {
-					t.Fatalf("expected object offset %d, got %d", objectOffset, c.objectOffset)
+			check := func(t *testing.T, chunks []slabs.SlabSlice, length uint64) {
+				t.Helper()
+				var total uint64
+				for i, c := range chunks {
+					if c.Version != version {
+						t.Fatalf("chunk %d has version %d, expected %d", i, c.Version, version)
+					} else if uint64(c.Length) > chunkSize {
+						t.Fatalf("chunk %d exceeds chunkSize: %d", i, c.Length)
+					}
+					if i > 0 && c.EncryptionKey == chunks[i-1].EncryptionKey {
+						if c.Offset != chunks[i-1].Offset+chunks[i-1].Length {
+							t.Fatalf("chunk %d not contiguous", i)
+						}
+					}
+					total += uint64(c.Length)
 				}
-				chunks = append(chunks, c.slab)
-				objectOffset += uint64(c.slab.Length)
+				if total != length {
+					t.Fatalf("total chunk length %d != expected %d", total, length)
+				}
 			}
-			check(t, chunks, tt.length)
+
+			tests := []struct {
+				name   string
+				slabs  []slabs.SlabSlice
+				offset uint64
+				length uint64
+			}{
+				{
+					name:   "single slab full",
+					slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
+					offset: 0,
+					length: 1 << 20,
+				},
+				{
+					name:   "partial offset",
+					slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
+					offset: 100,
+					length: chunkSize + 50,
+				},
+				{
+					name:   "multiple slabs",
+					slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 2), makeSlab(chunkSize * 3)},
+					offset: 0,
+					length: chunkSize*2 + chunkSize*3,
+				},
+				{
+					name:   "offset skips first slab",
+					slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(chunkSize * 2)},
+					offset: 1000,
+					length: chunkSize * 2,
+				},
+				{
+					name:   "span across slabs",
+					slabs:  []slabs.SlabSlice{makeSlab(chunkSize), makeSlab(chunkSize)},
+					offset: chunkSize / 2,
+					length: chunkSize,
+				},
+				{
+					name:   "small request",
+					slabs:  []slabs.SlabSlice{makeSlab(chunkSize * 4)},
+					offset: 0,
+					length: 100,
+				},
+				{
+					name:   "zero length",
+					slabs:  []slabs.SlabSlice{makeSlab(chunkSize)},
+					offset: 0,
+					length: 0,
+				},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					ci := newChunkIter(tt.slabs, tt.offset, tt.length)
+					var chunks []slabs.SlabSlice
+					objectOffset := tt.offset
+					for c, ok := ci.next(); ok; c, ok = ci.next() {
+						if c.objectOffset != objectOffset {
+							t.Fatalf("expected object offset %d, got %d", objectOffset, c.objectOffset)
+						}
+						chunks = append(chunks, c.slab)
+						objectOffset += uint64(c.slab.Length)
+					}
+					check(t, chunks, tt.length)
+				})
+			}
 		})
 	}
 }
@@ -170,7 +178,7 @@ func TestDownloadV0(t *testing.T) {
 		t.Fatal(err)
 	}
 	slabKeys := &slabKeySource{}
-	encrypted := encrypt((*[32]byte)(obj.dataKey), bytes.NewReader(data), 0)
+	encrypted := encryptV0((*[32]byte)(obj.dataKey), bytes.NewReader(data), 0)
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
