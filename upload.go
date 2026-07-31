@@ -364,18 +364,18 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	lastEvent := time.Now()
 
 	for {
-		// only race when no shard is still waiting for its first try. whether
-		// a host is free is checked when the timer fires by attempting a pick,
-		// so the timer polls the pool instead of waiting on an availability
-		// signal that might never come
-		eligible := su.waiting.load() == 0
+		// snapshot the waiting count once so the eligibility test and the wakeup
+		// channel stay consistent. only race when no shard is still waiting for
+		// its first try. whether a host is free is checked when the timer fires
+		// by attempting a pick, so the timer polls the pool instead of waiting
+		// on an availability signal that might never come
+		waiting, idleCh := su.waiting.snapshot()
 		var raceCh <-chan time.Time
-		var idleCh <-chan struct{}
-		if eligible {
+		if waiting == 0 {
 			// Go cleans up this timer even if we never read the channel
 			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
-		} else {
-			_, idleCh = su.waiting.snapshot()
+			// while racing we wait on the timer, not shards starting
+			idleCh = nil
 		}
 
 		select {
