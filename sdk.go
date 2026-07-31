@@ -880,7 +880,7 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	var warmed atomic.Uint64
 
 	var wg sync.WaitGroup
-	sema := make(chan struct{}, 15)
+	sema := make(chan struct{}, 50)
 	for _, hk := range hks {
 		select {
 		case <-ctx.Done():
@@ -900,7 +900,10 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
+			// from cold a probe has to fit a TCP handshake, the mux handshake and
+			// a settings round trip, so a tighter budget expires on distant hosts
+			// that are perfectly healthy
+			pCtx, pCancel := context.WithTimeout(ctx, 3*time.Second)
 			_, err := s.hosts.Prices(pCtx, hk)
 			pCancel()
 
