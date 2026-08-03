@@ -37,6 +37,8 @@ type (
 
 		AddFailedRPC(hostKey types.PublicKey)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
+		ReadEstimate(bytes uint64) time.Duration
+		WriteEstimate(bytes uint64) time.Duration
 		PickWrite(candidates []types.PublicKey) (host types.PublicKey, release func(), remaining []types.PublicKey, ok bool)
 		TrackInflightRead(hostKey types.PublicKey) func()
 		UploadQueue() (*client.HostQueue, error)
@@ -115,7 +117,7 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex int, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
+func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -159,7 +161,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	}
 	responseCh := make(chan result, len(slab.Sectors))
 	var outstanding int
-	tryDownloadSector := func(d sectorDownload, initial bool) {
+	tryDownloadSector := func(d sectorDownload) {
 		outstanding++
 		release := s.hosts.TrackInflightRead(d.sector.HostKey)
 		wg.Go(func() {
@@ -179,30 +181,49 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 				elapsed: time.Since(start),
 			}:
 			}
-			// a host gets demoted if either
-			// 1. it hit the shard timeout
-			// 2. it was part of the initial batch of hosts and was interrupted
-			if (timeoutCtx.Err() != nil && ctx.Err() == nil) || (initial && ctx.Err() != nil) {
+			// a host only gets demoted when it hits the shard timeout. reads
+			// cancelled because the chunk completed without them are expected
+			// with overprovisioning and do not count against the host
+			if timeoutCtx.Err() != nil && ctx.Err() == nil {
 				s.hosts.AddFailedRPC(d.sector.HostKey)
 			}
 		})
 	}
 
-	// launch minShards downloads right away
-	for range slab.MinShards {
-		tryDownloadSector(slabSectors[slabHosts[0]], true)
+	// overprovision the initial reads to avoid waiting on the slowest of
+	// exactly minShards hosts; the chunk completes on the first minShards
+	// successes and the leftover reads are cancelled
+	initial := min(int(slab.MinShards)*3/2, len(slabHosts))
+	for range initial {
+		tryDownloadSector(slabSectors[slabHosts[0]])
 		slabHosts = slabHosts[1:]
 	}
 
-	// launch more downloads as results come in or periodically to race
-	// slow hosts
+	// only race a host once it is clearly slower than normal. before we have
+	// timing data the estimate is large, so racing stays off until it warms up.
+	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(length)) * raceFactor)
+	lastEvent := time.Now()
+
 	var successful int
 	shards := make([][]byte, len(slab.Sectors))
-	timer := time.NewTimer(500 * time.Millisecond)
-	defer timer.Stop()
 	for {
+		// snapshot the read head once so the eligibility test and the wakeup
+		// channel stay consistent. only race while this chunk is near the read
+		// head and a spare host is free. the spare check stops a tiny estimate
+		// from spinning the timer.
+		head, windowCh := popped.snapshot()
+		eligible := len(slabHosts) > 0 && seq < head+raceWindow
+		var raceCh <-chan time.Time
+		if eligible {
+			// Go cleans up this timer even if we never read the channel
+			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
+			// while racing we wait on the timer, not read-head moves
+			windowCh = nil
+		}
+
 		select {
 		case res := <-responseCh:
+			lastEvent = time.Now()
 			outstanding--
 			if res.err == nil {
 				// successful download
@@ -228,20 +249,25 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 				return nil, ErrNotEnoughShards
 			}
 			if res.err != nil && len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]], false)
+				tryDownloadSector(slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
-		case <-timer.C:
+
+		case <-raceCh:
+			lastEvent = time.Now()
 			// periodically launch an extra download to race slow hosts
 			if len(slabHosts) > 0 {
-				tryDownloadSector(slabSectors[slabHosts[0]], false)
+				tryDownloadSector(slabSectors[slabHosts[0]])
 				slabHosts = slabHosts[1:]
 			}
+
+		case <-windowCh:
+			// the read head moved, loop around and check again
+
 		case <-ctx.Done():
 			// download got interrupted before it could finish
 			return nil, ctx.Err()
 		}
-		timer.Reset(500 * time.Millisecond)
 	}
 }
 
@@ -514,22 +540,34 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
 }
 
-const chunkSize = 1 << 18 // 256 KiB
+const (
+	// initialChunkSize is the size of a download's first chunk. Starting
+	// small keeps the time to first byte low, since the first chunk only
+	// needs a tiny read from each host.
+	initialChunkSize = 1 << 15 // 32 KiB
 
-// chunkIter splits slabs into fixed-size chunks for parallel recovery.
-// It handles byte-range selection internally: offset is a byte offset into
-// the logical stream of all slabs and length limits total output.
+	// maxChunkSize caps the per-chunk doubling. Larger chunks amortize the
+	// fixed cost of a read RPC over more bytes.
+	maxChunkSize = 1 << 20 // 1 MiB
+)
+
+// chunkIter splits slabs into chunks for parallel recovery. Chunks start at
+// initialChunkSize for a fast first byte and double per chunk up to
+// maxChunkSize. It handles byte-range selection internally: offset is a byte
+// offset into the logical stream of all slabs and length limits total output.
 type chunkIter struct {
 	slabs     []slabs.SlabSlice
 	slabIdx   int
 	offset    uint64 // position within current slab
 	remaining uint64 // total bytes left to yield
+	chunkSize uint64 // doubles per chunk up to maxChunkSize
 }
 
 func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	ci := &chunkIter{
 		slabs:     ss,
 		remaining: length,
+		chunkSize: initialChunkSize,
 	}
 	for ci.slabIdx < len(ci.slabs) {
 		slabLength := uint64(ci.slabs[ci.slabIdx].Length)
@@ -552,7 +590,7 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 			ci.offset = 0
 			continue
 		}
-		chunkLen := min(available, ci.remaining, chunkSize)
+		chunkLen := min(available, ci.remaining, ci.chunkSize)
 		chunk := slab
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
@@ -563,6 +601,7 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 			ci.slabIdx++
 		}
 		ci.remaining -= chunkLen
+		ci.chunkSize = min(ci.chunkSize*2, maxChunkSize)
 		return chunk, slabIdx, true
 	}
 	return slabs.SlabSlice{}, 0, false
@@ -574,8 +613,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex int, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, slabIndex, hostTimeout, onProgress)
+func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, chunk, slabIndex, seq, popped, hostTimeout, onProgress)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -634,6 +673,10 @@ type chunkDownloader struct {
 	chunks      *chunkIter
 	cipherOff   uint64
 
+	// popped counts how many chunks the reader has taken. each chunk task uses
+	// it to tell how close it is to the read head.
+	popped *changeCounter
+
 	sema    chan struct{}    // bounds concurrent chunk recoveries to maxInflight
 	results chan chunkResult // recovered chunks, in completion order
 
@@ -647,23 +690,23 @@ type chunkDownloader struct {
 }
 
 // chunkBufPool pools full-size plaintext buffers reused across chunk downloads,
-// hiding the [chunkSize]byte-array/slice conversion behind get and put.
+// hiding the [maxChunkSize]byte-array/slice conversion behind get and put.
 type chunkBufPool struct {
 	pool sync.Pool
 }
 
 func newChunkBufPool() *chunkBufPool {
-	return &chunkBufPool{pool: sync.Pool{New: func() any { return new([chunkSize]byte) }}}
+	return &chunkBufPool{pool: sync.Pool{New: func() any { return new([maxChunkSize]byte) }}}
 }
 
-// get returns a buffer of length n backed by a full [chunkSize]byte array.
+// get returns a buffer of length n backed by a full [maxChunkSize]byte array.
 func (p *chunkBufPool) get(n int) []byte {
-	return p.pool.Get().(*[chunkSize]byte)[:n]
+	return p.pool.Get().(*[maxChunkSize]byte)[:n]
 }
 
 // put returns a buffer previously obtained from get to the pool.
 func (p *chunkBufPool) put(buf []byte) {
-	p.pool.Put((*[chunkSize]byte)(buf[:chunkSize]))
+	p.pool.Put((*[maxChunkSize]byte)(buf[:maxChunkSize]))
 }
 
 // newChunkDownloader builds a chunkDownloader; the caller launches its
@@ -679,6 +722,7 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		bufs:        newChunkBufPool(),
 		chunks:      newChunkIter(ss, do.offset, do.length),
 		cipherOff:   do.offset,
+		popped:      newChangeCounter(0),
 		sema:        make(chan struct{}, do.maxInflight),
 		results:     make(chan chunkResult, do.maxInflight),
 		done:        make(chan struct{}),
@@ -732,7 +776,7 @@ func (c *chunkDownloader) run() {
 // deliverChunk recovers and decrypts one chunk and hands its result off,
 // returning the pooled buffer if the download was cancelled before the handoff.
 func (c *chunkDownloader) deliverChunk(index int, chunk slabs.SlabSlice, slabIdx int, offset uint64) {
-	data, err := c.recoverAndDecrypt(chunk, slabIdx, offset)
+	data, err := c.recoverAndDecrypt(chunk, slabIdx, index, offset)
 	if err != nil {
 		// surface the error promptly via the cause instead of
 		// waiting behind slower in-order chunks; first cause wins.
@@ -749,8 +793,8 @@ func (c *chunkDownloader) deliverChunk(index int, chunk slabs.SlabSlice, slabIdx
 
 // recoverAndDecrypt recovers a chunk into a pooled buffer and decrypts it in
 // place at its absolute plaintext offset, so chunks decrypt independently.
-func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex int, cipherOffset uint64) ([]byte, error) {
-	rc, err := c.s.recoverChunk(c.ctx, chunk, slabIndex, c.hostTimeout, c.onProgress)
+func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex, seq int, cipherOffset uint64) ([]byte, error) {
+	rc, err := c.s.recoverChunk(c.ctx, chunk, slabIndex, seq, c.popped, c.hostTimeout, c.onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -770,6 +814,7 @@ func (c *chunkDownloader) nextChunk() ([]byte, error) {
 		return nil, c.err
 	}
 	c.start()
+	c.popped.add(1) // the chunk being awaited is now the read head
 	for {
 		if r, ok := c.completed[c.next]; ok {
 			delete(c.completed, c.next)
