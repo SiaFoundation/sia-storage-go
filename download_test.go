@@ -2,10 +2,13 @@ package siastorage
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	proto "go.sia.tech/core/rhp/v4"
+	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
@@ -185,6 +188,51 @@ func TestSlabRecovery(t *testing.T) {
 			expected := data[tt.offset : tt.offset+tt.length]
 			if !bytes.Equal(got, expected) {
 				t.Fatalf("data mismatch: got %d bytes, expected %d", len(got), len(expected))
+			}
+		})
+	}
+}
+
+// TestDownloadUnusableHosts asserts a download whose slab has fewer usable
+// hosts than the slab's minimum shards returns an error instead of panicking.
+// Prioritize drops unusable hosts, so the count is only known after it runs.
+func TestDownloadUnusableHosts(t *testing.T) {
+	const (
+		dataShards   = 10
+		parityShards = 20
+		totalShards  = dataShards + parityShards
+	)
+
+	for _, usable := range []int{0, 1, dataShards - 1, dataShards, dataShards + 1, totalShards} {
+		t.Run(fmt.Sprintf("usable=%d", usable), func(t *testing.T) {
+			sdk, _ := newTestSDK(t, totalShards, zaptest.NewLogger(t))
+			defer sdk.Close()
+
+			data := frand.Bytes(int(proto.SectorSize) * dataShards)
+			obj := NewEmptyObject()
+			if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards)); err != nil {
+				t.Fatal(err)
+			}
+
+			// a host is usable only while it is cached, so shrinking the
+			// cache is what an indexer dropping hosts looks like to the SDK
+			var keep []hosts.HostInfo
+			for _, sector := range obj.Slabs()[0].Sectors[:usable] {
+				keep = append(keep, hosts.HostInfo{PublicKey: sector.HostKey, GoodForUpload: true})
+			}
+			sdk.hostsCache.updateHosts(keep)
+
+			got, err := readAll(sdk.Download(obj))
+			if usable < dataShards {
+				if !errors.Is(err, ErrNotEnoughShards) {
+					t.Fatalf("expected %v, got %v", ErrNotEnoughShards, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("download failed: %v", err)
+			} else if !bytes.Equal(got, data) {
+				t.Fatal("data mismatch")
 			}
 		})
 	}

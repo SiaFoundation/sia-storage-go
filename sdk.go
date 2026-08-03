@@ -131,9 +131,6 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 		}
 		slabHosts = append(slabHosts, sector.HostKey)
 	}
-	if len(slabHosts) < int(slab.MinShards) {
-		return nil, fmt.Errorf("slab has %d sectors with hosts, minimum required: %d: %w", len(slabHosts), slab.MinShards, ErrNotEnoughShards)
-	}
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(ctx)
@@ -146,8 +143,13 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	// the data referenced by the slab slice
 	offset, length := sectorRegion(slab)
 
-	// prioritize hosts
+	// prioritize hosts, dropping any that are no longer usable
 	slabHosts = s.hosts.Prioritize(slabHosts)
+	// check after prioritizing since it removes unusable hosts, leaving
+	// potentially fewer than the initial batch below consumes
+	if len(slabHosts) < int(slab.MinShards) {
+		return nil, fmt.Errorf("slab has %d usable hosts, minimum required: %d: %w", len(slabHosts), slab.MinShards, ErrNotEnoughShards)
+	}
 
 	// helper to launch download
 	type result struct {
