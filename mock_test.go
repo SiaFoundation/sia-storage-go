@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -395,6 +397,7 @@ type mockAppClient struct {
 
 	mu            sync.Mutex
 	pinned        map[slabs.SlabID]slabs.PinnedSlab
+	pinnedAt      map[slabs.SlabID]time.Time
 	objects       map[types.Hash256]slabs.SealedObject
 	deleted       map[types.Hash256]time.Time
 	hostsOverride []hosts.HostInfo
@@ -403,10 +406,11 @@ type mockAppClient struct {
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
 	return &mockAppClient{
-		hosts:   hosts,
-		objects: make(map[types.Hash256]slabs.SealedObject),
-		pinned:  make(map[slabs.SlabID]slabs.PinnedSlab),
-		deleted: make(map[types.Hash256]time.Time),
+		hosts:    hosts,
+		objects:  make(map[types.Hash256]slabs.SealedObject),
+		pinned:   make(map[slabs.SlabID]slabs.PinnedSlab),
+		pinnedAt: make(map[slabs.SlabID]time.Time),
+		deleted:  make(map[types.Hash256]time.Time),
 	}
 }
 
@@ -439,6 +443,9 @@ func (mc *mockAppClient) PinSlabs(_ context.Context, _ types.PrivateKey, toPin .
 			}
 		}
 		mc.pinned[id] = ps
+		// the indexer refreshes the pin timestamp when an existing slab is
+		// pinned again
+		mc.pinnedAt[id] = time.Now()
 	}
 	return
 }
@@ -459,6 +466,7 @@ func (mc *mockAppClient) UnpinSlab(_ context.Context, _ types.PrivateKey, id sla
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	delete(mc.pinned, id)
+	delete(mc.pinnedAt, id)
 	return nil
 }
 
@@ -586,23 +594,40 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 	return nil
 }
 
-func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, _ ...api.URLQueryParameterOption) error {
+// PruneSlabs implements the [appClient] interface. Like the indexer, it only
+// unpins slabs that are unreferenced and were pinned before the cutoff. The
+// cutoff defaults to [api.DefaultSlabPruneCutoff] ago and can be overridden
+// with [api.WithBefore].
+func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts ...api.URLQueryParameterOption) error {
+	values := url.Values{}
+	for _, opt := range opts {
+		opt(values)
+	}
+	cutoff := time.Now().Add(-api.DefaultSlabPruneCutoff)
+	if before := values.Get("before"); before != "" {
+		t, err := time.Parse(time.RFC3339Nano, before)
+		if err != nil {
+			return fmt.Errorf("failed to parse before: %w", err)
+		}
+		cutoff = t
+	}
+
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	used := make(map[slabs.SlabID]slabs.PinnedSlab)
+	used := make(map[slabs.SlabID]bool)
 	for _, obj := range mc.objects {
 		for _, slab := range obj.Slabs {
-			digest := slab.Digest()
-			used[digest] = slabs.PinnedSlab{
-				ID:            digest,
-				EncryptionKey: slab.EncryptionKey,
-				MinShards:     slab.MinShards,
-				Sectors:       slab.Sectors,
-			}
+			used[slab.Digest()] = true
 		}
 	}
-	mc.pinned = used
+	for id := range mc.pinned {
+		if used[id] || !mc.pinnedAt[id].Before(cutoff) {
+			continue
+		}
+		delete(mc.pinned, id)
+		delete(mc.pinnedAt, id)
+	}
 	return nil
 }
 

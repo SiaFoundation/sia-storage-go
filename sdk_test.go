@@ -14,6 +14,7 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/api"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap"
@@ -560,6 +561,55 @@ func TestPinObjectBatching(t *testing.T) {
 			t.Fatal("mismatch", c, expected[i])
 		}
 	}
+}
+
+func TestPruneSlabs(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(30)
+	appMock := newMockAppClient(hostStore)
+	hostMock := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appMock, hostMock, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sdk.Close()
+
+	assertPinned := func(n int) {
+		t.Helper()
+		appMock.mu.Lock()
+		defer appMock.mu.Unlock()
+		if len(appMock.pinned) != n {
+			t.Fatalf("expected %d pinned slabs, got %d", n, len(appMock.pinned))
+		}
+	}
+
+	// pin an object and orphan its slabs by deleting it
+	obj := newTestObject(t, 2)
+	if err := sdk.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	}
+	assertPinned(2)
+	if err := sdk.DeleteObject(t.Context(), obj.ID()); err != nil {
+		t.Fatal(err)
+	}
+
+	// deleting the object does not release its slabs
+	assertPinned(2)
+
+	// the slabs were just pinned, so they are younger than the default cutoff
+	// and pruning leaves them alone
+	if err := sdk.PruneSlabs(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertPinned(2)
+
+	// overriding the cutoff releases them
+	if err := sdk.PruneSlabs(t.Context(), api.WithBefore(time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	assertPinned(0)
 }
 
 func TestRefreshHosts(t *testing.T) {
