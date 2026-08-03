@@ -562,6 +562,44 @@ func TestPinObjectBatching(t *testing.T) {
 	}
 }
 
+func TestUnpinSlab(t *testing.T) {
+	appKey := types.GeneratePrivateKey()
+	hostStore := newMockHostStore(30)
+	appMock := newMockAppClient(hostStore)
+	hostMock := newMockHostClient(hostStore)
+
+	b := newMockBuilder(appMock, hostMock, hostStore)
+	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sdk.Close()
+
+	// pin an object and orphan its slabs by deleting it
+	obj := newTestObject(t, 2)
+	if err := sdk.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	}
+	if err := sdk.DeleteObject(t.Context(), obj.ID()); err != nil {
+		t.Fatal(err)
+	}
+
+	// unpinning releases the slab immediately, without waiting for the prune
+	// cutoff
+	id := obj.Slabs()[0].Digest()
+	if err := sdk.UnpinSlab(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	appMock.mu.Lock()
+	defer appMock.mu.Unlock()
+	if _, ok := appMock.pinned[id]; ok {
+		t.Fatal("expected slab to be unpinned")
+	} else if len(appMock.pinned) != 1 {
+		t.Fatalf("expected 1 pinned slab, got %d", len(appMock.pinned))
+	}
+}
+
 func TestRefreshHosts(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
 	hostStore := newMockHostStore(30)

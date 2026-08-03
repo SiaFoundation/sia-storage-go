@@ -259,6 +259,16 @@ func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
 	return s.app.Account(ctx, s.appKey)
 }
 
+// UnpinSlab removes the slab with the given ID from the account.
+//
+// Unlike [SDK.PruneSlabs], the slab is released immediately regardless of how
+// long ago it was pinned. The caller must ensure the slab is no longer
+// referenced by an object; objects that still reference it can no longer be
+// downloaded. The ID of a slab can be derived with [slabs.SlabSlice.Digest].
+func (s *SDK) UnpinSlab(ctx context.Context, id slabs.SlabID) error {
+	return s.app.UnpinSlab(ctx, s.appKey, id)
+}
+
 // PruneSlabs removes all slabs on the account that are not associated with
 // an object.
 func (s *SDK) PruneSlabs(ctx context.Context, opts ...api.URLQueryParameterOption) error {
