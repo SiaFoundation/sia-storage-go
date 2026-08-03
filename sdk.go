@@ -125,6 +125,14 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex 
 	slabSectors := make(map[types.PublicKey]sectorDownload)
 	slabHosts := make([]types.PublicKey, 0, len(slab.Sectors))
 	for i, sector := range slab.Sectors {
+		if _, ok := slabSectors[sector.HostKey]; ok {
+			// a host should never hold two sectors of the same slab; the
+			// indexer rejects such a slab at pin time. Skipping keeps
+			// slabHosts and slabSectors the same length, so the usable-host
+			// check below and the initial batch agree on how many sectors
+			// are actually reachable.
+			continue
+		}
 		slabSectors[sector.HostKey] = sectorDownload{
 			index:  i,
 			sector: sector,

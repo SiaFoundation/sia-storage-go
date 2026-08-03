@@ -237,3 +237,35 @@ func TestDownloadUnusableHosts(t *testing.T) {
 		})
 	}
 }
+
+// TestDownloadDuplicateHost asserts a slab with two sectors on the same host
+// still downloads. The sectors are keyed by host, so the duplicate collapses
+// and the same shard can be downloaded twice; counting it once keeps recovery
+// from reaching the minimum with a shard still missing.
+func TestDownloadDuplicateHost(t *testing.T) {
+	sdk, hostMock := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 10)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(10, 20)); err != nil {
+		t.Fatal(err)
+	}
+
+	// move the second sector onto the first sector's host, so one host holds
+	// two distinct sectors of the slab. Both roots must live on that host for
+	// the move to be consistent.
+	ss := obj.Slabs()
+	host, moved := ss[0].Sectors[0].HostKey, ss[0].Sectors[1]
+	hostMock.sectorsMu.Lock()
+	hostMock.hostSectors[host][moved.Root] = hostMock.hostSectors[moved.HostKey][moved.Root]
+	hostMock.sectorsMu.Unlock()
+	ss[0].Sectors[1].HostKey = host
+
+	got, err := readAll(sdk.Download(NewUnsafeObject(obj.UnsafeDataKey(), ss)))
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	} else if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+}
