@@ -75,7 +75,7 @@ func (o *Object) Seal(appKey types.PrivateKey) SealedObject {
 
 	so := SealedObject{slabs.SealedObject{
 		EncryptedDataKey:     encryptedDataKey,
-		Slabs:                o.slabs,
+		Slabs:                cloneSlabs(o.slabs),
 		EncryptedMetadataKey: encryptedMetaKey,
 		EncryptedMetadata:    encryptedMetadata,
 		CreatedAt:            o.createdAt,
@@ -94,9 +94,21 @@ func (o *Object) Size() uint64 {
 	return size
 }
 
+// UnsafeDataKey returns the key used to encrypt the object's data.
+//
+// The data key alone decrypts the object's data. Never store it in plaintext
+// and do not reuse it for new objects.
+//
+// Prefer sealing the object with [Object.Seal] instead.
+func (o *Object) UnsafeDataKey() [32]byte {
+	var key [32]byte
+	copy(key[:], o.dataKey)
+	return key
+}
+
 // Slabs returns a copy of the object's slabs.
 func (o *Object) Slabs() []slabs.SlabSlice {
-	return slices.Clone(o.slabs)
+	return cloneSlabs(o.slabs)
 }
 
 // Metadata returns a copy of the object's metadata.
@@ -114,6 +126,38 @@ func NewEmptyObject() Object {
 	now := time.Now()
 	return Object{
 		dataKey:   frand.Bytes(32),
+		createdAt: now,
+		updatedAt: now,
+	}
+}
+
+// NewUnsafeObject creates an Object from a data key and slabs. It can be used
+// together with [Object.UnsafeDataKey] and [Object.Slabs] to reconstruct an
+// object whose key and slabs were stored outside the indexer.
+//
+// This is useful for interoperability with systems such as IPFS or LBRY,
+// where an object's components are persisted separately and the object must
+// be reconstructed from them.
+//
+// Objects produced by [SDK.Upload] are guaranteed to be safe to reconstruct.
+// Others, not so much. Here be dragons.
+//
+// Invariants:
+//   - The data key must be the one that encrypted the slabs. A mismatched key
+//     fails silently: downloads succeed but return garbage.
+//   - Slab keys must never be reused. Reuse compromises encryption.
+//   - Each slab's version must match the version it was encrypted with. A
+//     mislabeled slab decrypts to garbage without error.
+//   - Each slab's offset and length must match how the data was encrypted:
+//     offset seeks the keystream, and slab order defines the object's byte
+//     stream. Wrong values silently corrupt or reorder the data.
+//
+// The returned object has empty metadata and sets CreatedAt/UpdatedAt to time.Now.
+func NewUnsafeObject(dataKey [32]byte, ss []slabs.SlabSlice) Object {
+	now := time.Now()
+	return Object{
+		dataKey:   dataKey[:],
+		slabs:     cloneSlabs(ss),
 		createdAt: now,
 		updatedAt: now,
 	}
@@ -180,6 +224,16 @@ func (s *SDK) CreateSharedObjectURL(ctx context.Context, objectKey types.Hash256
 	return s.app.CreateSharedObjectURL(ctx, s.appKey, obj.ID(), obj.dataKey, validUntil)
 }
 
+// cloneSlabs returns a deep copy of the given slabs, cloning each slab's
+// sectors so the returned slabs share no backing arrays with the originals.
+func cloneSlabs(ss []slabs.SlabSlice) []slabs.SlabSlice {
+	cloned := slices.Clone(ss)
+	for i := range cloned {
+		cloned[i].Sectors = slices.Clone(cloned[i].Sectors)
+	}
+	return cloned
+}
+
 // dataKeyCipher derives the data key cipher from the app key and object ID.
 func dataKeyCipher(appKey types.PrivateKey, objectID types.Hash256) cipher.AEAD {
 	key := keys.Derive(appKey, objectID[:], []byte("dataKey"), 32)
@@ -219,7 +273,7 @@ func unlockEncryptedMetadata(metadataKey, encryptedMeta []byte) (json.RawMessage
 // objectFromSealedObject unlocks a SealedObject using the given app key.
 func objectFromSealedObject(so slabs.SealedObject, appKey types.PrivateKey) (Object, error) {
 	obj := Object{
-		slabs:     slices.Clone(so.Slabs),
+		slabs:     cloneSlabs(so.Slabs),
 		createdAt: so.CreatedAt,
 		updatedAt: so.UpdatedAt,
 	}
