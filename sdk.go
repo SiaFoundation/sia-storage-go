@@ -291,7 +291,7 @@ func (s *SDK) Account(ctx context.Context) (app.AccountResponse, error) {
 //
 // The indexer only considers slabs that were pinned more than
 // [api.DefaultSlabPruneCutoff] ago. Pass [api.WithBefore] to override that
-// cutoff, or use [SDK.UnpinSlab] to release a single slab immediately.
+// cutoff.
 func (s *SDK) PruneSlabs(ctx context.Context, opts ...api.URLQueryParameterOption) error {
 	return s.app.PruneSlabs(ctx, s.appKey, opts...)
 }
