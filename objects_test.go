@@ -3,6 +3,7 @@ package siastorage
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -17,31 +18,43 @@ import (
 // TestObjectID makes sure that we don't accidentally change the way object IDs
 // are computed.
 func TestObjectID(t *testing.T) {
-	so := slabs.SealedObject{
-		EncryptedDataKey:     []byte{1, 2, 3},
-		EncryptedMetadataKey: []byte{3, 2, 1},
-		Slabs: []slabs.SlabSlice{
-			{
-				EncryptionKey: [32]byte{4, 5, 6},
-				MinShards:     1,
-				Sectors: []slabs.PinnedSector{
+	tests := []struct {
+		version uint8
+		id      string
+	}{
+		{0, "92b456fd0320c6595cf40280fafde2e3c549e09f6e7168ebdd963500830f50b5"},
+		{1, "1aa2d2c5fff16d912352646040865ef1fa7dff3e4daf9b66edef09fb0be4021c"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("v%d", tt.version), func(t *testing.T) {
+			so := slabs.SealedObject{
+				EncryptedDataKey:     []byte{1, 2, 3},
+				EncryptedMetadataKey: []byte{3, 2, 1},
+				Slabs: []slabs.SlabSlice{
 					{
-						Root:    [32]byte{7, 8, 9},
-						HostKey: [32]byte{10, 11, 12},
+						Version:       tt.version,
+						EncryptionKey: [32]byte{4, 5, 6},
+						MinShards:     1,
+						Sectors: []slabs.PinnedSector{
+							{
+								Root:    [32]byte{7, 8, 9},
+								HostKey: [32]byte{10, 11, 12},
+							},
+						},
+						Offset: 131415,
+						Length: 161718,
 					},
 				},
-				Offset: 131415,
-				Length: 161718,
-			},
-		},
-		EncryptedMetadata: []byte{19, 20, 21},
-		DataSignature:     types.Signature{22, 23, 24},
-		MetadataSignature: types.Signature{24, 23, 22},
-		CreatedAt:         time.Unix(25, 26),
-		UpdatedAt:         time.Unix(27, 28),
-	}
-	if so.ID().String() != "92b456fd0320c6595cf40280fafde2e3c549e09f6e7168ebdd963500830f50b5" {
-		t.Fatalf("unexpected object ID: %s", so.ID())
+				EncryptedMetadata: []byte{19, 20, 21},
+				DataSignature:     types.Signature{22, 23, 24},
+				MetadataSignature: types.Signature{24, 23, 22},
+				CreatedAt:         time.Unix(25, 26),
+				UpdatedAt:         time.Unix(27, 28),
+			}
+			if so.ID().String() != tt.id {
+				t.Fatalf("unexpected object ID: %s", so.ID())
+			}
+		})
 	}
 }
 
@@ -49,10 +62,10 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 	appKey := types.GeneratePrivateKey()
 
 	ss := []slabs.SlabSlice{
-		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
+		{Version: 1, Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
 			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
 		}},
-		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
+		{Version: 0, Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
 	}
 	obj := Object{
 		dataKey:  frand.Bytes(32),
@@ -97,10 +110,10 @@ func TestSealedObjectRoundtrip(t *testing.T) {
 
 func TestNewUnsafeObject(t *testing.T) {
 	ss := []slabs.SlabSlice{
-		{Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
+		{Version: 1, Offset: 10, Length: 5000, EncryptionKey: frand.Entropy256(), Sectors: []slabs.PinnedSector{
 			{Root: frand.Entropy256(), HostKey: frand.Entropy256()},
 		}},
-		{Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
+		{Version: 0, Offset: 32, Length: 4096, EncryptionKey: frand.Entropy256(), Sectors: nil},
 	}
 	obj := Object{
 		dataKey: frand.Bytes(32),
@@ -212,6 +225,7 @@ func TestObjectEquivalency(t *testing.T) {
 			ss := make([]slabs.SlabSlice, 30)
 			for i := range ss {
 				ss[i] = slabs.SlabSlice{
+					Version:       uint8(i % 2),
 					EncryptionKey: frand.Entropy256(),
 					MinShards:     10,
 					Sectors: func() []slabs.PinnedSector {

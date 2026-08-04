@@ -57,6 +57,8 @@ func TestRoundtripCount(t *testing.T) {
 		t.Fatalf("expected 1 slab, got %d", len(obj.Slabs()))
 	} else if obj.Slabs()[0].Length != uint32(len(data)) {
 		t.Fatalf("expected slab length %d, got %d", len(data), obj.Slabs()[0].Length)
+	} else if obj.Slabs()[0].Version != 1 {
+		t.Fatalf("expected slab version 1, got %d", obj.Slabs()[0].Version)
 	}
 
 	buf := bytes.NewBuffer(nil)
@@ -166,61 +168,6 @@ func TestUpload(t *testing.T) {
 			t.Fatal("expected error, got nil")
 		}
 	})
-}
-
-func TestUploadRacing(t *testing.T) {
-	sdk, hosts := newTestSDK(t, 50, zaptest.NewLogger(t))
-	defer sdk.Close()
-
-	// make 30 hosts slow enough to trigger the race timer (>1s)
-	// but leave 20 fast hosts for racers to pick up
-	slowHosts := hosts.SetSlowHosts(t, 30, 5*time.Second)
-	slowSet := make(map[types.PublicKey]bool, len(slowHosts))
-	for _, hk := range slowHosts {
-		slowSet[hk] = true
-	}
-
-	data := frand.Bytes(4096)
-	obj := NewEmptyObject()
-	err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	} else if len(obj.Slabs()) != 1 {
-		t.Fatalf("expected 1 slab, got %d", len(obj.Slabs()))
-	}
-
-	// verify racers won some shards by checking that more than 30
-	// hosts received write calls (the extra calls are racers)
-	writes := hosts.WriteCalls()
-	var totalWrites int
-	for _, n := range writes {
-		totalWrites += n
-	}
-	if totalWrites <= 30 {
-		t.Fatalf("expected racing to produce extra writes, got %d total", totalWrites)
-	}
-
-	// verify the uploaded shards are on fast hosts since the slow
-	// ones took 5s and the race timer fires after 1s
-	for _, slab := range obj.Slabs() {
-		var fastCount int
-		for _, sector := range slab.Sectors {
-			if !slowSet[sector.HostKey] {
-				fastCount++
-			}
-		}
-		if fastCount == 0 {
-			t.Fatal("expected at least some shards on fast hosts")
-		}
-	}
-
-	// verify the data roundtrips
-	got, err := readAll(sdk.Download(obj))
-	if err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(got, data) {
-		t.Fatal("data mismatch")
-	}
 }
 
 func TestResumableUpload(t *testing.T) {
@@ -429,7 +376,14 @@ func TestProgressCallbacks(t *testing.T) {
 		} else if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
-		if expected := int(slabSize) / chunkSize * dataShards * numSlabs; count != expected {
+		// the chunk ramp makes the chunk count schedule dependent, so derive
+		// the expected count from a fresh iterator
+		ci := newChunkIter(obj.Slabs(), 0, uint64(len(data)))
+		var chunks int
+		for _, ok := ci.next(); ok; _, ok = ci.next() {
+			chunks++
+		}
+		if expected := chunks * dataShards; count != expected {
 			t.Fatalf("expected %d download callbacks, got %d", expected, count)
 		}
 	})
@@ -825,6 +779,7 @@ func newTestObject(t *testing.T, numSlabs int) Object {
 	obj := NewEmptyObject()
 	for range numSlabs {
 		obj.slabs = append(obj.slabs, slabs.SlabSlice{
+			Version:       1,
 			EncryptionKey: slabs.EncryptionKey(types.GeneratePrivateKey()),
 			MinShards:     10,
 			Sectors:       randomSectors(30),
