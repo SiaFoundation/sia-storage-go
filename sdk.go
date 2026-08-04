@@ -3,6 +3,7 @@ package siastorage
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"errors"
 	"fmt"
 	"io"
@@ -311,14 +312,21 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 		return err
 	}
 
-	// encrypt the reader on the fly
-	r = encrypt((*[32]byte)(obj.dataKey), r, obj.Size())
+	if len(obj.dataKey) != 32 {
+		return fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
+	}
+
+	// encrypt the object data with a distinct nonce for each slab; the same
+	// slab key is then used to encrypt the individual shards
+	slabKeys := &slabKeySource{}
+	slabSize := uint64(uo.dataShards) * proto4.SectorSize
+	r = encryptV1((*[32]byte)(obj.dataKey), r, slabKeys, slabSize, 0)
 
 	// start uploading slabs
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
-		s.uploadSlabs(ctx, slabsCh, r, enc, uo)
+		s.uploadSlabs(ctx, slabsCh, r, slabKeys, enc, uo)
 	}()
 
 	// collect uploaded slabs
@@ -346,6 +354,8 @@ func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error
 
 	if len(obj.dataKey) != 32 {
 		return nil, fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
+	} else if err := validateSlabVersions((*[32]byte)(obj.dataKey), obj.slabs); err != nil {
+		return nil, err
 	}
 
 	return s.downloadReader((*[32]byte)(obj.dataKey), obj.slabs, do)
@@ -367,6 +377,13 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 
 	if !do.normalizeRange(obj.Size()) {
 		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	if len(encryptionKey) != 32 {
+		return nil, fmt.Errorf("invalid encryption key length: %d", len(encryptionKey))
+	}
+	if err := validateSlabVersions((*[32]byte)(encryptionKey), obj.Slabs); err != nil {
+		return nil, err
 	}
 
 	return s.downloadReader((*[32]byte)(encryptionKey), obj.Slabs, do)
@@ -513,6 +530,7 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
 		params[i] = slabs.SlabPinParams{
+			Version:       slab.Version,
 			EncryptionKey: slab.EncryptionKey,
 			MinShards:     slab.MinShards,
 			Sectors:       slab.Sectors,
@@ -556,18 +574,26 @@ const (
 // maxChunkSize. It handles byte-range selection internally: offset is a byte
 // offset into the logical stream of all slabs and length limits total output.
 type chunkIter struct {
-	slabs     []slabs.SlabSlice
-	slabIdx   int
-	offset    uint64 // position within current slab
-	remaining uint64 // total bytes left to yield
-	chunkSize uint64 // doubles per chunk up to maxChunkSize
+	slabs        []slabs.SlabSlice
+	slabIdx      int
+	offset       uint64 // position within current slab
+	objectOffset uint64 // position within the object's logical stream
+	remaining    uint64 // total bytes left to yield
+	chunkSize    uint64 // doubles per chunk up to maxChunkSize
+}
+
+type chunkSlab struct {
+	slab         slabs.SlabSlice
+	slabIdx      int
+	objectOffset uint64
 }
 
 func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	ci := &chunkIter{
-		slabs:     ss,
-		remaining: length,
-		chunkSize: initialChunkSize,
+		slabs:        ss,
+		objectOffset: offset,
+		remaining:    length,
+		chunkSize:    initialChunkSize,
 	}
 	for ci.slabIdx < len(ci.slabs) {
 		slabLength := uint64(ci.slabs[ci.slabIdx].Length)
@@ -581,7 +607,7 @@ func newChunkIter(ss []slabs.SlabSlice, offset, length uint64) *chunkIter {
 	return ci
 }
 
-func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
+func (ci *chunkIter) next() (chunkSlab, bool) {
 	for ci.remaining > 0 && ci.slabIdx < len(ci.slabs) {
 		slab := ci.slabs[ci.slabIdx]
 		available := uint64(slab.Length) - ci.offset
@@ -594,17 +620,22 @@ func (ci *chunkIter) next() (slabs.SlabSlice, int, bool) {
 		chunk := slab
 		chunk.Offset = slab.Offset + uint32(ci.offset)
 		chunk.Length = uint32(chunkLen)
-		slabIdx := ci.slabIdx
+		result := chunkSlab{
+			slab:         chunk,
+			slabIdx:      ci.slabIdx,
+			objectOffset: ci.objectOffset,
+		}
 		ci.offset += chunkLen
+		ci.objectOffset += chunkLen
 		if ci.offset >= uint64(slab.Length) {
 			ci.offset = 0
 			ci.slabIdx++
 		}
 		ci.remaining -= chunkLen
 		ci.chunkSize = min(ci.chunkSize*2, maxChunkSize)
-		return chunk, slabIdx, true
+		return result, true
 	}
-	return slabs.SlabSlice{}, 0, false
+	return chunkSlab{}, false
 }
 
 type recoveredChunk struct {
@@ -648,6 +679,32 @@ func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex
 	}, nil
 }
 
+// slabCipherStream returns the cipher stream that decrypts the given chunk's
+// data, returning ErrUnsupportedSlabVersion for versions this SDK cannot
+// decrypt. It is the single source of truth for which slab versions are
+// supported.
+func slabCipherStream(dataKey *[32]byte, chunk chunkSlab) (cipher.Stream, error) {
+	switch chunk.slab.Version {
+	case 0:
+		return newV0CipherStream(dataKey, chunk.objectOffset), nil
+	case 1:
+		return newV1CipherStream(dataKey, (*[32]byte)(&chunk.slab.EncryptionKey), uint64(chunk.slab.Offset)), nil
+	default:
+		return nil, fmt.Errorf("%w: %d", slabs.ErrUnsupportedSlabVersion, chunk.slab.Version)
+	}
+}
+
+// validateSlabVersions rejects slabs this SDK cannot decrypt so downloads fail
+// fast, before any sectors are fetched.
+func validateSlabVersions(dataKey *[32]byte, ss []slabs.SlabSlice) error {
+	for i, slab := range ss {
+		if _, err := slabCipherStream(dataKey, chunkSlab{slab: slab}); err != nil {
+			return fmt.Errorf("slab %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // chunkResult is the decrypted plaintext of a chunk, or the error that
 // prevented recovery.
 type chunkResult struct {
@@ -671,7 +728,6 @@ type chunkDownloader struct {
 	onProgress  func(ShardProgress)
 	bufs        *chunkBufPool
 	chunks      *chunkIter
-	cipherOff   uint64
 
 	// popped counts how many chunks the reader has taken. each chunk task uses
 	// it to tell how close it is to the read head.
@@ -721,7 +777,6 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		onProgress:  do.onProgress,
 		bufs:        newChunkBufPool(),
 		chunks:      newChunkIter(ss, do.offset, do.length),
-		cipherOff:   do.offset,
 		popped:      newChangeCounter(0),
 		sema:        make(chan struct{}, do.maxInflight),
 		results:     make(chan chunkResult, do.maxInflight),
@@ -749,16 +804,14 @@ func (c *chunkDownloader) run() {
 		if c.ctx.Err() != nil {
 			return
 		}
-		chunk, slabIdx, ok := c.chunks.next()
+		chunk, ok := c.chunks.next()
 		if !ok {
 			return
 		}
-		offset := c.cipherOff
-		c.cipherOff += uint64(chunk.Length)
 		if index == 0 {
 			// nothing else is in flight and results has a free slot, so
 			// this neither needs a sema slot nor blocks on the handoff
-			c.deliverChunk(index, chunk, slabIdx, offset)
+			c.deliverChunk(index, chunk)
 			continue
 		}
 		select {
@@ -768,15 +821,15 @@ func (c *chunkDownloader) run() {
 		}
 		wg.Go(func() {
 			defer func() { <-c.sema }()
-			c.deliverChunk(index, chunk, slabIdx, offset)
+			c.deliverChunk(index, chunk)
 		})
 	}
 }
 
 // deliverChunk recovers and decrypts one chunk and hands its result off,
 // returning the pooled buffer if the download was cancelled before the handoff.
-func (c *chunkDownloader) deliverChunk(index int, chunk slabs.SlabSlice, slabIdx int, offset uint64) {
-	data, err := c.recoverAndDecrypt(chunk, slabIdx, index, offset)
+func (c *chunkDownloader) deliverChunk(index int, chunk chunkSlab) {
+	data, err := c.recoverAndDecrypt(index, chunk)
 	if err != nil {
 		// surface the error promptly via the cause instead of
 		// waiting behind slower in-order chunks; first cause wins.
@@ -792,9 +845,14 @@ func (c *chunkDownloader) deliverChunk(index int, chunk slabs.SlabSlice, slabIdx
 }
 
 // recoverAndDecrypt recovers a chunk into a pooled buffer and decrypts it in
-// place at its absolute plaintext offset, so chunks decrypt independently.
-func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex, seq int, cipherOffset uint64) ([]byte, error) {
-	rc, err := c.s.recoverChunk(c.ctx, chunk, slabIndex, seq, c.popped, c.hostTimeout, c.onProgress)
+// place with the cipher stream for its slab version, so chunks decrypt
+// independently.
+func (c *chunkDownloader) recoverAndDecrypt(seq int, chunk chunkSlab) ([]byte, error) {
+	stream, err := slabCipherStream(c.key, chunk)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := c.s.recoverChunk(c.ctx, chunk.slab, chunk.slabIdx, seq, c.popped, c.hostTimeout, c.onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -803,7 +861,7 @@ func (c *chunkDownloader) recoverAndDecrypt(chunk slabs.SlabSlice, slabIndex, se
 		c.bufs.put(out)
 		return nil, err
 	}
-	newRekeyStream(c.key, cipherOffset).XORKeyStream(out, out)
+	stream.XORKeyStream(out, out)
 	return out, nil
 }
 

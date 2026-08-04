@@ -2,6 +2,8 @@ package siastorage
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -62,91 +64,170 @@ func TestOutOfOrderDownload(t *testing.T) {
 }
 
 func TestChunkIter(t *testing.T) {
-	makeSlab := func(length uint32) slabs.SlabSlice {
-		return slabs.SlabSlice{
-			EncryptionKey: frand.Entropy256(),
-			MinShards:     10,
-			Length:        length,
-		}
-	}
-
-	check := func(t *testing.T, chunks []slabs.SlabSlice, length uint64) {
-		t.Helper()
-		var total uint64
-		for i, c := range chunks {
-			if uint64(c.Length) > maxChunkSize {
-				t.Fatalf("chunk %d exceeds maxChunkSize: %d", i, c.Length)
-			}
-			if i > 0 && c.EncryptionKey == chunks[i-1].EncryptionKey {
-				if c.Offset != chunks[i-1].Offset+chunks[i-1].Length {
-					t.Fatalf("chunk %d not contiguous", i)
+	for _, version := range []uint8{0, 1} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			makeSlab := func(length uint32) slabs.SlabSlice {
+				return slabs.SlabSlice{
+					Version:       version,
+					EncryptionKey: frand.Entropy256(),
+					MinShards:     10,
+					Length:        length,
 				}
 			}
-			total += uint64(c.Length)
-		}
-		if total != length {
-			t.Fatalf("total chunk length %d != expected %d", total, length)
-		}
+
+			check := func(t *testing.T, chunks []slabs.SlabSlice, length uint64) {
+				t.Helper()
+				var total uint64
+				for i, c := range chunks {
+					if c.Version != version {
+						t.Fatalf("chunk %d has version %d, expected %d", i, c.Version, version)
+					} else if uint64(c.Length) > maxChunkSize {
+						t.Fatalf("chunk %d exceeds maxChunkSize: %d", i, c.Length)
+					}
+					if i > 0 && c.EncryptionKey == chunks[i-1].EncryptionKey {
+						if c.Offset != chunks[i-1].Offset+chunks[i-1].Length {
+							t.Fatalf("chunk %d not contiguous", i)
+						}
+					}
+					total += uint64(c.Length)
+				}
+				if total != length {
+					t.Fatalf("total chunk length %d != expected %d", total, length)
+				}
+			}
+
+			tests := []struct {
+				name   string
+				slabs  []slabs.SlabSlice
+				offset uint64
+				length uint64
+			}{
+				{
+					name:   "single slab full",
+					slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
+					offset: 0,
+					length: 1 << 20,
+				},
+				{
+					name:   "partial offset",
+					slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2)},
+					offset: 100,
+					length: maxChunkSize + 50,
+				},
+				{
+					name:   "multiple slabs",
+					slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2), makeSlab(maxChunkSize * 3)},
+					offset: 0,
+					length: maxChunkSize*2 + maxChunkSize*3,
+				},
+				{
+					name:   "offset skips first slab",
+					slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(maxChunkSize * 2)},
+					offset: 1000,
+					length: maxChunkSize * 2,
+				},
+				{
+					name:   "span across slabs",
+					slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize), makeSlab(maxChunkSize)},
+					offset: maxChunkSize / 2,
+					length: maxChunkSize,
+				},
+				{
+					name:   "small request",
+					slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 4)},
+					offset: 0,
+					length: 100,
+				},
+				{
+					name:   "zero length",
+					slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize)},
+					offset: 0,
+					length: 0,
+				},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					ci := newChunkIter(tt.slabs, tt.offset, tt.length)
+					var chunks []slabs.SlabSlice
+					objectOffset := tt.offset
+					for c, ok := ci.next(); ok; c, ok = ci.next() {
+						if c.objectOffset != objectOffset {
+							t.Fatalf("expected object offset %d, got %d", objectOffset, c.objectOffset)
+						}
+						chunks = append(chunks, c.slab)
+						objectOffset += uint64(c.slab.Length)
+					}
+					check(t, chunks, tt.length)
+				})
+			}
+		})
+	}
+}
+
+func TestDownloadV0(t *testing.T) {
+	sdk, _ := newTestSDK(t, 12, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	// build a legacy object by applying the v0 object-wide cipher
+	// before sending the data through the unchanged shard upload layer
+	const dataShards = 3
+	slabSize := uint64(proto.SectorSize) * dataShards
+	data := frand.Bytes(int(slabSize) + 4096)
+	obj := NewEmptyObject()
+	uo, enc, err := newUploadOption(WithRedundancy(dataShards, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	slabKeys := &slabKeySource{}
+	encrypted := encryptV0((*[32]byte)(obj.dataKey), bytes.NewReader(data), 0)
+	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	go func() {
+		defer close(slabsCh)
+		sdk.uploadSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
+	}()
+	obj.slabs, err = collectSlabs(t.Context(), slabsCh, uo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range obj.slabs {
+		obj.slabs[i].Version = 0
 	}
 
 	tests := []struct {
 		name   string
-		slabs  []slabs.SlabSlice
 		offset uint64
 		length uint64
 	}{
-		{
-			name:   "single slab full",
-			slabs:  []slabs.SlabSlice{makeSlab(1 << 20)},
-			offset: 0,
-			length: 1 << 20,
-		},
-		{
-			name:   "partial offset",
-			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2)},
-			offset: 100,
-			length: maxChunkSize + 50,
-		},
-		{
-			name:   "multiple slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 2), makeSlab(maxChunkSize * 3)},
-			offset: 0,
-			length: maxChunkSize*2 + maxChunkSize*3,
-		},
-		{
-			name:   "offset skips first slab",
-			slabs:  []slabs.SlabSlice{makeSlab(1000), makeSlab(maxChunkSize * 2)},
-			offset: 1000,
-			length: maxChunkSize * 2,
-		},
-		{
-			name:   "span across slabs",
-			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize), makeSlab(maxChunkSize)},
-			offset: maxChunkSize / 2,
-			length: maxChunkSize,
-		},
-		{
-			name:   "small request",
-			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize * 4)},
-			offset: 0,
-			length: 100,
-		},
-		{
-			name:   "zero length",
-			slabs:  []slabs.SlabSlice{makeSlab(maxChunkSize)},
-			offset: 0,
-			length: 0,
-		},
+		{"full object", 0, uint64(len(data))},
+		{"within slab", 12345, 54321},
+		{"across slabs", slabSize - 1000, 2000},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ci := newChunkIter(tt.slabs, tt.offset, tt.length)
-			var chunks []slabs.SlabSlice
-			for c, _, ok := ci.next(); ok; c, _, ok = ci.next() {
-				chunks = append(chunks, c)
+			got, err := readAll(sdk.Download(obj, WithDownloadRange(tt.offset, tt.length)))
+			if err != nil {
+				t.Fatal(err)
+			} else if !bytes.Equal(got, data[tt.offset:tt.offset+tt.length]) {
+				t.Fatal("data mismatch")
 			}
-			check(t, chunks, tt.length)
 		})
+	}
+}
+
+func TestDownloadUnsupportedSlabVersion(t *testing.T) {
+	sdk, _ := newTestSDK(t, 12, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(4096)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(3, 9)); err != nil {
+		t.Fatal(err)
+	}
+	obj.slabs[0].Version = 2
+
+	// the download must fail fast, before any sectors are fetched
+	if _, err := sdk.Download(obj); !errors.Is(err, slabs.ErrUnsupportedSlabVersion) {
+		t.Fatalf("expected ErrUnsupportedSlabVersion, got %v", err)
 	}
 }
 

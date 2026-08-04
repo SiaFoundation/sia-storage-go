@@ -14,7 +14,6 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
-	"lukechampine.com/frand"
 )
 
 const (
@@ -187,7 +186,7 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 	return uo, enc, nil
 }
 
-func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, enc reedsolomon.Encoder, uo uploadOption) {
+func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
@@ -255,7 +254,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			hosts:         s.hosts,
 			accountKey:    s.appKey,
 			onProgress:    uo.onProgress,
-			encryptionKey: frand.Entropy256(),
+			encryptionKey: slabKeys.key(i),
 			slabIndex:     i,
 			sema:          shardSema,
 			pool:          newUploadPool(s.hosts, candidates, totalShards),
@@ -499,6 +498,7 @@ func collectSlabs(ctx context.Context, ch <-chan slabUpload, uo uploadOption) ([
 		}
 
 		uploaded = append(uploaded, slabs.SlabSlice{
+			Version:       1,
 			EncryptionKey: slab.encryptionKey,
 			MinShards:     uint(uo.dataShards),
 			Sectors:       sectors,
