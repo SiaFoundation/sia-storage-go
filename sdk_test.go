@@ -57,6 +57,8 @@ func TestRoundtripCount(t *testing.T) {
 		t.Fatalf("expected 1 slab, got %d", len(obj.Slabs()))
 	} else if obj.Slabs()[0].Length != uint32(len(data)) {
 		t.Fatalf("expected slab length %d, got %d", len(data), obj.Slabs()[0].Length)
+	} else if obj.Slabs()[0].Version != 1 {
+		t.Fatalf("expected slab version 1, got %d", obj.Slabs()[0].Version)
 	}
 
 	buf := bytes.NewBuffer(nil)
@@ -378,7 +380,7 @@ func TestProgressCallbacks(t *testing.T) {
 		// the expected count from a fresh iterator
 		ci := newChunkIter(obj.Slabs(), 0, uint64(len(data)))
 		var chunks int
-		for _, _, ok := ci.next(); ok; _, _, ok = ci.next() {
+		for _, ok := ci.next(); ok; _, ok = ci.next() {
 			chunks++
 		}
 		if expected := chunks * dataShards; count != expected {
@@ -741,6 +743,7 @@ func newTestObject(t *testing.T, numSlabs int) Object {
 	obj := NewEmptyObject()
 	for range numSlabs {
 		obj.slabs = append(obj.slabs, slabs.SlabSlice{
+			Version:       1,
 			EncryptionKey: slabs.EncryptionKey(types.GeneratePrivateKey()),
 			MinShards:     10,
 			Sectors:       randomSectors(30),

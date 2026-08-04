@@ -38,6 +38,7 @@ type (
 		reader       *io.PipeReader
 		writer       *io.PipeWriter
 		objects      []packedObject
+		slabKeys     *slabKeySource
 		totalWritten int64 // cumulative bytes written to pipe, including dead padding from errored reads
 
 		// orchestration
@@ -77,9 +78,11 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 	default:
 	}
 
-	// create encrypted reader
+	// encrypt this object's data using the key of each slab it crosses as the
+	// nonce; the uploader uses the same keys for the per-shard layer
 	dataKey := frand.Entropy256()
-	r = encrypt(&dataKey, r, 0)
+	offset := u.totalWritten
+	r = encryptV1(&dataKey, r, u.slabKeys, uint64(u.OptimalDataSize()), uint64(offset))
 
 	// spawn goroutine to interrupt io.Copy if context is cancelled
 	done := make(chan struct{})
@@ -97,7 +100,6 @@ func (u *PackedUpload) Add(ctx context.Context, r io.Reader) (int64, error) {
 	}()
 
 	// pipe data into writer
-	offset := u.totalWritten
 	n, err := io.Copy(u.writer, r)
 	close(done) // stop the cancellation goroutine before processing the result
 	u.totalWritten += n
@@ -246,6 +248,7 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 		reader: reader,
 		writer: writer,
 
+		slabKeys:      &slabKeySource{},
 		resultAvailCh: make(chan struct{}),
 		tg:            threadgroup.New(),
 	}
@@ -260,7 +263,9 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabCh)
-		s.uploadSlabs(ctx, slabCh, reader, nil, 0, enc, uo)
+		// Add already encrypted each object's data, so the uploader only needs
+		// the slab keys for the per-shard layer
+		s.uploadSlabs(ctx, slabCh, reader, nil, u.slabKeys, enc, uo)
 	}()
 
 	// collect uploaded slabs in the background, we have to do this to avoid a

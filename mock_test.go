@@ -447,6 +447,7 @@ func (mc *mockAppClient) PinSlabs(_ context.Context, _ types.PrivateKey, toPin .
 
 		ps := slabs.PinnedSlab{
 			ID:            id,
+			Version:       s.Version,
 			EncryptionKey: s.EncryptionKey,
 			MinShards:     s.MinShards,
 			Sectors:       make([]slabs.PinnedSector, len(s.Sectors)),
@@ -558,6 +559,7 @@ func (mc *mockAppClient) SharedObject(_ context.Context, sharedURL string) (slab
 	for _, slab := range obj.Slabs {
 		pinnedSlab := mc.pinned[slab.Digest()]
 		objSlabs = append(objSlabs, slabs.SlabSlice{
+			Version:       pinnedSlab.Version,
 			EncryptionKey: pinnedSlab.EncryptionKey,
 			MinShards:     pinnedSlab.MinShards,
 			Sectors:       pinnedSlab.Sectors,
@@ -615,6 +617,7 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, _ ...
 			digest := slab.Digest()
 			used[digest] = slabs.PinnedSlab{
 				ID:            digest,
+				Version:       slab.Version,
 				EncryptionKey: slab.EncryptionKey,
 				MinShards:     slab.MinShards,
 				Sectors:       slab.Sectors,

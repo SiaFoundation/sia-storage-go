@@ -13,7 +13,6 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
-	"lukechampine.com/frand"
 )
 
 const (
@@ -203,7 +202,12 @@ func readSlab(r io.Reader, buf []byte) (int, error) {
 	return n, nil
 }
 
-func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, key *[32]byte, offset uint64, enc reedsolomon.Encoder, uo uploadOption) {
+// uploadSlabs reads slab-sized chunks from r and uploads each one's shards. The
+// slab keys double as the nonce for the object data and as the key for the
+// per-shard layer. A nil dataKey means r already carries ciphertext, as it does
+// for a packed upload, where each object encrypts its own data before it enters
+// the pipe.
+func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, dataKey *[32]byte, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
@@ -259,7 +263,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			hosts:         s.hosts,
 			accountKey:    s.appKey,
 			onProgress:    uo.onProgress,
-			encryptionKey: frand.Entropy256(),
+			encryptionKey: slabKeys.key(i),
 			slabIndex:     i,
 			sema:          shardSema,
 			pool:          newUploadPool(s.hosts, candidates, totalShards),
@@ -272,13 +276,14 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		// attempts
 		waiting.add(totalShards)
 
-		// encrypt, stripe, and encode off the read loop; a nil key means the
-		// reader already carries ciphertext and encode errors surface through
-		// the shard channel
+		// encrypt, stripe, and encode off the read loop; buf starts at a slab
+		// boundary, so the slab's stream starts at offset 0, and encode errors
+		// surface through the shard channel
 		buf = buf[:n]
-		go func(offset uint64) {
-			if key != nil {
-				newRekeyStream(key, offset).XORKeyStream(buf, buf)
+		go func() {
+			if dataKey != nil {
+				slabKey := su.encryptionKey
+				newV1CipherStream(dataKey, &slabKey, 0).XORKeyStream(buf, buf)
 			}
 			shards := make([][]byte, totalShards)
 			for j := range shards {
@@ -294,8 +299,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			for shardIdx, data := range shards {
 				go su.uploadShard(ctx, shardIdx, data)
 			}
-		}(offset)
-		offset += uint64(n)
+		}()
 
 		// send slab off for collection
 		send(slabUpload{
@@ -533,6 +537,7 @@ func collectSlabs(ctx context.Context, ch <-chan slabUpload, uo uploadOption) ([
 		}
 
 		uploaded = append(uploaded, slabs.SlabSlice{
+			Version:       1,
 			EncryptionKey: slab.encryptionKey,
 			MinShards:     uint(uo.dataShards),
 			Sectors:       sectors,
