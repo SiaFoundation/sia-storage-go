@@ -319,9 +319,9 @@ func TestDownloadUnusableHosts(t *testing.T) {
 }
 
 // TestDownloadDuplicateHost asserts a slab with two sectors on the same host
-// still downloads. The sectors are keyed by host, so the duplicate collapses
-// and the same shard can be downloaded twice; counting it once keeps recovery
-// from reaching the minimum with a shard still missing.
+// still downloads. Sectors are keyed by host in downloadSlab, so duplicate
+// hosts must be skipped when building the sector map to avoid double-counting
+// a single host toward the slab's minimum shards.
 func TestDownloadDuplicateHost(t *testing.T) {
 	sdk, hostMock := newTestSDK(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()
