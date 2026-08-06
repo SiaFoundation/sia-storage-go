@@ -6,7 +6,7 @@ replace go.sia.tech/siastorage => ../
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/vbauerster/mpb/v8 v8.14.0
+	github.com/vbauerster/mpb/v8 v8.15.1
 	go.sia.tech/core v0.21.7
 	go.sia.tech/siastorage v0.0.0-00010101000000-000000000000
 	go.uber.org/zap v1.28.0
