@@ -202,12 +202,24 @@ func readSlab(r io.Reader, buf []byte) (int, error) {
 	return n, nil
 }
 
-// uploadSlabs reads slab-sized chunks from r and uploads each one's shards. The
-// slab keys double as the nonce for the object data and as the key for the
-// per-shard layer. A nil dataKey means r already carries ciphertext, as it does
-// for a packed upload, where each object encrypts its own data before it enters
-// the pipe.
-func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, dataKey *[32]byte, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+// uploadPlaintextSlabs uploads slabs read from r, encrypting each one with
+// dataKey using the slab's key as the nonce.
+func (s *SDK) uploadPlaintextSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, dataKey [32]byte, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+	s.uploadSlabs(ctx, respCh, r, slabKeys, enc, uo, func(slabKey [32]byte, data []byte) {
+		newV1CipherStream(&dataKey, &slabKey, 0).XORKeyStream(data, data)
+	})
+}
+
+// uploadEncryptedSlabs uploads slabs read from r whose object data the caller
+// already encrypted, as PackedUpload.Add does.
+func (s *SDK) uploadEncryptedSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+	s.uploadSlabs(ctx, respCh, r, slabKeys, enc, uo, func([32]byte, []byte) {})
+}
+
+// uploadSlabs reads slab-sized chunks from r, applies encrypt to each one, and
+// uploads its shards. The slab keys double as the nonce for the object data and
+// as the key for the per-shard layer.
+func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption, encrypt func(slabKey [32]byte, data []byte)) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
@@ -281,10 +293,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		// surface through the shard channel
 		buf = buf[:n]
 		go func() {
-			if dataKey != nil {
-				slabKey := su.encryptionKey
-				newV1CipherStream(dataKey, &slabKey, 0).XORKeyStream(buf, buf)
-			}
+			encrypt(su.encryptionKey, buf)
 			shards := make([][]byte, totalShards)
 			for j := range shards {
 				shards[j] = make([]byte, proto4.SectorSize)

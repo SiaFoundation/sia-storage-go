@@ -263,14 +263,12 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabCh)
-		// Add already encrypted each object's data, so the uploader only needs
-		// the slab keys for the per-shard layer
-		s.uploadSlabs(ctx, slabCh, reader, nil, u.slabKeys, enc, uo)
+		s.uploadEncryptedSlabs(ctx, slabCh, reader, u.slabKeys, enc, uo)
 	}()
 
 	// collect uploaded slabs in the background, we have to do this to avoid a
 	// deadlock in PackedUpload.Add since it writes to an unbuffered io.Pipe and
-	// uploadSlabs reads from that pipe
+	// uploadEncryptedSlabs reads from that pipe
 	go func() {
 		defer cancel()
 		uploaded, err := collectSlabs(ctx, slabCh, uo)
