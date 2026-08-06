@@ -9,6 +9,7 @@ import (
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
@@ -269,6 +270,83 @@ func TestSlabRecovery(t *testing.T) {
 				t.Fatalf("data mismatch: got %d bytes, expected %d", len(got), len(expected))
 			}
 		})
+	}
+}
+
+// TestDownloadUnusableHosts asserts a download whose slab has fewer usable
+// hosts than the slab's minimum shards returns an error instead of panicking.
+// Prioritize drops unusable hosts, so the count is only known after it runs.
+func TestDownloadUnusableHosts(t *testing.T) {
+	const (
+		dataShards   = 10
+		parityShards = 20
+		totalShards  = dataShards + parityShards
+	)
+
+	for _, usable := range []int{0, 1, dataShards - 1, dataShards, dataShards + 1, totalShards} {
+		t.Run(fmt.Sprintf("usable=%d", usable), func(t *testing.T) {
+			sdk, _ := newTestSDK(t, totalShards, zaptest.NewLogger(t))
+			defer sdk.Close()
+
+			data := frand.Bytes(int(proto.SectorSize) * dataShards)
+			obj := NewEmptyObject()
+			if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards)); err != nil {
+				t.Fatal(err)
+			}
+
+			// a host is usable only while it is cached, so shrinking the
+			// cache is what an indexer dropping hosts looks like to the SDK
+			var keep []hosts.HostInfo
+			for _, sector := range obj.Slabs()[0].Sectors[:usable] {
+				keep = append(keep, hosts.HostInfo{PublicKey: sector.HostKey, GoodForUpload: true})
+			}
+			sdk.hostsCache.updateHosts(keep)
+
+			got, err := readAll(sdk.Download(obj))
+			if usable < dataShards {
+				if !errors.Is(err, ErrNotEnoughShards) {
+					t.Fatalf("expected %v, got %v", ErrNotEnoughShards, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("download failed: %v", err)
+			} else if !bytes.Equal(got, data) {
+				t.Fatal("data mismatch")
+			}
+		})
+	}
+}
+
+// TestDownloadDuplicateHost asserts a slab with two sectors on the same host
+// still downloads. Sectors are keyed by host in downloadSlab, so duplicate
+// hosts must be skipped when building the sector map to avoid double-counting
+// a single host toward the slab's minimum shards.
+func TestDownloadDuplicateHost(t *testing.T) {
+	sdk, hostMock := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 10)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(10, 20)); err != nil {
+		t.Fatal(err)
+	}
+
+	// move the second sector onto the first sector's host, so one host holds
+	// two distinct sectors of the slab. Both roots must live on that host for
+	// the move to be consistent.
+	ss := obj.Slabs()
+	host, moved := ss[0].Sectors[0].HostKey, ss[0].Sectors[1]
+	hostMock.sectorsMu.Lock()
+	hostMock.hostSectors[host][moved.Root] = hostMock.hostSectors[moved.HostKey][moved.Root]
+	hostMock.sectorsMu.Unlock()
+	ss[0].Sectors[1].HostKey = host
+
+	got, err := readAll(sdk.Download(NewUnsafeObject(obj.UnsafeDataKey(), ss)))
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	} else if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
 	}
 }
 
