@@ -6,7 +6,7 @@ require (
 	github.com/klauspost/reedsolomon v1.14.1
 	go.sia.tech/core v0.21.7
 	go.sia.tech/coreutils v0.23.6-0.20260717131215-dfd89d065259
-	go.sia.tech/indexd v0.4.1
+	go.sia.tech/indexd v0.4.2
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.54.0
 	lukechampine.com/frand v1.5.1
