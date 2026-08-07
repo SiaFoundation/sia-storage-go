@@ -23,12 +23,15 @@ func splitShards(dataShards [][]byte, src []byte) {
 // total.
 func stripedJoin(dst []byte, dataShards [][]byte, skip int) error {
 	written, writeLen := 0, len(dst)
+	if writeLen > 0 && len(dataShards) == 0 {
+		return reedsolomon.ErrTooFewShards
+	}
 	for off := 0; writeLen > 0; off += proto4.LeafSize {
 		for _, shard := range dataShards {
-			if len(shard[off:]) < proto4.LeafSize {
+			if off+proto4.LeafSize > len(shard) {
 				return reedsolomon.ErrShortData
 			}
-			shard = shard[off:][:proto4.LeafSize]
+			shard = shard[off : off+proto4.LeafSize]
 			if skip >= len(shard) {
 				skip -= len(shard)
 				continue
