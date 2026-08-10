@@ -184,7 +184,7 @@ func TestDownloadV0(t *testing.T) {
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
-		sdk.uploadSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
+		sdk.uploadEncryptedSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
 	}()
 	obj.slabs, err = collectSlabs(t.Context(), slabsCh, uo)
 	if err != nil {

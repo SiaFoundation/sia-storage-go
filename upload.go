@@ -1,9 +1,7 @@
 package siastorage
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -11,6 +9,7 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
 	"golang.org/x/crypto/chacha20"
@@ -186,11 +185,46 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 	return uo, enc, nil
 }
 
-func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+// readSlab fills buf and returns the number of bytes read along with the
+// error that ended the read. Unlike io.ReadFull it never rewrites a short read
+// as io.ErrUnexpectedEOF, so a reader failing with that error is not mistaken
+// for a clean io.EOF, and it preserves an error returned by the same read that
+// filled buf.
+func readSlab(r io.Reader, buf []byte) (int, error) {
+	var n int
+	for n < len(buf) {
+		nn, err := r.Read(buf[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// uploadPlaintextSlabs uploads slabs read from r, encrypting each one with
+// dataKey using the slab's key as the nonce.
+func (s *SDK) uploadPlaintextSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, dataKey [32]byte, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+	s.uploadSlabs(ctx, respCh, r, slabKeys, enc, uo, func(slabKey [32]byte, data []byte) {
+		newV1CipherStream(&dataKey, &slabKey, 0).XORKeyStream(data, data)
+	})
+}
+
+// uploadEncryptedSlabs uploads slabs read from r whose object data the caller
+// already encrypted, as PackedUpload.Add does.
+func (s *SDK) uploadEncryptedSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption) {
+	s.uploadSlabs(ctx, respCh, r, slabKeys, enc, uo, func([32]byte, []byte) {})
+}
+
+// uploadSlabs reads slab-sized chunks from r, applies encrypt to each one, and
+// uploads its shards. The slab keys double as the nonce for the object data and
+// as the key for the per-shard layer.
+func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Reader, slabKeys *slabKeySource, enc reedsolomon.Encoder, uo uploadOption, encrypt func(slabKey [32]byte, data []byte)) {
 	// convenience variables
 	dataShards := int(uo.dataShards)
 	parityShards := int(uo.parityShards)
 	totalShards := dataShards + parityShards
+	dataSize := dataShards * proto4.SectorSize
 
 	// create semaphore to limit concurrent shard uploads
 	shardSema := make(chan struct{}, uo.maxInflight)
@@ -207,10 +241,6 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		case respCh <- su:
 		}
 	}
-
-	// buffer the reader since SlabReader reads 64 bytes at a time
-	br := bufio.NewReader(r)
-	sr := NewSlabReader(dataShards, parityShards)
 
 	// read slabs in a loop
 	for i := 0; ctx.Err() == nil; i++ {
@@ -229,27 +259,18 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// read next slab
-		slab, err := sr.ReadSlab(br)
-		if slab.Length == 0 && errors.Is(err, io.EOF) {
-			return
-		} else if err != nil && !errors.Is(err, io.EOF) {
+		// read the next raw slab; io.EOF means the stream ended, every other
+		// error is fatal
+		buf := make([]byte, dataSize)
+		n, err := readSlab(r, buf)
+		last := err == io.EOF
+		if err != nil && !last {
 			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
 			return
-		}
-
-		// count this slab's shards as waiting before encoding so the racing
-		// gate cannot open between buffering and the first upload attempts
-		waiting.add(len(slab.Shards))
-
-		// encode shards
-		if err := enc.Encode(slab.Shards); err != nil {
-			waiting.add(-len(slab.Shards))
-			send(slabUpload{err: fmt.Errorf("failed to encode slab %d shards: %w", i, err)})
+		} else if n == 0 {
 			return
 		}
 
-		// launch uploads for all shards
 		su := shardUpload{
 			hosts:         s.hosts,
 			accountKey:    s.appKey,
@@ -261,16 +282,43 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			shardsCh:      make(chan shard, totalShards),
 			waiting:       waiting,
 		}
-		for shardIdx, data := range slab.Shards {
-			go su.uploadShard(ctx, shardIdx, data)
-		}
+
+		// count this slab's shards as waiting before the encode goroutine starts
+		// so the racing gate cannot open between buffering and the first upload
+		// attempts
+		waiting.add(totalShards)
+
+		// encrypt, stripe, and encode off the read loop; buf starts at a slab
+		// boundary, so the slab's stream starts at offset 0, and encode errors
+		// surface through the shard channel
+		buf = buf[:n]
+		go func() {
+			encrypt(su.encryptionKey, buf)
+			shards := make([][]byte, totalShards)
+			for j := range shards {
+				shards[j] = make([]byte, proto4.SectorSize)
+			}
+			splitShards(shards[:dataShards], buf)
+			if err := enc.Encode(shards); err != nil {
+				// no shard gets its first attempt, so release the whole slab
+				waiting.add(-totalShards)
+				su.shardsCh <- shard{err: fmt.Errorf("failed to encode slab %d shards: %w", su.slabIndex, err)}
+				return
+			}
+			for shardIdx, data := range shards {
+				go su.uploadShard(ctx, shardIdx, data)
+			}
+		}()
 
 		// send slab off for collection
 		send(slabUpload{
 			encryptionKey: su.encryptionKey,
-			length:        uint32(slab.Length),
+			length:        uint32(n),
 			shardsCh:      su.shardsCh,
 		})
+		if last {
+			return
+		}
 	}
 }
 

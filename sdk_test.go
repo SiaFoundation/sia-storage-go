@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"runtime"
@@ -624,14 +625,21 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
+// object size for the transfer benchmarks. at the default most of a run is
+// spent ramping the inflight limit rather than at steady state
+var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")
+
+// host pool for the transfer benchmarks. the default scheme is 10 data and 20
+// parity shards, so a pool of 30 leaves upload no host to choose between
+const benchHosts = 90
+
 func BenchmarkUpload(b *testing.B) {
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-	data := frand.Bytes(benchmarkSize)
+	data := frand.Bytes(*benchSize)
 
 	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
 		b.Helper()
 		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
-			sdk, hosts := newTestSDK(b, 30+timeout, zap.NewNop())
+			sdk, hosts := newTestSDK(b, benchHosts+timeout, zap.NewNop())
 			defer sdk.Close()
 
 			hosts.SetSlowHosts(b, slow, time.Second)       // slow, but not too slow
@@ -641,7 +649,7 @@ func BenchmarkUpload(b *testing.B) {
 			sdk.refreshHosts(b.Context(), true)
 
 			r := bytes.NewReader(data)
-			b.SetBytes(benchmarkSize)
+			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
 				r.Reset(data)
@@ -667,11 +675,10 @@ func BenchmarkUpload(b *testing.B) {
 }
 
 func BenchmarkDownload(b *testing.B) {
-	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	sdk, hosts := newTestSDK(b, benchHosts, zap.NewNop())
 	defer sdk.Close()
 
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-	data := frand.Bytes(benchmarkSize)
+	data := frand.Bytes(*benchSize)
 	obj := NewEmptyObject()
 	err := sdk.Upload(b.Context(), &obj, bytes.NewReader(data))
 	if err != nil {
@@ -688,18 +695,22 @@ func BenchmarkDownload(b *testing.B) {
 			// NOTE: refreshing hosts makes all benchmarks roughly equal
 			sdk.refreshHosts(b.Context(), true)
 
-			buf := bytes.NewBuffer(nil)
-			b.SetBytes(benchmarkSize)
+			// discard through a reusable buffer like the Rust benchmark's sink
+			buf := make([]byte, 1<<20) // 1 MiB
+			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
-				buf.Reset()
 				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
-				if _, err := io.Copy(buf, rc); err != nil {
-					rc.Close()
-					b.Fatalf("failed to download: %v", err)
+				for {
+					if _, err := rc.Read(buf); err == io.EOF {
+						break
+					} else if err != nil {
+						rc.Close()
+						b.Fatalf("failed to download: %v", err)
+					}
 				}
 				rc.Close()
 			}
@@ -722,11 +733,10 @@ func BenchmarkDownload(b *testing.B) {
 // including occasional stragglers — which, unlike the fixed per-host delays in
 // BenchmarkDownload, prioritization and racing cannot route around.
 func BenchmarkDownloadJitter(b *testing.B) {
-	sdk, hosts := newTestSDK(b, 30, zap.NewNop())
+	sdk, hosts := newTestSDK(b, benchHosts, zap.NewNop())
 	defer sdk.Close()
 
-	const benchmarkSize = 256 * 1000 * 1000 // 256 MB
-	data := frand.Bytes(benchmarkSize)
+	data := frand.Bytes(*benchSize)
 	obj := NewEmptyObject()
 	err := sdk.Upload(b.Context(), &obj, bytes.NewReader(data))
 	if err != nil {
@@ -743,18 +753,22 @@ func BenchmarkDownloadJitter(b *testing.B) {
 
 	for _, inflight := range []int{30, 80} {
 		b.Run(fmt.Sprintf("inflight %d", inflight), func(b *testing.B) {
-			buf := bytes.NewBuffer(nil)
-			b.SetBytes(benchmarkSize)
+			// discard through a reusable buffer like the Rust benchmark's sink
+			buf := make([]byte, 1<<20) // 1 MiB
+			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
-				buf.Reset()
 				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
-				if _, err := io.Copy(buf, rc); err != nil {
-					rc.Close()
-					b.Fatalf("failed to download: %v", err)
+				for {
+					if _, err := rc.Read(buf); err == io.EOF {
+						break
+					} else if err != nil {
+						rc.Close()
+						b.Fatalf("failed to download: %v", err)
+					}
 				}
 				rc.Close()
 			}

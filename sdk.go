@@ -330,17 +330,15 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 		return fmt.Errorf("invalid data key length: %d", len(obj.dataKey))
 	}
 
-	// encrypt the object data with a distinct nonce for each slab; the same
+	// the object data is encrypted with a distinct nonce for each slab; the same
 	// slab key is then used to encrypt the individual shards
 	slabKeys := &slabKeySource{}
-	slabSize := uint64(uo.dataShards) * proto4.SectorSize
-	r = encryptV1((*[32]byte)(obj.dataKey), r, slabKeys, slabSize, 0)
 
-	// start uploading slabs
+	// start uploading slabs; the workers encrypt each slab in place
 	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
 	go func() {
 		defer close(slabsCh)
-		s.uploadSlabs(ctx, slabsCh, r, slabKeys, enc, uo)
+		s.uploadPlaintextSlabs(ctx, slabsCh, r, obj.UnsafeDataKey(), slabKeys, enc, uo)
 	}()
 
 	// collect uploaded slabs
@@ -1031,35 +1029,6 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 	wg.Wait()
 
 	s.log.Debug("warmed up hosts", zap.Uint64("n", warmed.Load()))
-	return nil
-}
-
-// stripedJoin joins the striped data shards, writing them to dst. The first 'skip'
-// bytes of the recovered data are skipped, and len(dst) bytes are written in
-// total.
-func stripedJoin(dst []byte, dataShards [][]byte, skip int) error {
-	written, writeLen := 0, len(dst)
-	for off := 0; writeLen > 0; off += proto4.LeafSize {
-		for _, shard := range dataShards {
-			if len(shard[off:]) < proto4.LeafSize {
-				return reedsolomon.ErrShortData
-			}
-			shard = shard[off:][:proto4.LeafSize]
-			if skip >= len(shard) {
-				skip -= len(shard)
-				continue
-			} else if skip > 0 {
-				shard = shard[skip:]
-				skip = 0
-			}
-			if writeLen < len(shard) {
-				shard = shard[:writeLen]
-			}
-			n := copy(dst[written:], shard)
-			written += n
-			writeLen -= n
-		}
-	}
 	return nil
 }
 
