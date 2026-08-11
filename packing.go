@@ -260,7 +260,7 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	}
 
 	// upload slabs in background
-	slabCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	slabCh := make(chan slabUpload, uo.maxBufferedSlabs)
 	go func() {
 		defer close(slabCh)
 		s.uploadEncryptedSlabs(ctx, slabCh, reader, u.slabKeys, enc, uo)

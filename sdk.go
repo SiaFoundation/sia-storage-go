@@ -68,10 +68,12 @@ type (
 
 	downloadOption struct {
 		hostTimeout time.Duration
-		maxInflight int
-		offset      uint64
-		length      uint64
-		onProgress  func(ShardProgress)
+		// maxBufferedChunks is the memory ceiling for the download, in chunks.
+		// Zero derives it from the memory budget.
+		maxBufferedChunks int
+		offset            uint64
+		length            uint64
+		onProgress        func(ShardProgress)
 	}
 
 	// A ShardProgress reports the result of a successfully completed
@@ -118,7 +120,7 @@ type sectorDownload struct {
 	sector slabs.PinnedSector
 }
 
-func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
+func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, timeout time.Duration, onProgress func(ShardProgress)) ([][]byte, error) {
 	if slab.MinShards == 0 {
 		return nil, errors.New("invalid slab: min shards cannot be 0")
 	} else if int(slab.MinShards) > len(slab.Sectors) {
@@ -177,11 +179,19 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 		release := s.hosts.TrackInflightRead(d.sector.HostKey)
 		wg.Go(func() {
 			defer release()
+			permit := limiter.sample()
 			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
 			start := time.Now()
 			_, err := s.hosts.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+			elapsed := time.Since(start)
+			// a read aborted because the chunk already had enough shards
+			// measured the cancellation, not the network, so it is not a
+			// congestion signal
+			if ctx.Err() == nil {
+				limiter.record(permit, elapsed, err == nil)
+			}
 			select {
 			case <-ctx.Done():
 			case responseCh <- result{
@@ -189,7 +199,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 				buf:     buf.Bytes(),
 				err:     err,
 				hostKey: d.sector.HostKey,
-				elapsed: time.Since(start),
+				elapsed: elapsed,
 			}:
 			}
 			// a host only gets demoted when it hits the shard timeout. reads
@@ -335,7 +345,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	slabKeys := &slabKeySource{}
 
 	// start uploading slabs; the workers encrypt each slab in place
-	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	slabsCh := make(chan slabUpload, uo.maxBufferedSlabs)
 	go func() {
 		defer close(slabsCh)
 		s.uploadPlaintextSlabs(ctx, slabsCh, r, obj.UnsafeDataKey(), slabKeys, enc, uo)
@@ -355,9 +365,9 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 // reader cancels the underlying download. Callers must always Close the
 // returned reader to release resources.
 func (s *SDK) Download(obj Object, opts ...DownloadOption) (io.ReadCloser, error) {
-	do := defaultDownloadOption(obj.Size())
-	for _, opt := range opts {
-		opt(&do)
+	do, err := newDownloadOption(obj.Size(), opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	if !do.normalizeRange(obj.Size()) {
@@ -382,9 +392,9 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 		return nil, err
 	}
 
-	do := defaultDownloadOption(obj.Size())
-	for _, opt := range opts {
-		opt(&do)
+	do, err := newDownloadOption(obj.Size(), opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	if !do.normalizeRange(obj.Size()) {
@@ -405,9 +415,6 @@ func (s *SDK) DownloadSharedObject(ctx context.Context, sharedURL string, opts .
 // reader, so the first bytes are ready as early as possible. Closing the
 // returned reader cancels any chunk downloads in flight.
 func (s *SDK) downloadReader(key *[32]byte, ss []slabs.SlabSlice, do downloadOption) (io.ReadCloser, error) {
-	if do.maxInflight <= 0 {
-		return nil, errors.New("download inflight must be greater than 0")
-	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	chunks := newChunkDownloader(ctx, cancel, s, key, ss, do)
 	chunks.start()
@@ -511,13 +518,26 @@ func (d *downloadStream) Close() error {
 	return nil
 }
 
-func defaultDownloadOption(maxLength uint64) downloadOption {
-	return downloadOption{
-		hostTimeout: 60 * time.Second, // long to handle slow hosts, racing will ensure we don't waste time unnecessarily
-		maxInflight: 80,               // ~20 MiB in memory
-		offset:      0,
-		length:      maxLength,
+// newDownloadOption creates a downloadOption for an object of the given size
+// with defaults, applies the given options, and validates them.
+func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOption, error) {
+	do := downloadOption{
+		hostTimeout: 60 * time.Second, // long to handle slow hosts; racing routes around stragglers
+		length:      objectSize,
 	}
+	for _, opt := range opts {
+		opt(&do)
+	}
+
+	if do.maxBufferedChunks < 0 {
+		return do, fmt.Errorf("max buffered chunks must not be negative, got %d", do.maxBufferedChunks)
+	} else if do.maxBufferedChunks == 0 {
+		do.maxBufferedChunks = defaultChunksInMemory()
+	}
+	// a chunk holds a single permit, so the budget is already a capacity
+	do.maxBufferedChunks = clampBufferBudget(do.maxBufferedChunks, 1)
+
+	return do, nil
 }
 
 // normalizeRange clamps the download range to the object size. Returns
@@ -571,6 +591,12 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 }
 
 const (
+	// initialDownloadInflight is the number of chunk recoveries allowed in
+	// flight before the controller has measured anything, and
+	// minDownloadInflight is the floor it may back off to.
+	initialDownloadInflight = 8
+	minDownloadInflight     = 1
+
 	// initialChunkSize is the size of a download's first chunk. Starting
 	// small keeps the time to first byte low, since the first chunk only
 	// needs a tiny read from each host.
@@ -656,8 +682,8 @@ type recoveredChunk struct {
 	writeLen int
 }
 
-func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
-	shards, err := s.downloadSlab(ctx, chunk, slabIndex, seq, popped, hostTimeout, onProgress)
+func (s *SDK) recoverChunk(ctx context.Context, chunk slabs.SlabSlice, slabIndex, seq int, popped *changeCounter, limiter *inflightLimiter, hostTimeout time.Duration, onProgress func(ShardProgress)) (recoveredChunk, error) {
+	shards, err := s.downloadSlab(ctx, chunk, slabIndex, seq, popped, limiter, hostTimeout, onProgress)
 	if err != nil {
 		return recoveredChunk{}, fmt.Errorf("failed to download slab: %w", err)
 	}
@@ -720,9 +746,10 @@ func validateSlabVersions(dataKey *[32]byte, ss []slabs.SlabSlice) error {
 // chunkResult is the decrypted plaintext of a chunk, or the error that
 // prevented recovery.
 type chunkResult struct {
-	index int
-	data  []byte // pooled; returned via bufs.put once consumed
-	err   error
+	index   int
+	data    []byte // pooled; returned via bufs.put once consumed
+	err     error
+	release func() // frees the chunk's limiter permit once consumed
 }
 
 // chunkDownloader recovers and decrypts chunks concurrently and yields their
@@ -745,7 +772,7 @@ type chunkDownloader struct {
 	// it to tell how close it is to the read head.
 	popped *changeCounter
 
-	sema    chan struct{}    // bounds concurrent chunk recoveries to maxInflight
+	limiter *inflightLimiter // adapts the number of concurrent chunk recoveries
 	results chan chunkResult // recovered chunks, in completion order
 
 	once sync.Once
@@ -780,6 +807,12 @@ func (p *chunkBufPool) put(buf []byte) {
 // newChunkDownloader builds a chunkDownloader; the caller launches its
 // dispatcher via start.
 func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *SDK, key *[32]byte, ss []slabs.SlabSlice, do downloadOption) *chunkDownloader {
+	// the controller samples sector reads but limits chunk recoveries, and each
+	// recovery issues about MinShards reads, so scale its window accordingly
+	scale := 1
+	if len(ss) > 0 {
+		scale = int(ss[0].MinShards)
+	}
 	return &chunkDownloader{
 		s:           s,
 		ctx:         ctx,
@@ -790,8 +823,8 @@ func newChunkDownloader(ctx context.Context, cancel context.CancelCauseFunc, s *
 		bufs:        newChunkBufPool(),
 		chunks:      newChunkIter(ss, do.offset, do.length),
 		popped:      newChangeCounter(0),
-		sema:        make(chan struct{}, do.maxInflight),
-		results:     make(chan chunkResult, do.maxInflight),
+		limiter:     newInflightLimiter(initialDownloadInflight, minDownloadInflight, do.maxBufferedChunks, scale, s.log),
+		results:     make(chan chunkResult, do.maxBufferedChunks),
 		done:        make(chan struct{}),
 		completed:   make(map[int]chunkResult),
 	}
@@ -801,11 +834,10 @@ func (c *chunkDownloader) start() {
 	c.once.Do(func() { go c.run() })
 }
 
-// run walks the chunks in order, acquiring a sema slot for each before spawning
-// a goroutine to recover it. The slot is held until the result is handed off,
-// so a stalled consumer backpressures recoveries. The first chunk is recovered
-// synchronously for fast TTFB, so its host reads never queue behind reads for
-// the other inflight chunks.
+// run walks chunks in order and admits each at the controller's current limit.
+// The permit is held until the reader consumes the result, bounding buffered
+// memory as well as active recovery. The first chunk is recovered synchronously
+// for fast TTFB, so its host reads never queue behind later chunks.
 func (c *chunkDownloader) run() {
 	var wg sync.WaitGroup
 	defer close(c.done)
@@ -820,27 +852,24 @@ func (c *chunkDownloader) run() {
 		if !ok {
 			return
 		}
-		if index == 0 {
-			// nothing else is in flight and results has a free slot, so
-			// this neither needs a sema slot nor blocks on the handoff
-			c.deliverChunk(index, chunk)
-			continue
-		}
-		select {
-		case c.sema <- struct{}{}:
-		case <-c.ctx.Done():
+		release, ok := c.limiter.acquire(c.ctx)
+		if !ok {
 			return
 		}
+		if index == 0 {
+			c.deliverChunk(index, chunk, release)
+			continue
+		}
 		wg.Go(func() {
-			defer func() { <-c.sema }()
-			c.deliverChunk(index, chunk)
+			c.deliverChunk(index, chunk, release)
 		})
 	}
 }
 
-// deliverChunk recovers and decrypts one chunk and hands its result off,
-// returning the pooled buffer if the download was cancelled before the handoff.
-func (c *chunkDownloader) deliverChunk(index int, chunk chunkSlab) {
+// deliverChunk recovers and decrypts one chunk and hands its result off along
+// with the permit the reader releases once it consumes it. If the download was
+// cancelled first, the permit and the pooled buffer are released here instead.
+func (c *chunkDownloader) deliverChunk(index int, chunk chunkSlab, release func()) {
 	data, err := c.recoverAndDecrypt(index, chunk)
 	if err != nil {
 		// surface the error promptly via the cause instead of
@@ -848,8 +877,9 @@ func (c *chunkDownloader) deliverChunk(index int, chunk chunkSlab) {
 		c.cancel(err)
 	}
 	select {
-	case c.results <- chunkResult{index: index, data: data, err: err}:
+	case c.results <- chunkResult{index: index, data: data, err: err, release: release}:
 	case <-c.ctx.Done():
+		release()
 		if data != nil {
 			c.bufs.put(data)
 		}
@@ -864,7 +894,7 @@ func (c *chunkDownloader) recoverAndDecrypt(seq int, chunk chunkSlab) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	rc, err := c.s.recoverChunk(c.ctx, chunk.slab, chunk.slabIdx, seq, c.popped, c.hostTimeout, c.onProgress)
+	rc, err := c.s.recoverChunk(c.ctx, chunk.slab, chunk.slabIdx, seq, c.popped, c.limiter, c.hostTimeout, c.onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -888,6 +918,7 @@ func (c *chunkDownloader) nextChunk() ([]byte, error) {
 	for {
 		if r, ok := c.completed[c.next]; ok {
 			delete(c.completed, c.next)
+			r.release()
 			if r.err != nil {
 				return nil, c.fail(r.err)
 			}
@@ -920,8 +951,8 @@ func (c *chunkDownloader) fail(err error) error {
 	return c.err
 }
 
-// close cancels the download and waits for its goroutines to exit; outstanding
-// buffers are left for the GC.
+// close cancels the download and waits for its goroutines to exit. Outstanding
+// result buffers and limiter permits become unreachable with the downloader.
 func (c *chunkDownloader) close() {
 	c.cancel(nil)
 	// ensure the dispatcher was launched so done is guaranteed to close; if it
@@ -1062,12 +1093,13 @@ func WithRedundancy(dataShards, parityShards uint8) UploadOption {
 	}
 }
 
-// WithUploadInflight sets the maximum number of concurrent shard uploads.
-// This is useful to reduce bandwidth consumption, but will decrease
-// performance.
-func WithUploadInflight(maxInflight int) UploadOption {
+// WithUploadMaxBufferedSlabs sets the maximum number of fully encoded slabs
+// held in memory. Upload concurrency adapts to network conditions up to that
+// ceiling. Each slab uses (dataShards+parityShards) * 4 MiB; zero uses the
+// default, roughly 10% of the memory available to the process.
+func WithUploadMaxBufferedSlabs(maxBufferedSlabs int) UploadOption {
 	return func(uo *uploadOption) {
-		uo.maxInflight = maxInflight
+		uo.maxBufferedSlabs = maxBufferedSlabs
 	}
 }
 
@@ -1088,11 +1120,13 @@ func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 	}
 }
 
-// WithDownloadInflight sets the maximum number of concurrent chunk
-// downloads. The default is 80.
-func WithDownloadInflight(maxInflight int) DownloadOption {
+// WithDownloadMaxBufferedChunks sets the maximum number of chunks held in
+// memory. Download concurrency adapts to network conditions up to that ceiling.
+// Each chunk uses up to 1 MiB; zero uses the default, roughly 10% of the memory
+// available to the process.
+func WithDownloadMaxBufferedChunks(maxBufferedChunks int) DownloadOption {
 	return func(do *downloadOption) {
-		do.maxInflight = maxInflight
+		do.maxBufferedChunks = maxBufferedChunks
 	}
 }
 

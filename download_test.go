@@ -2,6 +2,7 @@ package siastorage
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -37,6 +38,44 @@ func TestDownloadInflight(t *testing.T) {
 	hosts.waitInflightDrained(t)
 }
 
+func TestDownloadMaxBufferedChunks(t *testing.T) {
+	sdk, _ := newTestSDK(t, 10, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	if _, err := sdk.Download(NewEmptyObject(), WithDownloadMaxBufferedChunks(-1)); err == nil {
+		t.Fatal("expected a negative max buffered chunks to fail")
+	}
+
+	// zero derives the budget from the available memory
+	if do, err := newDownloadOption(1, WithDownloadMaxBufferedChunks(0)); err != nil {
+		t.Fatal(err)
+	} else if do.maxBufferedChunks != defaultChunksInMemory() {
+		t.Fatal("unexpected default max buffered chunks", do.maxBufferedChunks)
+	}
+
+	// an absurd budget is clamped to the controller's ceiling, so the queues
+	// sized from it cannot outgrow the limit it can reach
+	if do, err := newDownloadOption(1, WithDownloadMaxBufferedChunks(maxInflightLimit+1)); err != nil {
+		t.Fatal(err)
+	} else if do.maxBufferedChunks != maxInflightLimit {
+		t.Fatal("max buffered chunks not clamped", do.maxBufferedChunks)
+	}
+
+	// the buffered chunk budget caps the adaptive limit
+	do, err := newDownloadOption(1, WithDownloadMaxBufferedChunks(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(nil)
+	downloader := newChunkDownloader(ctx, cancel, sdk, new([32]byte), []slabs.SlabSlice{{MinShards: 10}}, do)
+	if got := downloader.limiter.controller.capacity; got != 3 {
+		t.Fatalf("expected capacity 3, got %d", got)
+	} else if got := downloader.limiter.controller.currentLimit(); got != 3 {
+		t.Fatalf("expected initial limit clamped to 3, got %d", got)
+	}
+}
+
 func TestOutOfOrderDownload(t *testing.T) {
 	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()
@@ -56,7 +95,7 @@ func TestOutOfOrderDownload(t *testing.T) {
 		}
 	}
 
-	got, err := readAll(sdk.Download(obj, WithDownloadInflight(40)))
+	got, err := readAll(sdk.Download(obj, WithDownloadMaxBufferedChunks(40)))
 	if err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, data) {
@@ -181,7 +220,7 @@ func TestDownloadV0(t *testing.T) {
 	}
 	slabKeys := &slabKeySource{}
 	encrypted := encryptV0((*[32]byte)(obj.dataKey), bytes.NewReader(data), 0)
-	slabsCh := make(chan slabUpload, uo.maxConcurrentSlabs())
+	slabsCh := make(chan slabUpload, uo.maxBufferedSlabs)
 	go func() {
 		defer close(slabsCh)
 		sdk.uploadEncryptedSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
@@ -405,7 +444,8 @@ func TestDownloadRacing(t *testing.T) {
 	start = time.Now()
 
 	// assert the chunk waited for the slow host instead of racing
-	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, time.Minute, nil); err != nil {
+	limiter := newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
 		t.Fatal(err)
 	} else if elapsed := time.Since(start); elapsed < 1200*time.Millisecond {
 		t.Fatal("gated chunk should have waited, not raced", elapsed)
@@ -421,7 +461,8 @@ func TestDownloadRacing(t *testing.T) {
 	start = time.Now()
 
 	// assert racing started when the window opened, not after the slow delay
-	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, time.Minute, nil); err != nil {
+	limiter = newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, raceWindow, popped, limiter, time.Minute, nil); err != nil {
 		t.Fatal(err)
 	} else if elapsed := time.Since(start); elapsed < 190*time.Millisecond {
 		t.Fatal("raced before the window opened", elapsed)

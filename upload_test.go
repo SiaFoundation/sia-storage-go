@@ -90,12 +90,20 @@ func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCou
 	}
 	hosts.SetSlowHostKeys([]types.PublicKey{slow}, slowDelay)
 
+	// one slab of four shards, all of which this shard's attempts may use
+	limiter := newInflightLimiter(initialUploadInflight, minUploadInflight, 4, 1, zaptest.NewLogger(t))
+	slabCommitment, ok := limiter.commit(t.Context(), 4)
+	if !ok {
+		t.Fatal("failed to commit slab memory")
+	}
+
 	candidates := append([]types.PublicKey{slow}, fast...)
 	su := &shardUpload{
 		hosts:      hosts,
 		accountKey: sdk.appKey,
-		sema:       make(chan struct{}, 4),
+		limiter:    limiter,
 		pool:       newUploadPool(hosts, candidates, 1),
+		commitment: slabCommitment,
 		shardsCh:   make(chan shard, 1),
 		waiting:    waiting,
 	}
@@ -206,10 +214,20 @@ func TestUploadGateReleasedOnCancel(t *testing.T) {
 	waiting := newChangeCounter(0)
 	su, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
 
-	// fill the semaphore so the initial permit acquire blocks
-	for range cap(su.sema) {
-		su.sema <- struct{}{}
+	// fill the limiter so the initial permit acquire blocks
+	var releases []func()
+	for range su.limiter.controller.currentLimit() {
+		release, ok := su.limiter.tryAcquire()
+		if !ok {
+			t.Fatal("failed to fill limiter")
+		}
+		releases = append(releases, release)
 	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
 
 	waiting.add(1)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -228,6 +246,36 @@ func TestUploadGateReleasedOnCancel(t *testing.T) {
 		t.Fatal("expected cancellation error")
 	} else if waiting.load() != 0 {
 		t.Fatal("waiting gate leaked", waiting.load())
+	}
+}
+
+func TestUploadMaxBufferedSlabs(t *testing.T) {
+	if _, _, err := newUploadOption(WithUploadMaxBufferedSlabs(-1)); err == nil {
+		t.Fatal("expected a negative max buffered slabs to fail")
+	}
+
+	// zero derives the budget from the available memory
+	if uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(0), WithRedundancy(10, 20)); err != nil {
+		t.Fatal(err)
+	} else if uo.maxBufferedSlabs != defaultSlabsInMemory(30) {
+		t.Fatal("unexpected default max buffered slabs", uo.maxBufferedSlabs)
+	}
+
+	if uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(3)); err != nil {
+		t.Fatal(err)
+	} else if uo.maxBufferedSlabs != 3 {
+		t.Fatal("unexpected max buffered slabs", uo.maxBufferedSlabs)
+	}
+
+	// an absurd budget is clamped so the shard capacity it converts to stays
+	// within the controller's ceiling, keeping the queues sized from it in step
+	uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(maxInflightLimit+1), WithRedundancy(10, 20))
+	if err != nil {
+		t.Fatal(err)
+	} else if want := maxInflightLimit / 30; uo.maxBufferedSlabs != want {
+		t.Fatalf("expected max buffered slabs clamped to %d, got %d", want, uo.maxBufferedSlabs)
+	} else if capacity := uo.maxBufferedSlabs * 30; capacity > maxInflightLimit {
+		t.Fatal("clamped slab budget still exceeds the inflight ceiling", capacity)
 	}
 }
 

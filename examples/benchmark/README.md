@@ -19,19 +19,19 @@ successive writes during the download.
 
 ## Flags
 
-| Flag                      | Description                                         | Default               |
-|---------------------------|-----------------------------------------------------|-----------------------|
-| `-size`                   | Size of the data to upload and download, in bytes.  | `125829120` (120 MiB) |
-| `-upload-max-inflight`    | Maximum number of concurrent shard uploads.         | `0` (SDK default)     |
-| `-download-max-inflight`  | Maximum number of concurrent chunk downloads.       | `0` (SDK default)     |
+| Flag                            | Description                                         | Default               |
+|---------------------------------|-----------------------------------------------------|-----------------------|
+| `-size`                         | Size of the data to upload and download, in bytes.  | `125829120` (120 MiB) |
+| `-upload-max-buffered-slabs`    | Maximum number of encoded slabs buffered in memory. | `0` (SDK default)     |
+| `-download-max-buffered-chunks` | Maximum number of chunks buffered in memory.        | `0` (SDK default)     |
 
 ## Example
 
-Run the benchmark with 10 GiB of data, 16 concurrent uploaders and 32 concurrent
-downloaders:
+Run the benchmark with 10 GiB of data, allowing up to 16 encoded slabs and 32
+download chunks in memory:
 
 ```sh
-go run ./examples/benchmark -size $((10 * 1024 * 1024 * 1024)) -upload-max-inflight 16 -download-max-inflight 32
+go run ./examples/benchmark -size $((10 * 1024 * 1024 * 1024)) -upload-max-buffered-slabs 16 -download-max-buffered-chunks 32
 ```
 
 Follow the printed URL to authorize the app, then paste your recovery phrase

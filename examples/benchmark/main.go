@@ -493,7 +493,7 @@ func listProfiles() error {
 	return nil
 }
 
-func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadMaxInflight, downloadMaxInflight int, hostSummary bool) error {
+func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadMaxBufferedSlabs, downloadMaxBufferedChunks int, hostSummary bool) error {
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return fmt.Errorf("failed to generate seed: %w", err)
@@ -518,8 +518,8 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 			uploadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
 		}),
 	}
-	if uploadMaxInflight > 0 {
-		uploadOpts = append(uploadOpts, siastorage.WithUploadInflight(uploadMaxInflight))
+	if uploadMaxBufferedSlabs > 0 {
+		uploadOpts = append(uploadOpts, siastorage.WithUploadMaxBufferedSlabs(uploadMaxBufferedSlabs))
 	}
 
 	obj := siastorage.NewEmptyObject()
@@ -561,8 +561,8 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 			downloadHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
 		}),
 	}
-	if downloadMaxInflight > 0 {
-		downloadOpts = append(downloadOpts, siastorage.WithDownloadInflight(downloadMaxInflight))
+	if downloadMaxBufferedChunks > 0 {
+		downloadOpts = append(downloadOpts, siastorage.WithDownloadMaxBufferedChunks(downloadMaxBufferedChunks))
 	}
 
 	downloadStart := time.Now()
@@ -637,8 +637,8 @@ func usage() {
 
 Usage:
   benchmark login    [--profile NAME] [--indexer URL] [--new]
-  benchmark run      [--profile NAME] [--size BYTES] [--upload-max-inflight N]
-                     [--download-max-inflight N] [--host-summary]
+  benchmark run      [--profile NAME] [--size BYTES] [--upload-max-buffered-slabs N]
+                     [--download-max-buffered-chunks N] [--host-summary]
   benchmark profiles
 
 Each profile binds an app key to an indexer so subsequent runs can skip the
@@ -668,8 +668,8 @@ func main() {
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		profileName := fs.String("profile", defaultProfile, "profile to use")
 		size := fs.Uint64("size", 120*1024*1024, "size of the data to upload and download in bytes")
-		uploadMaxInflight := fs.Int("upload-max-inflight", 0, "maximum number of concurrent shard uploads (0 = SDK default)")
-		downloadMaxInflight := fs.Int("download-max-inflight", 0, "maximum number of concurrent chunk downloads (0 = SDK default)")
+		uploadMaxBufferedSlabs := fs.Int("upload-max-buffered-slabs", 0, "maximum number of encoded slabs buffered in memory (0 = SDK default)")
+		downloadMaxBufferedChunks := fs.Int("download-max-buffered-chunks", 0, "maximum number of chunks buffered in memory (0 = SDK default)")
 		hostSummary := fs.Bool("host-summary", false, "print a per-host breakdown of shards and throughput after the run")
 		fs.Parse(os.Args[2:])
 
@@ -686,7 +686,7 @@ func main() {
 		}
 		defer sdk.Close()
 
-		if err := runBenchmark(ctx, sdk, *size, *uploadMaxInflight, *downloadMaxInflight, *hostSummary); err != nil {
+		if err := runBenchmark(ctx, sdk, *size, *uploadMaxBufferedSlabs, *downloadMaxBufferedChunks, *hostSummary); err != nil {
 			log.Fatal(err)
 		}
 

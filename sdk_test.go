@@ -626,7 +626,7 @@ func TestRefreshHosts(t *testing.T) {
 }
 
 // object size for the transfer benchmarks. at the default most of a run is
-// spent ramping the inflight limit rather than at steady state
+// spent ramping the adaptive limit rather than at steady state
 var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")
 
 // host pool for the transfer benchmarks. the default scheme is 10 data and 20
@@ -636,9 +636,9 @@ const benchHosts = 90
 func BenchmarkUpload(b *testing.B) {
 	data := frand.Bytes(*benchSize)
 
-	benchMatrix := func(b *testing.B, slow, timeout, inflight int) {
+	benchMatrix := func(b *testing.B, slow, timeout, bufferedSlabs int) {
 		b.Helper()
-		b.Run(fmt.Sprintf("slow %d timeout %d inflight %d", slow, timeout, inflight), func(b *testing.B) {
+		b.Run(fmt.Sprintf("slow %d timeout %d buffered slabs %d", slow, timeout, bufferedSlabs), func(b *testing.B) {
 			sdk, hosts := newTestSDK(b, benchHosts+timeout, zap.NewNop())
 			defer sdk.Close()
 
@@ -654,20 +654,20 @@ func BenchmarkUpload(b *testing.B) {
 			for b.Loop() {
 				r.Reset(data)
 				obj := NewEmptyObject()
-				if err := sdk.Upload(context.Background(), &obj, r, WithUploadInflight(inflight)); err != nil {
+				if err := sdk.Upload(context.Background(), &obj, r, WithUploadMaxBufferedSlabs(bufferedSlabs)); err != nil {
 					b.Fatalf("failed to upload: %v", err)
 				}
 			}
 		})
 	}
 
-	inflight := []int{runtime.NumCPU(), 5, 10, 20, 30}
+	bufferedSlabs := []int{1, 3, 5, 10}
 	// testing more variants is not particularly useful
 	slow := []int{0, 1, 3, 5}
 	timeout := []int{0, 1, 3, 5}
 	for _, s := range slow {
 		for _, t := range timeout {
-			for _, i := range inflight {
+			for _, i := range bufferedSlabs {
 				benchMatrix(b, s, t, i)
 			}
 		}
@@ -685,9 +685,9 @@ func BenchmarkDownload(b *testing.B) {
 		b.Fatalf("failed to upload: %v", err)
 	}
 
-	benchMatrix := func(b *testing.B, slow, inflight int) {
+	benchMatrix := func(b *testing.B, slow, bufferedChunks int) {
 		b.Helper()
-		b.Run(fmt.Sprintf("slow %d inflight %d", slow, inflight), func(b *testing.B) {
+		b.Run(fmt.Sprintf("slow %d buffered chunks %d", slow, bufferedChunks), func(b *testing.B) {
 			// needs to be longer than the default timeout
 			hosts.ResetSlowHosts()
 			hosts.SetSlowHosts(b, slow, 30*time.Second)
@@ -700,7 +700,7 @@ func BenchmarkDownload(b *testing.B) {
 			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
-				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
+				rc, err := sdk.Download(obj, WithDownloadMaxBufferedChunks(bufferedChunks))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
@@ -719,11 +719,11 @@ func BenchmarkDownload(b *testing.B) {
 
 	benchMatrix(b, 0, runtime.NumCPU())
 
-	inflight := []int{1, 3, 5, 10, 20, 30}
+	bufferedChunks := []int{1, 3, 5, 10, 20, 30}
 	slow := []int{0, 1, 3, 5, 10, 20}
 
 	for _, s := range slow {
-		for _, i := range inflight {
+		for _, i := range bufferedChunks {
 			benchMatrix(b, s, i)
 		}
 	}
@@ -751,14 +751,14 @@ func BenchmarkDownloadJitter(b *testing.B) {
 		return time.Duration(frand.Intn(20)) * time.Millisecond
 	})
 
-	for _, inflight := range []int{30, 80} {
-		b.Run(fmt.Sprintf("inflight %d", inflight), func(b *testing.B) {
+	for _, bufferedChunks := range []int{30, 80} {
+		b.Run(fmt.Sprintf("buffered chunks %d", bufferedChunks), func(b *testing.B) {
 			// discard through a reusable buffer like the Rust benchmark's sink
 			buf := make([]byte, 1<<20) // 1 MiB
 			b.SetBytes(int64(*benchSize))
 			b.ResetTimer()
 			for b.Loop() {
-				rc, err := sdk.Download(obj, WithDownloadInflight(inflight))
+				rc, err := sdk.Download(obj, WithDownloadMaxBufferedChunks(bufferedChunks))
 				if err != nil {
 					b.Fatalf("failed to download: %v", err)
 				}
