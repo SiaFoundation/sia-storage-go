@@ -25,10 +25,10 @@ require (
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.60.0 // indirect
-	github.com/quic-go/webtransport-go v0.11.1 // indirect
+	github.com/quic-go/quic-go v0.61.0 // indirect
+	github.com/quic-go/webtransport-go v0.12.0 // indirect
 	github.com/vbauerster/cupwriter v0.0.4 // indirect
-	go.sia.tech/coreutils v0.23.6-0.20260717131215-dfd89d065259 // indirect
+	go.sia.tech/coreutils v0.24.0 // indirect
 	go.sia.tech/indexd v0.4.2 // indirect
 	go.sia.tech/jape v0.14.1 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
