@@ -29,7 +29,7 @@ require (
 	github.com/quic-go/webtransport-go v0.12.0 // indirect
 	github.com/vbauerster/cupwriter v0.0.4 // indirect
 	go.sia.tech/coreutils v0.24.0 // indirect
-	go.sia.tech/indexd v0.4.2 // indirect
+	go.sia.tech/indexd v0.4.3-0.20260811102619-b064dc9575d1 // indirect
 	go.sia.tech/jape v0.14.1 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
