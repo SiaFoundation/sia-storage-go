@@ -68,6 +68,9 @@ type mockHostClient struct {
 
 	pricesMu    sync.Mutex
 	pricesCalls map[types.PublicKey]int
+
+	failedMu   sync.Mutex
+	failedRPCs map[types.PublicKey]int
 }
 
 // Close implements the [hostClient] interface.
@@ -77,7 +80,19 @@ func (m *mockHostClient) Close() error {
 
 // AddFailedRPC implements the [hostClient] interface.
 func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
+	m.failedMu.Lock()
+	m.failedRPCs[hostKey]++
+	m.failedMu.Unlock()
 	m.provider.AddFailedRPC(hostKey)
+}
+
+// FailedRPCs returns the number of AddFailedRPC calls per host.
+func (m *mockHostClient) FailedRPCs() map[types.PublicKey]int {
+	m.failedMu.Lock()
+	defer m.failedMu.Unlock()
+	failed := make(map[types.PublicKey]int, len(m.failedRPCs))
+	maps.Copy(failed, m.failedRPCs)
+	return failed
 }
 
 // UploadQueue implements the [hostClient] interface.
@@ -146,6 +161,16 @@ func (m *mockHostClient) SetSlowHostKeys(keys []types.PublicKey, d time.Duration
 	}
 }
 
+// timeoutErr mirrors the real transport, where an expired deadline surfaces
+// as a closed mux stream rather than a deadline error.
+func timeoutErr(ctx context.Context) error {
+	err := context.Cause(ctx)
+	if err == context.DeadlineExceeded {
+		return errors.New("stream was gracefully closed")
+	}
+	return err
+}
+
 func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]
@@ -158,7 +183,7 @@ func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) err
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) error {
@@ -176,7 +201,7 @@ func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) er
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) hostError(hostKey types.PublicKey) error {
@@ -199,9 +224,11 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 
 	start := time.Now()
 	defer func() {
-		if err != nil {
+		// the real client skips failure accounting for RPCs interrupted by
+		// their context
+		if err != nil && ctx.Err() == nil {
 			m.provider.AddFailedRPC(hostKey)
-		} else {
+		} else if err == nil {
 			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
 		}
 	}()
@@ -238,9 +265,11 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
 	start := time.Now()
 	defer func() {
-		if err != nil {
+		// the real client skips failure accounting for RPCs interrupted by
+		// their context
+		if err != nil && ctx.Err() == nil {
 			m.provider.AddFailedRPC(hostKey)
-		} else {
+		} else if err == nil {
 			m.provider.AddReadSample(hostKey, length, time.Since(start))
 		}
 	}()
@@ -275,9 +304,11 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_ proto.HostPrices, err error) {
 	start := time.Now()
 	defer func() {
-		if err != nil {
+		// the real client skips failure accounting for RPCs interrupted by
+		// their context
+		if err != nil && ctx.Err() == nil {
 			m.provider.AddFailedRPC(hostKey)
-		} else {
+		} else if err == nil {
 			m.provider.AddSettingsSample(hostKey, time.Since(start))
 		}
 	}()
@@ -358,7 +389,7 @@ func (m *mockHostClient) jitterDelay(ctx context.Context) error {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 // SetReadJitter delays every sector read by a duration drawn from fn. It
@@ -407,6 +438,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
 		writeCalls:   make(map[types.PublicKey]int),
 		pricesCalls:  make(map[types.PublicKey]int),
+		failedRPCs:   make(map[types.PublicKey]int),
 	}
 	return m
 }
