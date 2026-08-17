@@ -500,4 +500,50 @@ func TestDownloadRacing(t *testing.T) {
 	} else if elapsed >= 1200*time.Millisecond {
 		t.Fatal("did not race when the window opened", elapsed)
 	}
+
+	// a small mid stream chunk borrows the race timeout of a full size read,
+	// while the first chunk keeps its own estimate for a fast first byte. the
+	// slow hosts get small fast samples so they rank first without touching
+	// the global rate, and bulk samples on the spare hosts set a low global
+	// rate, so the floored timeout dwarfs the own estimate and the slow delay
+	sdk, hosts := newTestSDK(t, 60, zaptest.NewLogger(t))
+	t.Cleanup(func() { sdk.Close() })
+	data = frand.Bytes(int(proto.SectorSize) * 10)
+	obj = NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	slab := obj.Slabs()[0]
+	var slowKeys []types.PublicKey
+	for _, sector := range slab.Sectors[:slab.MinShards] {
+		hosts.provider.AddReadSample(sector.HostKey, 1<<15, time.Microsecond) // 32 KiB
+		slowKeys = append(slowKeys, sector.HostKey)
+	}
+	for _, sector := range slab.Sectors[slab.MinShards:] {
+		hosts.provider.AddReadSample(sector.HostKey, 1<<18, 4*time.Second) // 256 KiB
+	}
+	hosts.SetSlowHostKeys(slowKeys, time.Second)
+
+	chunk = slab
+	chunk.Offset, chunk.Length = 0, 1<<14 // 16 KiB
+	popped = newChangeCounter(raceWindow)
+	start = time.Now()
+
+	// assert the mid stream chunk waited for the slow hosts instead of racing
+	limiter = newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, 1, popped, limiter, time.Minute, nil); err != nil {
+		t.Fatal(err)
+	} else if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatal("small chunk raced on its own estimate", elapsed)
+	}
+
+	// assert the first chunk raced instead of borrowing the floored timeout
+	popped = newChangeCounter(0)
+	start = time.Now()
+	limiter = newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, 0, popped, limiter, time.Minute, nil); err != nil {
+		t.Fatal(err)
+	} else if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatal("first chunk did not race on its own estimate", elapsed)
+	}
 }
