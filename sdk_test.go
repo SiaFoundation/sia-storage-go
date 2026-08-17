@@ -625,6 +625,59 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
+func TestWriteTimeoutDemotesHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 10, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	slow := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, time.Minute)
+
+	accountKey := types.GeneratePrivateKey()
+	sector := make([]byte, proto.SectorSize)
+
+	// assert the host that ate the write deadline was demoted
+	if _, err := writeSector(t.Context(), hosts, accountKey, slow, sector, 250*time.Millisecond); err == nil {
+		t.Fatal("expected the write to fail")
+	} else if failed := hosts.FailedRPCs(); failed[slow] != 1 {
+		t.Fatal("unexpected demotions", failed)
+	}
+
+	// assert a write abandoned by its caller is not held against the host
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := writeSector(ctx, hosts, accountKey, slow, sector, time.Minute); err == nil {
+		t.Fatal("expected the write to fail")
+	} else if failed := hosts.FailedRPCs(); failed[slow] != 1 {
+		t.Fatal("unexpected demotions", failed)
+	}
+}
+
+func TestWarmupDemotesUnresponsiveHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 3, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	slow := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, 5*time.Second)
+
+	keys := make([]types.PublicKey, 0, len(usable))
+	for _, hi := range usable {
+		keys = append(keys, hi.PublicKey)
+	}
+	if err := sdk.warmConnections(t.Context(), keys); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert only the host that ate the warmup deadline was demoted
+	failed := hosts.FailedRPCs()
+	if failed[slow] == 0 {
+		t.Fatal("expected the unresponsive host to be demoted")
+	} else if len(failed) != 1 {
+		t.Fatal("unexpected demotions", failed)
+	}
+}
+
 // object size for the transfer benchmarks. at the default most of a run is
 // spent ramping the adaptive limit rather than at steady state
 var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")

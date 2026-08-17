@@ -76,6 +76,37 @@ func TestDownloadMaxBufferedChunks(t *testing.T) {
 	}
 }
 
+func TestDownloadTimeoutDemotesHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * 10)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// a chunk with no spare hosts needs all ten reads, so the slow host must
+	// eat its whole timeout and the chunk fails instead of racing around it
+	chunk := obj.Slabs()[0]
+	chunk.Sectors = chunk.Sectors[:chunk.MinShards]
+	slow := chunk.Sectors[0].HostKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, time.Minute)
+
+	limiter := newInflightLimiter(initialDownloadInflight, minDownloadInflight, 80, int(chunk.MinShards), zaptest.NewLogger(t))
+	if _, err := sdk.downloadSlab(t.Context(), chunk, 0, 0, newChangeCounter(0), limiter, 250*time.Millisecond, nil); err == nil {
+		t.Fatal("expected the download to fail")
+	}
+
+	// assert the timed out host was demoted and the responsive ones were not
+	failed := hosts.FailedRPCs()
+	if failed[slow] == 0 {
+		t.Fatal("expected the timed out host to be demoted")
+	} else if len(failed) != 1 {
+		t.Fatal("unexpected demotions", failed)
+	}
+}
+
 func TestOutOfOrderDownload(t *testing.T) {
 	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()

@@ -205,9 +205,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			// a host only gets demoted when it hits the shard timeout. reads
 			// cancelled because the chunk completed without them are expected
 			// with overprovisioning and do not count against the host
-			if timeoutCtx.Err() != nil && ctx.Err() == nil {
-				s.hosts.AddFailedRPC(d.sector.HostKey)
-			}
+			demoteOnTimeout(timeoutCtx, ctx, s.hosts, d.sector.HostKey)
 		})
 	}
 
@@ -1048,11 +1046,13 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 			}()
 			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
 			_, err := s.hosts.Prices(pCtx, hk)
-			pCancel()
-
 			if err == nil {
 				warmed.Add(1)
+			} else {
+				// rank hosts that did not answer behind those that did
+				demoteOnTimeout(pCtx, ctx, s.hosts, hk)
 			}
+			pCancel()
 		}(tCtx, hk)
 	}
 
@@ -1075,11 +1075,24 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// writeSector uploads a single sector to a host with the given timeout.
+// demoteOnTimeout records a host failure for an attempt that ate its
+// deadline. The demotion keys off the attempt context because the client
+// skips failure accounting for RPCs interrupted by their context and the
+// transport surfaces such timeouts as closed streams rather than deadline
+// errors. Nothing is recorded when the surrounding operation was cancelled.
+func demoteOnTimeout(attempt, live context.Context, client hostClient, hostKey types.PublicKey) {
+	if attempt.Err() != nil && live.Err() == nil {
+		client.AddFailedRPC(hostKey)
+	}
+}
+
+// writeSector uploads a single sector to a host with the given timeout,
+// demoting the host when it eats the whole deadline.
 func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := client.WriteSector(ctx, accountKey, hostKey, data)
+	result, err := client.WriteSector(attemptCtx, accountKey, hostKey, data)
+	demoteOnTimeout(attemptCtx, ctx, client, hostKey)
 	return result.Root, err
 }
 
