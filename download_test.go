@@ -358,20 +358,6 @@ func TestDownloadUnusableHosts(t *testing.T) {
 	}
 }
 
-// TestDownloadHostTimeout asserts a non-positive host timeout is rejected. It
-// would otherwise expire every read before it began, demoting every host the
-// download touched.
-func TestDownloadHostTimeout(t *testing.T) {
-	sdk, _ := newTestSDK(t, 1, zaptest.NewLogger(t))
-	defer sdk.Close()
-
-	for _, timeout := range []time.Duration{0, -time.Second} {
-		if _, err := sdk.Download(NewEmptyObject(), WithDownloadHostTimeout(timeout)); err == nil {
-			t.Fatalf("expected host timeout %v to fail", timeout)
-		}
-	}
-}
-
 // TestDownloadHostTimeoutDemotes asserts a read that hits the host timeout
 // demotes the host with the throughput it managed, not with the region it was
 // asked for.

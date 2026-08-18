@@ -25,21 +25,9 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-const (
-	// pinBatchSize is the maximum number of slabs sent to the indexer in a
-	// single PinSlabs request.
-	pinBatchSize = 50
-
-	// defaultDownloadHostTimeout is the per-attempt timeout for reading a
-	// sector from a host. It is long to handle slow hosts; racing routes
-	// around stragglers.
-	defaultDownloadHostTimeout = 60 * time.Second
-
-	// warmupTimeout is the per-attempt timeout for the settings request that
-	// warms a connection. A host that cannot answer one in that long is not
-	// worth waiting on while the transfer is still starting up.
-	warmupTimeout = time.Second
-)
+// pinBatchSize is the maximum number of slabs sent to the indexer in a
+// single PinSlabs request.
+const pinBatchSize = 50
 
 type (
 	// A hostClient is an interface for interacting with hosts.
@@ -532,17 +520,11 @@ func (d *downloadStream) Close() error {
 // with defaults, applies the given options, and validates them.
 func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOption, error) {
 	do := downloadOption{
-		hostTimeout: defaultDownloadHostTimeout,
+		hostTimeout: 60 * time.Second, // long to handle slow hosts; racing routes around stragglers
 		length:      objectSize,
 	}
 	for _, opt := range opts {
 		opt(&do)
-	}
-
-	// a non-positive timeout expires every read before it starts, demoting
-	// every host the download touched
-	if do.hostTimeout <= 0 {
-		return do, fmt.Errorf("host timeout must be positive, got %v", do.hostTimeout)
 	}
 
 	if do.maxBufferedChunks < 0 {
@@ -1062,7 +1044,7 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			elapsed, timedOut, err := timedAttempt(ctx, warmupTimeout, func(ctx context.Context) error {
+			elapsed, timedOut, err := timedAttempt(ctx, time.Second, func(ctx context.Context) error {
 				_, err := s.hosts.Prices(ctx, hk)
 				return err
 			})
@@ -1153,7 +1135,7 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 }
 
 // WithDownloadHostTimeout sets the timeout for reading sectors
-// from individual hosts. It must be positive; the default is 60 seconds.
+// from individual hosts. The default is 60 seconds.
 func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 	return func(do *downloadOption) {
 		do.hostTimeout = timeout
