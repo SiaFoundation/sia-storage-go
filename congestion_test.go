@@ -18,6 +18,16 @@ func congestionStep(c *inflightController, seconds float64) int {
 	return c.currentLimit()
 }
 
+// congestionStepFailing feeds one window of failed completions, returning the
+// resulting limit. A window without a success always decides, so one window is
+// always a step, whether or not it moves the limit.
+func congestionStepFailing(c *inflightController) int {
+	for range minWindow {
+		c.record(c.sample(), time.Second, false)
+	}
+	return c.currentLimit()
+}
+
 // congestionStepSaturating steps with a latency that is flat below sat and
 // grows in proportion to the limit above it, so goodput plateaus at sat.
 func congestionStepSaturating(c *inflightController, sat int, base float64) int {
@@ -107,6 +117,35 @@ func TestInflightController(t *testing.T) {
 			}
 		}
 		t.Fatal("sustained failures did not back off")
+	})
+
+	t.Run("failures without baseline", func(t *testing.T) {
+		c := newInflightController(8, 2, 1000, 1, zaptest.NewLogger(t))
+		// each window without a success halves the limit, then holds it at the
+		// floor rather than probing upward on a goodput of zero
+		for _, want := range []int{4, 2, 2, 2} {
+			if got := congestionStepFailing(c); got != want {
+				t.Fatalf("expected %d, got %d", want, got)
+			}
+		}
+	})
+
+	t.Run("successes without measurable time", func(t *testing.T) {
+		c := newInflightController(8, 2, 1000, 1, zaptest.NewLogger(t))
+		// windows too fast to measure are discarded rather than read as
+		// congestion
+		for range minWindow * 2 {
+			c.record(c.sample(), 0, true)
+		}
+		if got := c.currentLimit(); got != 8 {
+			t.Fatal("a window with no measurable time moved the limit", got)
+		}
+
+		// the discarded windows left no partial counts behind, so the next
+		// measurable window decides on its own samples
+		if got := congestionStep(c, 1); got != 16 {
+			t.Fatal("first measurable window did not climb", got)
+		}
 	})
 
 	t.Run("bounds", func(t *testing.T) {

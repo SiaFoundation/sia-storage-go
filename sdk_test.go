@@ -625,6 +625,37 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
+// TestWriteSectorTimeout asserts writeSector reports the attempt deadline it
+// owns, but not one inherited from its caller, so only a host that stalled for
+// the whole attempt is reported as having timed out.
+func TestWriteSectorTimeout(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 1, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	hostKey := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{hostKey}, time.Second)
+	data := make([]byte, 1024)
+
+	_, timedOut, err := writeSector(t.Context(), hosts, sdk.appKey, hostKey, data, 10*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected %v, got %v", context.DeadlineExceeded, err)
+	} else if !timedOut {
+		t.Fatal("a stalled write was not reported as timed out")
+	}
+
+	// a deadline on the caller's context is cancellation from above, not
+	// evidence that the host stalled for the upload timeout
+	parent, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, timedOut, err = writeSector(parent, hosts, sdk.appKey, hostKey, data, time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected %v, got %v", context.DeadlineExceeded, err)
+	} else if timedOut {
+		t.Fatal("the caller's deadline was reported as a host timeout")
+	}
+}
+
 // object size for the transfer benchmarks. at the default most of a run is
 // spent ramping the adaptive limit rather than at steady state
 var benchSize = flag.Int("bench.size", 256*1000*1000, "object size in bytes for the transfer benchmarks")

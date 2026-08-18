@@ -25,9 +25,21 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-// pinBatchSize is the maximum number of slabs sent to the indexer in a
-// single PinSlabs request.
-const pinBatchSize = 50
+const (
+	// pinBatchSize is the maximum number of slabs sent to the indexer in a
+	// single PinSlabs request.
+	pinBatchSize = 50
+
+	// defaultDownloadHostTimeout is the per-attempt timeout for reading a
+	// sector from a host. It is long to handle slow hosts; racing routes
+	// around stragglers.
+	defaultDownloadHostTimeout = 60 * time.Second
+
+	// warmupTimeout is the per-attempt timeout for the settings request that
+	// warms a connection. A host that cannot answer one in that long is not
+	// worth waiting on while the transfer is still starting up.
+	warmupTimeout = time.Second
+)
 
 type (
 	// A hostClient is an interface for interacting with hosts.
@@ -36,7 +48,7 @@ type (
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 
-		AddFailedRPC(hostKey types.PublicKey)
+		AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
 		ReadEstimate(bytes uint64) time.Duration
 		WriteEstimate(bytes uint64) time.Duration
@@ -180,17 +192,21 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 		wg.Go(func() {
 			defer release()
 			permit := limiter.sample()
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
-			start := time.Now()
-			_, err := s.hosts.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
-			elapsed := time.Since(start)
+			elapsed, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+				_, err := s.hosts.ReadSector(ctx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+				return err
+			})
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
 			// congestion signal
 			if ctx.Err() == nil {
 				limiter.record(permit, elapsed, err == nil)
+			}
+			// the bytes that landed are the worst-case throughput sample; the
+			// whole region over a short timeout would score a stall as fast
+			if timedOut {
+				s.hosts.AddTimedOutRPC(d.sector.HostKey, false, uint64(buf.Len()), elapsed)
 			}
 			select {
 			case <-ctx.Done():
@@ -201,12 +217,6 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 				hostKey: d.sector.HostKey,
 				elapsed: elapsed,
 			}:
-			}
-			// a host only gets demoted when it hits the shard timeout. reads
-			// cancelled because the chunk completed without them are expected
-			// with overprovisioning and do not count against the host
-			if timeoutCtx.Err() != nil && ctx.Err() == nil {
-				s.hosts.AddFailedRPC(d.sector.HostKey)
 			}
 		})
 	}
@@ -522,11 +532,17 @@ func (d *downloadStream) Close() error {
 // with defaults, applies the given options, and validates them.
 func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOption, error) {
 	do := downloadOption{
-		hostTimeout: 60 * time.Second, // long to handle slow hosts; racing routes around stragglers
+		hostTimeout: defaultDownloadHostTimeout,
 		length:      objectSize,
 	}
 	for _, opt := range opts {
 		opt(&do)
+	}
+
+	// a non-positive timeout expires every read before it starts, demoting
+	// every host the download touched
+	if do.hostTimeout <= 0 {
+		return do, fmt.Errorf("host timeout must be positive, got %v", do.hostTimeout)
 	}
 
 	if do.maxBufferedChunks < 0 {
@@ -1046,12 +1062,16 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
-			_, err := s.hosts.Prices(pCtx, hk)
-			pCancel()
+			elapsed, timedOut, err := timedAttempt(ctx, warmupTimeout, func(ctx context.Context) error {
+				_, err := s.hosts.Prices(ctx, hk)
+				return err
+			})
 
 			if err == nil {
 				warmed.Add(1)
+			} else if timedOut {
+				// nothing arrived, so the worst-case sample is no bytes
+				s.hosts.AddTimedOutRPC(hk, false, 0, elapsed)
 			}
 		}(tCtx, hk)
 	}
@@ -1075,12 +1095,32 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// writeSector uploads a single sector to a host with the given timeout.
-func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+// timedAttempt runs fn against a single host under its own timeout, reporting
+// how long fn took and whether it ate that deadline rather than one inherited
+// from ctx. Only the caller that owns the deadline can tell a host that stalled
+// from a caller that cancelled, so the verdict is taken here, while the attempt
+// context is still the freshest thing that cancelled.
+func timedAttempt(ctx context.Context, timeout time.Duration, fn func(ctx context.Context) error) (time.Duration, bool, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := client.WriteSector(ctx, accountKey, hostKey, data)
-	return result.Root, err
+
+	start := time.Now()
+	err := fn(attemptCtx)
+	elapsed := time.Since(start)
+	timedOut := err != nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	return elapsed, timedOut, err
+}
+
+// writeSector uploads a single sector to a host with the given timeout, also
+// reporting whether the write ate that deadline; see [timedAttempt].
+func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, bool, error) {
+	var root types.Hash256
+	_, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+		result, err := client.WriteSector(ctx, accountKey, hostKey, data)
+		root = result.Root
+		return err
+	})
+	return root, timedOut, err
 }
 
 // WithRedundancy sets the number of data and parity shards for the upload.
@@ -1113,7 +1153,7 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 }
 
 // WithDownloadHostTimeout sets the timeout for reading sectors
-// from individual hosts. The default is 60 seconds.
+// from individual hosts. It must be positive; the default is 60 seconds.
 func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 	return func(do *downloadOption) {
 		do.hostTimeout = timeout

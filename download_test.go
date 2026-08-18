@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -354,6 +355,59 @@ func TestDownloadUnusableHosts(t *testing.T) {
 				t.Fatal("data mismatch")
 			}
 		})
+	}
+}
+
+// TestDownloadHostTimeout asserts a non-positive host timeout is rejected. It
+// would otherwise expire every read before it began, demoting every host the
+// download touched.
+func TestDownloadHostTimeout(t *testing.T) {
+	sdk, _ := newTestSDK(t, 1, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		if _, err := sdk.Download(NewEmptyObject(), WithDownloadHostTimeout(timeout)); err == nil {
+			t.Fatalf("expected host timeout %v to fail", timeout)
+		}
+	}
+}
+
+// TestDownloadHostTimeoutDemotes asserts a read that hits the host timeout
+// demotes the host with the throughput it managed, not with the region it was
+// asked for.
+func TestDownloadHostTimeoutDemotes(t *testing.T) {
+	// the redundancy the other tests here use, so twelve sectors have to stall
+	// rather than the default thirty
+	const dataShards, parityShards = 3, 9
+
+	sdk, hosts := newTestSDK(t, dataShards+parityShards, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	data := frand.Bytes(int(proto.SectorSize) * dataShards)
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards)); err != nil {
+		t.Fatal(err)
+	}
+
+	// every host holding a sector of the slab stalls for far longer than the
+	// host timeout, so the reads hit it instead of failing on their own
+	var slabHosts []types.PublicKey
+	for _, sector := range obj.Slabs()[0].Sectors {
+		slabHosts = append(slabHosts, sector.HostKey)
+	}
+	hosts.SetSlowHostKeys(slabHosts, time.Second)
+
+	if _, err := readAll(sdk.Download(obj, WithDownloadHostTimeout(50*time.Millisecond))); err == nil {
+		t.Fatal("expected the download to fail")
+	}
+
+	// these hosts send nothing before the deadline, so the whole region would
+	// score a stall as fast throughput
+	for _, rpc := range hosts.waitTimedOutRPCs(t, 1) {
+		if !slices.Contains(slabHosts, rpc.hostKey) {
+			t.Fatal("timeout recorded against a host holding no sector", rpc.hostKey)
+		}
+		rpc.assertSample(t, false, 0)
 	}
 }
 

@@ -29,7 +29,8 @@ const (
 
 	// confirmWindows is the number of consecutive adverse windows required
 	// before acting, so a single noisy window can neither settle the limit low
-	// nor back it off.
+	// nor back it off. A window without a single success is exempt: no goodput
+	// at all is not noise.
 	confirmWindows = 2
 
 	// probeInterval is the number of healthy steady-state windows between
@@ -147,12 +148,22 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 		return 0
 	}
 
-	// Little's law: throughput ≈ inflight / latency
-	old, goodput := c.limit, 0.0
-	if c.elapsed > 0 {
-		goodput = float64(c.successes) * float64(old) / c.elapsed
-	}
+	old, successes, windowElapsed := c.limit, c.successes, c.elapsed
 	c.completions, c.successes, c.elapsed = 0, 0, 0
+
+	// no goodput at all, however fast the failures came back, so back off
+	// without waiting out the strike count
+	if successes == 0 {
+		c.backOff(old)
+		return c.applyLimit(old, 0)
+	}
+	if windowElapsed <= 0 {
+		// too fast to measure, so it says nothing either way
+		return 0
+	}
+
+	// Little's law: throughput ≈ inflight / latency
+	goodput := float64(successes) * float64(old) / windowElapsed
 
 	var adverse bool
 	if c.prevGoodput > 0 {
@@ -173,11 +184,7 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 
 	doubled := min(old*2, c.capacity)
 	switch {
-	case c.prevGoodput <= 0: // no baseline yet, so climb
-		c.limit = doubled
-		c.prevGoodput = goodput
-
-	case !adverse && c.probing: // still paying off
+	case !adverse && c.probing: // no baseline yet, or still paying off, so climb
 		c.limit = doubled
 		c.prevGoodput = goodput
 
@@ -200,13 +207,26 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 		c.steadyRun = 0
 
 	default: // sustained decline at a settled limit, back off and probe again
-		c.limit = max(old/2, c.floor)
-		c.probing = true
-		c.prevGoodput = 0
-		c.steadyRun = 0
+		c.backOff(old)
 	}
-	c.prevLimit = old
+	return c.applyLimit(old, goodput)
+}
 
+// backOff halves the limit, down to the floor, and clears the baseline so the
+// controller probes upward again from there. The caller must hold c.mu.
+func (c *inflightController) backOff(old int) {
+	c.limit = max(old/2, c.floor)
+	c.strikes = 0
+	c.probing = true
+	c.prevGoodput = 0
+	c.steadyRun = 0
+}
+
+// applyLimit records the limit the decision replaced and reports the change it
+// made. A change bumps the generation, retiring permits sampled under old. The
+// caller must hold c.mu.
+func (c *inflightController) applyLimit(old int, goodput float64) int {
+	c.prevLimit = old
 	delta := c.limit - old
 	if delta != 0 {
 		c.generation++

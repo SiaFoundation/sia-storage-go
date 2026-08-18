@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -399,26 +398,33 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	}
 	results := make(chan writeResult, 8)
 
-	var initialDone atomic.Bool
-	var active int
+	var active int // only touched by this goroutine, like the launches it gates
 	launchWrite := func(host types.PublicKey, release func(), canRetry bool) {
+		// only the attempt launched with nothing else in flight races from the
+		// front, so only its loss says anything about its own speed
+		initial := active == 0
 		active++
 		go func() {
 			permit := su.limiter.sample()
 			start := time.Now()
-			root, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
+			root, timedOut, err := writeSector(shardCtx, su.hosts, su.accountKey, host, sector, uploadTimeout)
 			elapsed := time.Since(start)
 			// a racer aborted because another attempt won measured the
 			// cancellation, not the network, so it is not a congestion signal
 			if shardCtx.Err() == nil {
 				su.limiter.record(permit, elapsed, err == nil)
 			}
+			// attempts are cancelled only once one lands, so an initial attempt
+			// still uploading then was beaten by a racer, not merely started late
+			beatenByRacer := initial && err != nil && shardCtx.Err() != nil && ctx.Err() == nil
 			// the write is done, so release the host's inflight reservation and
 			// this attempt's permit before the host can re-enter the pool,
 			// keeping the inflight accounting accurate
 			release()
-			if host == initialHost {
-				initialDone.Store(true)
+			// a write reports no partial progress, so the whole sector over an
+			// attempt that outlasted the race timeout is the worst-case sample
+			if timedOut || beatenByRacer {
+				su.hosts.AddTimedOutRPC(host, true, uint64(len(sector)), elapsed)
 			}
 			// if the shard already completed, this result is stale: return the
 			// host to the pool instead of racing to enqueue a result nobody
@@ -475,12 +481,6 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 				// cancel the racers; they release their reservations as
 				// they exit, so completion can be reported immediately
 				cancel()
-
-				// penalize the original host if a racer beat it while it was
-				// still uploading
-				if res.host != initialHost && !initialDone.Load() {
-					su.hosts.AddFailedRPC(initialHost)
-				}
 
 				if su.onProgress != nil {
 					su.onProgress(ShardProgress{
