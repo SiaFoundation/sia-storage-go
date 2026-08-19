@@ -224,9 +224,9 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 	// fire the timer instantly. the first chunk keeps its own estimate: time
 	// to first byte hinges on racing its stragglers early, and reading a tiny
 	// chunk twice costs almost nothing.
-	raceLength := max(length, maxChunkSize/uint64(slab.MinShards))
-	if seq == 0 {
-		raceLength = length
+	raceLength := length
+	if seq != 0 {
+		raceLength = max(length, maxChunkSize/uint64(slab.MinShards))
 	}
 	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(raceLength)) * raceFactor)
 	lastEvent := time.Now()
