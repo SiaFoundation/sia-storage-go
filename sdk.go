@@ -25,10 +25,6 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-// pinBatchSize is the maximum number of slabs sent to the indexer in a
-// single PinSlabs request.
-const pinBatchSize = 50
-
 type (
 	// A hostClient is an interface for interacting with hosts.
 	hostClient interface {
@@ -329,8 +325,8 @@ func (s *SDK) DeleteObject(ctx context.Context, key types.Hash256) error {
 // Upload uploads the data to hosts.
 //
 // Appends the metadata of the slabs that were uploaded to the given object.
-// After uploading the object, the caller must call PinObject to pin the
-// slabs and save the object metadata to the indexer.
+// The slabs are pinned to the indexer as they finish uploading, but the caller
+// must still call PinObject to save the object metadata.
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -357,7 +353,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	}()
 
 	// collect uploaded slabs
-	uploaded, err := collectSlabs(ctx, slabsCh, uo)
+	uploaded, err := s.collectSlabs(ctx, slabsCh)
 	if err != nil {
 		return err
 	}
@@ -561,38 +557,40 @@ func (s *SDK) Close() error {
 	return s.hosts.Close()
 }
 
-// PinObject pins the object's slabs and saves the object metadata to the
-// indexer.
+// PinObject saves the object metadata to the indexer, pinning any of its slabs
+// that are not pinned yet.
+//
+// Slabs uploaded through [SDK.Upload] or [SDK.UploadPacked] are pinned as they
+// finish uploading, so pinning those objects takes a single request.
 func (s *SDK) PinObject(ctx context.Context, obj Object) error {
+	sealed := obj.Seal(s.appKey).SealedObject
+	err := s.app.PinObject(ctx, s.appKey, sealed)
+	if !isUnpinnedSlabErr(err) {
+		return err
+	}
+
+	// the object references slabs this account has not pinned, pin them and
+	// retry
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
-		params[i] = slabs.SlabPinParams{
-			Version:       slab.Version,
-			EncryptionKey: slab.EncryptionKey,
-			MinShards:     slab.MinShards,
-			Sectors:       slab.Sectors,
-		}
+		params[i] = slab.Pin()
 		if err := params[i].Validate(); err != nil {
 			return fmt.Errorf("slab %d invalid: %w", i, err)
 		}
 	}
 
 	for i := 0; i < len(params); i += pinBatchSize {
-		end := min(i+pinBatchSize, len(params))
+		batch := params[i:min(i+pinBatchSize, len(params))]
 
-		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, params[i:end]...)
+		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, batch...)
 		if err != nil {
 			return fmt.Errorf("failed to pin slabs: %w", err)
-		}
-
-		for j, slab := range obj.slabs[i:end] {
-			if expected := slab.Digest(); slabIDs[j] != expected {
-				return fmt.Errorf("slab %d: pinned id %s does not match expected id %s", i+j, slabIDs[j], expected)
-			}
+		} else if err := validateSlabIDs(batch, slabIDs); err != nil {
+			return fmt.Errorf("batch at slab %d: %w", i, err)
 		}
 	}
 
-	return s.app.PinObject(ctx, s.appKey, obj.Seal(s.appKey).SealedObject)
+	return s.app.PinObject(ctx, s.appKey, sealed)
 }
 
 const (

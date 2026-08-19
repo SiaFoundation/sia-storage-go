@@ -41,11 +41,13 @@ type (
 	}
 
 	slabUpload struct {
-		encryptionKey [32]byte
-		length        uint32
-
-		shardsCh chan shard
+		resultCh chan slabResult
 		err      error
+	}
+
+	slabResult struct {
+		slab slabs.SlabSlice
+		err  error
 	}
 
 	shardUpload struct {
@@ -307,6 +309,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			shardsCh:      make(chan shard, totalShards),
 			waiting:       waiting,
 		}
+		resultCh := make(chan slabResult, 1)
 
 		// count this slab's shards as waiting before the encode goroutine starts
 		// so the racing gate cannot open between buffering and the first upload
@@ -328,20 +331,20 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 				// no shard gets its first attempt, so release the whole slab
 				waiting.add(-totalShards)
 				su.commitment.releaseAll()
-				su.shardsCh <- shard{err: fmt.Errorf("failed to encode slab %d shards: %w", su.slabIndex, err)}
+				resultCh <- slabResult{err: fmt.Errorf("failed to encode slab %d shards: %w", su.slabIndex, err)}
 				return
 			}
 			for shardIdx, data := range shards {
 				go su.uploadShard(ctx, shardIdx, data)
 			}
+
+			// pin from the slab task so a slab is protected as soon as its
+			// own shards land
+			resultCh <- s.collectSlab(ctx, su, uo, uint32(n))
 		}()
 
 		// send slab off for collection
-		send(slabUpload{
-			encryptionKey: su.encryptionKey,
-			length:        uint32(n),
-			shardsCh:      su.shardsCh,
-		})
+		send(slabUpload{resultCh: resultCh})
 		if last {
 			return
 		}
@@ -554,45 +557,62 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	}
 }
 
-// collectSlabs reads uploaded slabs from the channel and collects their
-// shard results into SlabSlices. It returns when the channel is closed
-// or an error is encountered.
-func collectSlabs(ctx context.Context, ch <-chan slabUpload, uo uploadOption) ([]slabs.SlabSlice, error) {
+// collectSlab waits for the slab's shards, assembles them, and pins the slab to
+// the indexer.
+func (s *SDK) collectSlab(ctx context.Context, su shardUpload, uo uploadOption, length uint32) slabResult {
 	// 128 data and 128 parity shards is a valid redundancy that overflows
 	// uint8, so widen both before summing
 	totalShards := int(uo.dataShards) + int(uo.parityShards)
-	var uploaded []slabs.SlabSlice
 
-	for slab := range ch {
-		if slab.err != nil {
-			return nil, slab.err
-		}
-
-		sectors := make([]slabs.PinnedSector, totalShards)
-
-		for range totalShards {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case shard := <-slab.shardsCh:
-				if shard.err != nil {
-					return nil, fmt.Errorf("failed to upload slab: shard upload failed: %w", shard.err)
-				}
-				sectors[shard.index] = slabs.PinnedSector{
-					HostKey: shard.host,
-					Root:    shard.root,
-				}
+	sectors := make([]slabs.PinnedSector, totalShards)
+	for range totalShards {
+		select {
+		case <-ctx.Done():
+			return slabResult{err: ctx.Err()}
+		case sh := <-su.shardsCh:
+			if sh.err != nil {
+				return slabResult{err: fmt.Errorf("failed to upload slab: shard upload failed: %w", sh.err)}
+			}
+			sectors[sh.index] = slabs.PinnedSector{
+				HostKey: sh.host,
+				Root:    sh.root,
 			}
 		}
+	}
 
-		uploaded = append(uploaded, slabs.SlabSlice{
-			Version:       1,
-			EncryptionKey: slab.encryptionKey,
-			MinShards:     uint(uo.dataShards),
-			Sectors:       sectors,
-			Offset:        0,
-			Length:        slab.length,
-		})
+	slab := slabs.SlabSlice{
+		Version:       1,
+		EncryptionKey: su.encryptionKey,
+		MinShards:     uint(uo.dataShards),
+		Sectors:       sectors,
+		Offset:        0,
+		Length:        length,
+	}
+	if err := s.pinSlab(ctx, slab); err != nil {
+		return slabResult{err: err}
+	}
+	return slabResult{slab: slab}
+}
+
+// collectSlabs reads the uploaded slabs in the order they were started. Each
+// slab is assembled and pinned by its own task, so this only orders results.
+func (s *SDK) collectSlabs(ctx context.Context, ch <-chan slabUpload) ([]slabs.SlabSlice, error) {
+	var uploaded []slabs.SlabSlice
+
+	for su := range ch {
+		if su.err != nil {
+			return nil, su.err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-su.resultCh:
+			if res.err != nil {
+				return nil, res.err
+			}
+			uploaded = append(uploaded, res.slab)
+		}
 	}
 
 	if ctx.Err() != nil {

@@ -140,9 +140,9 @@ func (u *PackedUpload) Close() error {
 
 // Finalize finalizes the upload and returns the resulting objects. This will
 // wait for all slabs to be uploaded before returning. The resulting objects
-// will contain the metadata needed to download the objects. The caller must
-// call PinObject for each returned object to pin the slabs and save the
-// object metadata to the indexer.
+// will contain the metadata needed to download the objects. The slabs are
+// pinned to the indexer as they finish uploading, but the caller must still
+// call PinObject for each returned object to save its metadata.
 func (u *PackedUpload) Finalize(ctx context.Context) ([]Object, error) {
 	// close the writer to signal EOF to the uploader
 	_ = u.writer.Close()
@@ -271,7 +271,7 @@ func (s *SDK) UploadPacked(opts ...UploadOption) (*PackedUpload, error) {
 	// uploadEncryptedSlabs reads from that pipe
 	go func() {
 		defer cancel()
-		uploaded, err := collectSlabs(ctx, slabCh, uo)
+		uploaded, err := s.collectSlabs(ctx, slabCh)
 		u.finish(uploaded, err)
 	}()
 

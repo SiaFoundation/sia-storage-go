@@ -257,7 +257,7 @@ func TestDownloadV0(t *testing.T) {
 		defer close(slabsCh)
 		sdk.uploadEncryptedSlabs(t.Context(), slabsCh, encrypted, slabKeys, enc, uo)
 	}()
-	obj.slabs, err = collectSlabs(t.Context(), slabsCh, uo)
+	obj.slabs, err = sdk.collectSlabs(t.Context(), slabsCh)
 	if err != nil {
 		t.Fatal(err)
 	}

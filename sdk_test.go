@@ -487,17 +487,38 @@ func TestE2E(t *testing.T) {
 	assertShareable(objects2[1], data4)
 }
 
-func TestPinObjectBatching(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	hostStore := newMockHostStore(30)
-	appMock := newMockAppClient(hostStore)
-	hostMock := newMockHostClient(hostStore)
+func TestPinObjectPinsMissingSlabs(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 30, zaptest.NewLogger(t))
+	defer sdk.Close()
 
-	b := newMockBuilder(appMock, hostMock, hostStore)
-	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
-	if err != nil {
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(frand.Bytes(4096))); err != nil {
+		t.Fatal(err)
+	} else if appMock.PinnedSlabs() != len(obj.slabs) {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	// simulate an imported object whose slabs this account never pinned
+	if err := sdk.PruneSlabs(t.Context(), api.WithBefore(time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	} else if appMock.PinnedSlabs() != 0 {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	// pinning the object pins its slabs and retries
+	if err := sdk.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	} else if appMock.PinnedSlabs() != len(obj.slabs) {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	if _, err := sdk.Object(t.Context(), obj.ID()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPinObjectBatching(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()
 
 	// build a large object
@@ -508,10 +529,11 @@ func TestPinObjectBatching(t *testing.T) {
 
 	// assert batches
 	expected := []int{pinBatchSize, pinBatchSize, pinBatchSize / 2}
-	if len(appMock.pinSlabsCalls) != len(expected) {
-		t.Fatal("unexpected", appMock.pinSlabsCalls)
+	calls := appMock.PinSlabsCalls()
+	if len(calls) != len(expected) {
+		t.Fatal("unexpected", calls)
 	}
-	for i, c := range appMock.pinSlabsCalls {
+	for i, c := range calls {
 		if c != expected[i] {
 			t.Fatal("mismatch", c, expected[i])
 		}
@@ -519,24 +541,13 @@ func TestPinObjectBatching(t *testing.T) {
 }
 
 func TestPruneSlabs(t *testing.T) {
-	appKey := types.GeneratePrivateKey()
-	hostStore := newMockHostStore(30)
-	appMock := newMockAppClient(hostStore)
-	hostMock := newMockHostClient(hostStore)
-
-	b := newMockBuilder(appMock, hostMock, hostStore)
-	sdk, err := b.SDK(appKey, WithLogger(zaptest.NewLogger(t)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	sdk, appMock, _ := newTestSDKWithMocks(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()
 
 	assertPinned := func(n int) {
 		t.Helper()
-		appMock.mu.Lock()
-		defer appMock.mu.Unlock()
-		if len(appMock.pinned) != n {
-			t.Fatalf("expected %d pinned slabs, got %d", n, len(appMock.pinned))
+		if got := appMock.PinnedSlabs(); got != n {
+			t.Fatalf("expected %d pinned slabs, got %d", n, got)
 		}
 	}
 

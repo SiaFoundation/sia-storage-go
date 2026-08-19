@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"net/url"
 	"slices"
 	"sync"
@@ -533,6 +534,7 @@ type mockAppClient struct {
 	deleted       map[types.Hash256]time.Time
 	hostsOverride []hosts.HostInfo
 	pinSlabsCalls []int
+	pinSlabsFails int
 }
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
@@ -551,11 +553,19 @@ func (mc *mockAppClient) Account(_ context.Context, _ types.PrivateKey) (resp ap
 }
 
 // PinSlabs implements the [appClient] interface.
-func (mc *mockAppClient) PinSlabs(_ context.Context, _ types.PrivateKey, toPin ...slabs.SlabPinParams) (digests []slabs.SlabID, err error) {
+func (mc *mockAppClient) PinSlabs(ctx context.Context, _ types.PrivateKey, toPin ...slabs.SlabPinParams) (digests []slabs.SlabID, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
 	mc.pinSlabsCalls = append(mc.pinSlabsCalls, len(toPin))
+	if mc.pinSlabsFails > 0 {
+		mc.pinSlabsFails--
+		return nil, &app.HTTPError{StatusCode: http.StatusInternalServerError, Body: "pin slabs unavailable"}
+	}
 
 	for _, s := range toPin {
 		id := s.Digest()
@@ -695,6 +705,13 @@ func (mc *mockAppClient) SharedObject(_ context.Context, sharedURL string) (slab
 func (mc *mockAppClient) PinObject(_ context.Context, _ types.PrivateKey, obj slabs.SealedObject) (err error) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
+
+	for _, slab := range obj.Slabs {
+		if _, ok := mc.pinned[slab.Digest()]; !ok {
+			return &app.HTTPError{StatusCode: http.StatusBadRequest, Body: slabs.ErrObjectUnpinnedSlab.Error()}
+		}
+	}
+
 	mc.objects[obj.ID()] = obj
 	return nil
 }
@@ -764,6 +781,28 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 	return nil
 }
 
+// SetPinSlabsFailures fails the next n PinSlabs calls before they resume
+// succeeding.
+func (mc *mockAppClient) SetPinSlabsFailures(n int) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.pinSlabsFails = n
+}
+
+// PinSlabsCalls returns the slab count of each PinSlabs call, including the
+// calls made to fail.
+func (mc *mockAppClient) PinSlabsCalls() []int {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return slices.Clone(mc.pinSlabsCalls)
+}
+
+func (mc *mockAppClient) PinnedSlabs() int {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return len(mc.pinned)
+}
+
 // newMockBuilder creates a Builder backed by mock implementations.
 func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Builder {
 	return &Builder{
@@ -778,6 +817,13 @@ func newMockBuilder(app appClient, hosts hostClient, hostStore *hostCache) *Buil
 func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient) {
 	t.Helper()
 
+	sdk, _, hostClient := newTestSDKWithMocks(t, hosts, log)
+	return sdk, hostClient
+}
+
+func newTestSDKWithMocks(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockAppClient, *mockHostClient) {
+	t.Helper()
+
 	appKey := types.GeneratePrivateKey()
 	hostStore := newMockHostStore(hosts)
 	appClient := newMockAppClient(hostStore)
@@ -789,5 +835,5 @@ func newTestSDK(t testing.TB, hosts int, log *zap.Logger) (*SDK, *mockHostClient
 		t.Fatal(err)
 	}
 
-	return sdk, hostClient
+	return sdk, appClient, hostClient
 }
