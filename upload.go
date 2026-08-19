@@ -554,7 +554,9 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 // shard results into SlabSlices. It returns when the channel is closed
 // or an error is encountered.
 func collectSlabs(ctx context.Context, ch <-chan slabUpload, uo uploadOption) ([]slabs.SlabSlice, error) {
-	totalShards := uo.dataShards + uo.parityShards
+	// 128 data and 128 parity shards is a valid redundancy that overflows
+	// uint8, so widen both before summing
+	totalShards := int(uo.dataShards) + int(uo.parityShards)
 	var uploaded []slabs.SlabSlice
 
 	for slab := range ch {
