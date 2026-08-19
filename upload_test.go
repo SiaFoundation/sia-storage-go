@@ -323,3 +323,35 @@ func TestUploadInflight(t *testing.T) {
 		r()
 	}
 }
+
+func TestCollectSlabsMaxRedundancy(t *testing.T) {
+	// 128 data and 128 parity shards is the largest redundancy the indexer
+	// accepts, and it sums to exactly the uint8 boundary
+	uo, _, err := newUploadOption(WithRedundancy(128, 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const totalShards = 256
+	shardsCh := make(chan shard, totalShards)
+	for i := range totalShards {
+		shardsCh <- shard{
+			index: i,
+			host:  types.GeneratePrivateKey().PublicKey(),
+			root:  frand.Entropy256(),
+		}
+	}
+
+	ch := make(chan slabUpload, 1)
+	ch <- slabUpload{encryptionKey: frand.Entropy256(), length: 1, shardsCh: shardsCh}
+	close(ch)
+
+	uploaded, err := collectSlabs(t.Context(), ch, uo)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(uploaded) != 1 {
+		t.Fatal("unexpected", len(uploaded))
+	} else if len(uploaded[0].Sectors) != totalShards {
+		t.Fatal("unexpected", len(uploaded[0].Sectors))
+	}
+}
