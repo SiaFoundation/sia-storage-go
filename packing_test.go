@@ -372,3 +372,44 @@ func (r *errReader) Read(p []byte) (int, error) {
 	}
 	return 0, r.err
 }
+
+func TestUploadPackedPinsSlabs(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 50, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	u, err := sdk.UploadPacked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+
+	// span two slabs
+	if _, err := u.Add(t.Context(), bytes.NewReader(frand.Bytes(int(u.OptimalDataSize())+1024))); err != nil {
+		t.Fatal(err)
+	} else if _, err := u.Add(t.Context(), bytes.NewReader(frand.Bytes(512))); err != nil {
+		t.Fatal(err)
+	}
+
+	objects, err := u.Finalize(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	} else if len(objects) != 2 {
+		t.Fatal("unexpected", len(objects))
+	}
+
+	// both slabs were pinned while the upload ran
+	if appMock.PinnedSlabs() != 2 {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	// pinning the objects needs no further PinSlabs requests
+	calls := appMock.PinSlabsCalls()
+	for _, obj := range objects {
+		if err := sdk.PinObject(t.Context(), obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := appMock.PinSlabsCalls(); len(after) != len(calls) {
+		t.Fatal("unexpected", after)
+	}
+}

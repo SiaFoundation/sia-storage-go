@@ -324,7 +324,10 @@ func TestUploadInflight(t *testing.T) {
 	}
 }
 
-func TestCollectSlabsMaxRedundancy(t *testing.T) {
+func TestCollectSlabMaxRedundancy(t *testing.T) {
+	sdk, _, _ := newTestSDKWithMocks(t, 0, zaptest.NewLogger(t))
+	defer sdk.Close()
+
 	// 128 data and 128 parity shards is the largest redundancy the indexer
 	// accepts, and it sums to exactly the uint8 boundary
 	uo, _, err := newUploadOption(WithRedundancy(128, 128))
@@ -333,25 +336,87 @@ func TestCollectSlabsMaxRedundancy(t *testing.T) {
 	}
 
 	const totalShards = 256
-	shardsCh := make(chan shard, totalShards)
+	su := shardUpload{
+		encryptionKey: frand.Entropy256(),
+		shardsCh:      make(chan shard, totalShards),
+	}
 	for i := range totalShards {
-		shardsCh <- shard{
+		su.shardsCh <- shard{
 			index: i,
 			host:  types.GeneratePrivateKey().PublicKey(),
 			root:  frand.Entropy256(),
 		}
 	}
 
-	ch := make(chan slabUpload, 1)
-	ch <- slabUpload{encryptionKey: frand.Entropy256(), length: 1, shardsCh: shardsCh}
-	close(ch)
+	res := sdk.collectSlab(t.Context(), su, uo, 1)
+	if res.err != nil {
+		t.Fatal(res.err)
+	} else if len(res.slab.Sectors) != totalShards {
+		t.Fatal("unexpected", len(res.slab.Sectors))
+	}
+}
 
-	uploaded, err := collectSlabs(t.Context(), ch, uo)
+func TestUploadPinsSlabs(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 60, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	uo, _, err := newUploadOption()
 	if err != nil {
 		t.Fatal(err)
-	} else if len(uploaded) != 1 {
-		t.Fatal("unexpected", len(uploaded))
-	} else if len(uploaded[0].Sectors) != totalShards {
-		t.Fatal("unexpected", len(uploaded[0].Sectors))
+	}
+	slabSize := int(uo.dataShards) * proto.SectorSize
+	data := frand.Bytes(slabSize*2 + 4096)
+
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// every slab is pinned by the upload itself
+	if len(obj.slabs) != 3 {
+		t.Fatal("unexpected", len(obj.slabs))
+	} else if appMock.PinnedSlabs() != 3 {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	// the slabs are already pinned, so pinning the object needs no further
+	// PinSlabs requests
+	calls := appMock.PinSlabsCalls()
+	if err := sdk.PinObject(t.Context(), obj); err != nil {
+		t.Fatal(err)
+	} else if after := appMock.PinSlabsCalls(); len(after) != len(calls) {
+		t.Fatal("unexpected", after)
+	}
+}
+
+func TestUploadPinRetries(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 40, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	appMock.SetPinSlabsFailures(maxPinAttempts - 1)
+
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(frand.Bytes(4096))); err != nil {
+		t.Fatal(err)
+	} else if calls := appMock.PinSlabsCalls(); len(calls) != maxPinAttempts {
+		t.Fatal("unexpected", calls)
+	} else if appMock.PinnedSlabs() != 1 {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+}
+
+func TestUploadPinFails(t *testing.T) {
+	sdk, appMock, _ := newTestSDKWithMocks(t, 40, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	appMock.SetPinSlabsFailures(maxPinAttempts)
+
+	obj := NewEmptyObject()
+	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(frand.Bytes(4096))); err == nil {
+		t.Fatal("expected upload to fail")
+	} else if calls := appMock.PinSlabsCalls(); len(calls) != maxPinAttempts {
+		t.Fatal("unexpected", calls)
+	} else if appMock.PinnedSlabs() != 0 {
+		t.Fatal("unexpected", appMock.PinnedSlabs())
 	}
 }
