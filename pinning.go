@@ -29,6 +29,9 @@ const (
 // failing the upload.
 func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 	params := []slabs.SlabPinParams{slab.Pin()}
+	if err := params[0].Validate(); err != nil {
+		return fmt.Errorf("slab invalid: %w", err)
+	}
 
 	delay := pinRetryDelay
 	for attempt := 1; ; attempt++ {
