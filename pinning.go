@@ -24,9 +24,6 @@ const (
 	pinRetryDelay = 250 * time.Millisecond
 )
 
-// pinSlab pins a freshly uploaded slab to the indexer. The sectors are already
-// on the network by this point, so transient errors are retried rather than
-// failing the upload.
 // pinSlab pins a single slab, retrying transient errors with exponential
 // backoff. Its sectors are already on the network by the time it is called, so
 // a temporary indexer failure must not fail the upload.
