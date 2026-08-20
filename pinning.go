@@ -27,19 +27,19 @@ const (
 // pinSlab pins a freshly uploaded slab to the indexer. The sectors are already
 // on the network by this point, so transient errors are retried rather than
 // failing the upload.
+// pinSlab pins a single slab, retrying transient errors with exponential
+// backoff. Its sectors are already on the network by the time it is called, so
+// a temporary indexer failure must not fail the upload.
 func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
-	params := []slabs.SlabPinParams{slab.Pin()}
-	if err := params[0].Validate(); err != nil {
-		return fmt.Errorf("slab invalid: %w", err)
-	}
+	params := slab.Pin()
 
 	delay := pinRetryDelay
 	for attempt := 1; ; attempt++ {
-		ids, err := s.app.PinSlabs(ctx, s.appKey, params...)
+		err := s.pinSlabs(ctx, params)
 		if err == nil {
-			return validateSlabIDs(params, ids)
+			return nil
 		} else if attempt == maxPinAttempts || ctx.Err() != nil {
-			return fmt.Errorf("failed to pin slabs: %w", err)
+			return err
 		}
 
 		s.log.Debug("failed to pin slab, retrying", zap.Int("attempt", attempt), zap.Duration("delay", delay), zap.Error(err))
@@ -50,6 +50,28 @@ func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 		}
 		delay *= 2
 	}
+}
+
+// pinSlabs validates the given slabs and pins them in batches of pinBatchSize,
+// checking the ids returned by the indexer. Errors are not retried.
+func (s *SDK) pinSlabs(ctx context.Context, params ...slabs.SlabPinParams) error {
+	for i := range params {
+		if err := params[i].Validate(); err != nil {
+			return fmt.Errorf("slab %d invalid: %w", i, err)
+		}
+	}
+
+	for i := 0; i < len(params); i += pinBatchSize {
+		batch := params[i:min(i+pinBatchSize, len(params))]
+
+		ids, err := s.app.PinSlabs(ctx, s.appKey, batch...)
+		if err != nil {
+			return fmt.Errorf("failed to pin slabs: %w", err)
+		} else if err := validateSlabIDs(batch, ids); err != nil {
+			return fmt.Errorf("batch at slab %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 func validateSlabIDs(params []slabs.SlabPinParams, ids []slabs.SlabID) error {
