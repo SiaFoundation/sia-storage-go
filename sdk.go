@@ -561,7 +561,8 @@ func (s *SDK) Close() error {
 // that are not pinned yet.
 //
 // Slabs uploaded through [SDK.Upload] or [SDK.UploadPacked] are pinned as they
-// finish uploading, so pinning those objects takes a single request.
+// finish uploading, so pinning those objects takes a single request. Transient
+// errors are not retried, calling PinObject again is safe and cheap.
 func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	sealed := obj.Seal(s.appKey).SealedObject
 	err := s.app.PinObject(ctx, s.appKey, sealed)
@@ -574,20 +575,9 @@ func (s *SDK) PinObject(ctx context.Context, obj Object) error {
 	params := make([]slabs.SlabPinParams, len(obj.slabs))
 	for i, slab := range obj.slabs {
 		params[i] = slab.Pin()
-		if err := params[i].Validate(); err != nil {
-			return fmt.Errorf("slab %d invalid: %w", i, err)
-		}
 	}
-
-	for i := 0; i < len(params); i += pinBatchSize {
-		batch := params[i:min(i+pinBatchSize, len(params))]
-
-		slabIDs, err := s.app.PinSlabs(ctx, s.appKey, batch...)
-		if err != nil {
-			return fmt.Errorf("failed to pin slabs: %w", err)
-		} else if err := validateSlabIDs(batch, slabIDs); err != nil {
-			return fmt.Errorf("batch at slab %d: %w", i, err)
-		}
+	if err := s.pinSlabs(ctx, params...); err != nil {
+		return err
 	}
 
 	return s.app.PinObject(ctx, s.appKey, sealed)
