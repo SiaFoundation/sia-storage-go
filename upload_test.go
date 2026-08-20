@@ -348,7 +348,7 @@ func TestCollectSlabMaxRedundancy(t *testing.T) {
 		}
 	}
 
-	res := sdk.collectSlab(t.Context(), su, uo, 1)
+	res := sdk.collectSlab(t.Context(), &su, uo, 1)
 	if res.err != nil {
 		t.Fatal(res.err)
 	} else if len(res.slab.Sectors) != totalShards {

@@ -341,7 +341,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 
 			// pin from the slab task so a slab is protected as soon as its
 			// own shards land
-			resultCh <- s.collectSlab(ctx, su, uo, uint32(n))
+			resultCh <- s.collectSlab(ctx, &su, uo, uint32(n))
 		}()
 
 		// send slab off for collection
@@ -555,7 +555,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 
 // collectSlab waits for the slab's shards, assembles them, and pins the slab to
 // the indexer.
-func (s *SDK) collectSlab(ctx context.Context, su shardUpload, uo uploadOption, length uint32) slabResult {
+func (s *SDK) collectSlab(ctx context.Context, su *shardUpload, uo uploadOption, length uint32) slabResult {
 	// 128 data and 128 parity shards is a valid redundancy that overflows
 	// uint8, so widen both before summing
 	totalShards := int(uo.dataShards) + int(uo.parityShards)
