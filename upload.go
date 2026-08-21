@@ -421,10 +421,14 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 			// this attempt's permit before the host can re-enter the pool,
 			// keeping the inflight accounting accurate
 			release()
-			// a write reports no partial progress, so the whole sector over an
-			// attempt that outlasted the race timeout is the worst-case sample
-			if timedOut || beatenByRacer {
+			// a write reports no partial progress, so the whole sector over
+			// the deadline it burned is the worst-case sample. a racer's win
+			// tells us the attempt lost, not how slow it was, so a beaten
+			// attempt only counts against the failure rate
+			if timedOut {
 				su.hosts.AddTimedOutRPC(host, true, uint64(len(sector)), elapsed)
+			} else if beatenByRacer {
+				su.hosts.AddFailedRPC(host)
 			}
 			// if the shard already completed, this result is stale: return the
 			// host to the pool instead of racing to enqueue a result nobody

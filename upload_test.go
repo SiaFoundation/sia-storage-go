@@ -230,15 +230,19 @@ func TestUploadInitialHostBeaten(t *testing.T) {
 		t.Fatal("expected a racer to win")
 	}
 
-	// only the beaten initial host is demoted, with the whole sector over an
-	// attempt that outlasted the race timeout as its worst-case sample
-	rpcs := hosts.waitTimedOutRPCs(t, 1)
-	if len(rpcs) != 1 {
-		t.Fatalf("expected 1 timed out RPC, got %d", len(rpcs))
-	} else if rpcs[0].hostKey != slow {
-		t.Fatalf("expected the beaten host %v, got %v", slow, rpcs[0].hostKey)
+	// only the beaten initial host is demoted, and only against its failure
+	// rate: it was cancelled partway through an upload of unknown progress, so
+	// the sector over the time the racer took to win would score it far faster
+	// than it was
+	hks := hosts.waitFailedRPCs(t, 1)
+	hosts.waitInflightDrained(t) // let every attempt unwind before asserting
+	if len(hks) != 1 {
+		t.Fatalf("expected 1 failed RPC, got %d", len(hks))
+	} else if hks[0] != slow {
+		t.Fatalf("expected the beaten host %v, got %v", slow, hks[0])
+	} else if rpcs := hosts.TimedOutRPCs(); len(rpcs) != 0 {
+		t.Fatalf("expected no throughput sample from a beaten host, got %d", len(rpcs))
 	}
-	rpcs[0].assertSample(t, true, uint64(len(sector)))
 }
 
 func TestUploadGateReleasedOnCancel(t *testing.T) {

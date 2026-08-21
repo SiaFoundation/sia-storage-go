@@ -36,6 +36,7 @@ type (
 		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 
+		AddFailedRPC(hostKey types.PublicKey)
 		AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
 		ReadEstimate(bytes uint64) time.Duration
@@ -1044,7 +1045,7 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			elapsed, timedOut, err := timedAttempt(ctx, time.Second, func(ctx context.Context) error {
+			_, timedOut, err := timedAttempt(ctx, time.Second, func(ctx context.Context) error {
 				_, err := s.hosts.Prices(ctx, hk)
 				return err
 			})
@@ -1052,8 +1053,10 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 			if err == nil {
 				warmed.Add(1)
 			} else if timedOut {
-				// nothing arrived, so the worst-case sample is no bytes
-				s.hosts.AddTimedOutRPC(hk, false, 0, elapsed)
+				// a prices RPC carries no bulk data, so a stalled one says
+				// nothing about throughput. only the failure rate, which
+				// decays, holds the warmup against the host
+				s.hosts.AddFailedRPC(hk)
 			}
 		}(tCtx, hk)
 	}

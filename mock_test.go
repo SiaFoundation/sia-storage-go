@@ -80,6 +80,9 @@ type mockHostClient struct {
 	timeoutMu    sync.Mutex
 	timedOutRPCs []timedOutRPC
 
+	failedMu   sync.Mutex
+	failedRPCs []types.PublicKey
+
 	readJitter func() time.Duration // set before issuing reads; nil for none
 
 	errHostsMu sync.Mutex
@@ -128,11 +131,49 @@ func (m *mockHostClient) waitTimedOutRPCs(t testing.TB, n int) []timedOutRPC {
 	}
 }
 
+// TimedOutRPCs returns the timed out RPCs recorded so far, for tests asserting
+// that a failed RPC carried no throughput sample.
+func (m *mockHostClient) TimedOutRPCs() []timedOutRPC {
+	m.timeoutMu.Lock()
+	defer m.timeoutMu.Unlock()
+	return slices.Clone(m.timedOutRPCs)
+}
+
+// AddFailedRPC implements the [hostClient] interface, recording the call for
+// inspection by tests. Only the failure samples the SDK decides on land here;
+// the ones the client itself records go through
+// [mockHostClient.recordFailedRPC].
+func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
+	m.failedMu.Lock()
+	m.failedRPCs = append(m.failedRPCs, hostKey)
+	m.failedMu.Unlock()
+	m.provider.AddFailedRPC(hostKey)
+}
+
+// waitFailedRPCs waits for n failed RPCs to be recorded, then returns the hosts
+// they were recorded against. Attempts report as they unwind, so a transfer may
+// finish before every host it gave up on has reported.
+func (m *mockHostClient) waitFailedRPCs(t testing.TB, n int) []types.PublicKey {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.failedMu.Lock()
+		hks := slices.Clone(m.failedRPCs)
+		m.failedMu.Unlock()
+		if len(hks) >= n {
+			return hks
+		} else if time.Now().After(deadline) {
+			t.Fatalf("expected %d failed RPCs, got %d", n, len(hks))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // recordFailedRPC mirrors the context half of the real client's isFailedRPC: an
 // RPC interrupted by its context is not counted against the host, since the
 // client cannot tell a host that misbehaved from a caller that cancelled. Only
-// the caller owning the deadline can, and it reports the difference with
-// AddTimedOutRPC.
+// the caller owning the deadline can, so it reports those itself with
+// [hostClient.AddTimedOutRPC] or [hostClient.AddFailedRPC].
 func (m *mockHostClient) recordFailedRPC(ctx context.Context, hostKey types.PublicKey) {
 	if ctx.Err() != nil {
 		return
