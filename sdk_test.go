@@ -636,11 +636,11 @@ func TestWriteTimeoutDemotesHost(t *testing.T) {
 	accountKey := types.GeneratePrivateKey()
 	sector := make([]byte, proto.SectorSize)
 
-	// assert the host that ate the write deadline was demoted
+	// assert the host that reached the write deadline was demoted
 	if _, err := writeSector(t.Context(), hosts, accountKey, slow, sector, 250*time.Millisecond); err == nil {
 		t.Fatal("expected the write to fail")
-	} else if failed := hosts.FailedRPCs(); failed[slow] != 1 {
-		t.Fatal("unexpected demotions", failed)
+	} else if timedOut := hosts.TimedOutRPCs(); timedOut[slow] != 1 {
+		t.Fatal("unexpected demotions", timedOut)
 	}
 
 	// assert a write abandoned by its caller is not held against the host
@@ -648,8 +648,8 @@ func TestWriteTimeoutDemotesHost(t *testing.T) {
 	cancel()
 	if _, err := writeSector(ctx, hosts, accountKey, slow, sector, time.Minute); err == nil {
 		t.Fatal("expected the write to fail")
-	} else if failed := hosts.FailedRPCs(); failed[slow] != 1 {
-		t.Fatal("unexpected demotions", failed)
+	} else if timedOut := hosts.TimedOutRPCs(); timedOut[slow] != 1 {
+		t.Fatal("unexpected demotions", timedOut)
 	}
 }
 
@@ -669,7 +669,7 @@ func TestWarmupDemotesUnresponsiveHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// assert only the host that ate the warmup deadline was demoted
+	// assert only the host that reached the warmup deadline was demoted
 	failed := hosts.FailedRPCs()
 	if failed[slow] == 0 {
 		t.Fatal("expected the unresponsive host to be demoted")

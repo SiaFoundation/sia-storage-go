@@ -87,7 +87,7 @@ func TestDownloadTimeoutDemotesHost(t *testing.T) {
 	}
 
 	// a chunk with no spare hosts needs all ten reads, so the slow host must
-	// eat its whole timeout and the chunk fails instead of racing around it
+	// use its whole timeout and the chunk fails instead of racing around it
 	chunk := obj.Slabs()[0]
 	chunk.Sectors = chunk.Sectors[:chunk.MinShards]
 	slow := chunk.Sectors[0].HostKey
@@ -99,11 +99,11 @@ func TestDownloadTimeoutDemotesHost(t *testing.T) {
 	}
 
 	// assert the timed out host was demoted and the responsive ones were not
-	failed := hosts.FailedRPCs()
-	if failed[slow] == 0 {
+	timedOut := hosts.TimedOutRPCs()
+	if timedOut[slow] == 0 {
 		t.Fatal("expected the timed out host to be demoted")
-	} else if len(failed) != 1 {
-		t.Fatal("unexpected demotions", failed)
+	} else if len(timedOut) != 1 {
+		t.Fatal("unexpected demotions", timedOut)
 	}
 }
 
