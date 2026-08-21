@@ -37,6 +37,7 @@ type (
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 
 		AddFailedRPC(hostKey types.PublicKey)
+		AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration)
 		Prioritize(hosts []types.PublicKey) []types.PublicKey
 		ReadEstimate(bytes uint64) time.Duration
 		WriteEstimate(bytes uint64) time.Duration
@@ -205,7 +206,7 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			// a host only gets demoted when it hits the shard timeout. reads
 			// cancelled because the chunk completed without them are expected
 			// with overprovisioning and do not count against the host
-			demoteOnTimeout(timeoutCtx, ctx, s.hosts, d.sector.HostKey)
+			demoteOnTimeout(timeoutCtx, ctx, s.hosts, d.sector.HostKey, false, length, elapsed)
 		})
 	}
 
@@ -218,12 +219,10 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 		slabHosts = slabHosts[1:]
 	}
 
-	// only race a host once it is clearly slower than normal. the estimate
-	// scales with bytes alone, so a small ramp read borrows the timeout of a
-	// full size read; its own estimate sits below a round trip and would
-	// fire the timer instantly. the first chunk keeps its own estimate: time
-	// to first byte hinges on racing its stragglers early, and reading a tiny
-	// chunk twice costs almost nothing.
+	// only race a host once it is clearly slower than normal. the first chunk
+	// keeps its own estimate to optimize for TTFB. later chunks use a full
+	// size read for a more conservative estimate, since a small ramp read
+	// estimates below a single round trip and would fire the timer instantly.
 	raceLength := length
 	if seq != 0 {
 		raceLength = max(length, maxChunkSize/uint64(slab.MinShards))
@@ -1053,14 +1052,15 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				<-sema
 			}()
 			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
+			defer pCancel()
 			_, err := s.hosts.Prices(pCtx, hk)
 			if err == nil {
 				warmed.Add(1)
-			} else {
-				// rank hosts that did not answer behind those that did
-				demoteOnTimeout(pCtx, ctx, s.hosts, hk)
+			} else if pCtx.Err() != nil && ctx.Err() == nil {
+				// rank hosts that did not answer within the deadline behind
+				// those that did
+				s.hosts.AddFailedRPC(hk)
 			}
-			pCancel()
 		}(tCtx, hk)
 	}
 
@@ -1083,24 +1083,23 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// demoteOnTimeout records a host failure for an attempt that ate its
-// deadline. The demotion keys off the attempt context because the client
-// skips failure accounting for RPCs interrupted by their context and the
-// transport surfaces such timeouts as closed streams rather than deadline
-// errors. Nothing is recorded when the surrounding operation was cancelled.
-func demoteOnTimeout(attempt, live context.Context, client hostClient, hostKey types.PublicKey) {
-	if attempt.Err() != nil && live.Err() == nil {
-		client.AddFailedRPC(hostKey)
+// demoteOnTimeout records a host failure and the worst case throughput it
+// implies when the transfer reached its own deadline while the parent context
+// was still live.
+func demoteOnTimeout(timeoutCtx, parentCtx context.Context, client hostClient, hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
+	if timeoutCtx.Err() != nil && parentCtx.Err() == nil {
+		client.AddTimedOutRPC(hostKey, write, bytes, elapsed)
 	}
 }
 
 // writeSector uploads a single sector to a host with the given timeout,
-// demoting the host when it eats the whole deadline.
+// demoting the host when the attempt reaches that deadline.
 func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := client.WriteSector(attemptCtx, accountKey, hostKey, data)
-	demoteOnTimeout(attemptCtx, ctx, client, hostKey)
+	start := time.Now()
+	result, err := client.WriteSector(timeoutCtx, accountKey, hostKey, data)
+	demoteOnTimeout(timeoutCtx, ctx, client, hostKey, true, uint64(len(data)), time.Since(start))
 	return result.Root, err
 }
 

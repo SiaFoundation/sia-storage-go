@@ -22,6 +22,7 @@ import (
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
+	"go.sia.tech/mux/v3"
 	"go.uber.org/zap"
 )
 
@@ -69,8 +70,9 @@ type mockHostClient struct {
 	pricesMu    sync.Mutex
 	pricesCalls map[types.PublicKey]int
 
-	failedMu   sync.Mutex
-	failedRPCs map[types.PublicKey]int
+	failedMu     sync.Mutex
+	failedRPCs   map[types.PublicKey]int
+	timedOutRPCs map[types.PublicKey]int
 }
 
 // Close implements the [hostClient] interface.
@@ -84,6 +86,23 @@ func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
 	m.failedRPCs[hostKey]++
 	m.failedMu.Unlock()
 	m.provider.AddFailedRPC(hostKey)
+}
+
+// AddTimedOutRPC implements the [hostClient] interface.
+func (m *mockHostClient) AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
+	m.failedMu.Lock()
+	m.timedOutRPCs[hostKey]++
+	m.failedMu.Unlock()
+	m.provider.AddTimedOutRPC(hostKey, write, bytes, elapsed)
+}
+
+// TimedOutRPCs returns the number of AddTimedOutRPC calls per host.
+func (m *mockHostClient) TimedOutRPCs() map[types.PublicKey]int {
+	m.failedMu.Lock()
+	defer m.failedMu.Unlock()
+	timedOut := make(map[types.PublicKey]int, len(m.timedOutRPCs))
+	maps.Copy(timedOut, m.timedOutRPCs)
+	return timedOut
 }
 
 // FailedRPCs returns the number of AddFailedRPC calls per host.
@@ -166,7 +185,7 @@ func (m *mockHostClient) SetSlowHostKeys(keys []types.PublicKey, d time.Duration
 func timeoutErr(ctx context.Context) error {
 	err := context.Cause(ctx)
 	if err == context.DeadlineExceeded {
-		return errors.New("stream was gracefully closed")
+		return mux.ErrClosedStream
 	}
 	return err
 }
@@ -439,6 +458,7 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		writeCalls:   make(map[types.PublicKey]int),
 		pricesCalls:  make(map[types.PublicKey]int),
 		failedRPCs:   make(map[types.PublicKey]int),
+		timedOutRPCs: make(map[types.PublicKey]int),
 	}
 	return m
 }
