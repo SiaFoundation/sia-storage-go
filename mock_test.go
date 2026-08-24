@@ -22,6 +22,7 @@ import (
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
 	"go.sia.tech/indexd/slabs"
+	"go.sia.tech/mux/v3"
 	"go.uber.org/zap"
 )
 
@@ -247,6 +248,16 @@ func (m *mockHostClient) SetSlowHostKeys(keys []types.PublicKey, d time.Duration
 	}
 }
 
+// timeoutErr mirrors the real transport, where an expired deadline surfaces
+// as a closed mux stream rather than a deadline error.
+func timeoutErr(ctx context.Context) error {
+	err := context.Cause(ctx)
+	if err == context.DeadlineExceeded {
+		return mux.ErrClosedStream
+	}
+	return err
+}
+
 func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) error {
 	m.delayMu.Lock()
 	delay, ok := m.slowHosts[hostKey]
@@ -259,7 +270,7 @@ func (m *mockHostClient) delay(ctx context.Context, hostKey types.PublicKey) err
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) error {
@@ -277,7 +288,7 @@ func (m *mockHostClient) sectorDelay(ctx context.Context, root types.Hash256) er
 	case <-ctx.Done():
 	case <-time.After(delay):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 func (m *mockHostClient) hostError(hostKey types.PublicKey) error {
@@ -459,7 +470,7 @@ func (m *mockHostClient) jitterDelay(ctx context.Context) error {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
-	return context.Cause(ctx)
+	return timeoutErr(ctx)
 }
 
 // SetReadJitter delays every sector read by a duration drawn from fn. It

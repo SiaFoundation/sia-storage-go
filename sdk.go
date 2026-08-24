@@ -219,9 +219,15 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 		slabHosts = slabHosts[1:]
 	}
 
-	// only race a host once it is clearly slower than normal. before we have
-	// timing data the estimate is large, so racing stays off until it warms up.
-	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(length)) * raceFactor)
+	// only race a host once it is clearly slower than normal. the first chunk
+	// keeps its own estimate to optimize for TTFB. later chunks use a full
+	// size read for a more conservative estimate, since a small ramp read
+	// estimates below a single round trip and would fire the timer instantly.
+	raceLength := length
+	if seq != 0 {
+		raceLength = max(length, maxChunkSize/uint64(slab.MinShards))
+	}
+	raceTimeout := time.Duration(float64(s.hosts.ReadEstimate(raceLength)) * raceFactor)
 	lastEvent := time.Now()
 
 	var successful int

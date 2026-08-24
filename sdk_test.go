@@ -638,8 +638,8 @@ func TestWriteSectorTimeout(t *testing.T) {
 	data := make([]byte, 1024)
 
 	_, timedOut, err := writeSector(t.Context(), hosts, sdk.appKey, hostKey, data, 10*time.Millisecond)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected %v, got %v", context.DeadlineExceeded, err)
+	if err == nil {
+		t.Fatal("expected the write to fail")
 	} else if !timedOut {
 		t.Fatal("a stalled write was not reported as timed out")
 	}
@@ -649,10 +649,35 @@ func TestWriteSectorTimeout(t *testing.T) {
 	parent, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 	defer cancel()
 	_, timedOut, err = writeSector(parent, hosts, sdk.appKey, hostKey, data, time.Second)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected %v, got %v", context.DeadlineExceeded, err)
+	if err == nil {
+		t.Fatal("expected the write to fail")
 	} else if timedOut {
 		t.Fatal("the caller's deadline was reported as a host timeout")
+	}
+}
+
+func TestWarmupDemotesUnresponsiveHost(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 3, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	slow := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{slow}, 5*time.Second)
+
+	keys := make([]types.PublicKey, 0, len(usable))
+	for _, hi := range usable {
+		keys = append(keys, hi.PublicKey)
+	}
+	if err := sdk.warmConnections(t.Context(), keys); err != nil {
+		t.Fatal(err)
+	}
+
+	// assert only the host that reached the warmup deadline was demoted
+	failed := hosts.waitFailedRPCs(t, 1)
+	if len(failed) != 1 {
+		t.Fatal("unexpected demotions", failed)
+	} else if failed[0] != slow {
+		t.Fatal("expected the unresponsive host to be demoted, got", failed[0])
 	}
 }
 
