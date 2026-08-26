@@ -29,6 +29,9 @@ const (
 // a temporary indexer failure must not fail the upload.
 func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 	params := slab.Pin()
+	if err := params.Validate(); err != nil {
+		return fmt.Errorf("slab invalid: %w", err)
+	}
 
 	delay := pinRetryDelay
 	for attempt := 1; ; attempt++ {
