@@ -25,8 +25,8 @@ const (
 )
 
 // pinSlab pins a single slab, retrying transient errors with exponential
-// backoff. Its sectors are already on the network by the time it is called, so
-// a temporary indexer failure must not fail the upload.
+// backoff. It returns the error of the last attempt once maxPinAttempts is
+// reached, failing the upload.
 func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 	params := slab.Pin()
 	if err := params.Validate(); err != nil {
