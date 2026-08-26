@@ -45,6 +45,28 @@ type hostErr struct {
 	err       error
 }
 
+// timedOutRPC records one [hostClient.AddTimedOutRPC] call.
+type timedOutRPC struct {
+	hostKey types.PublicKey
+	write   bool
+	bytes   uint64
+	elapsed time.Duration
+}
+
+// assertSample checks the throughput sample the timeout was recorded with. The
+// host key is left to the caller, which knows whether it expects one host or
+// any of a set.
+func (rpc timedOutRPC) assertSample(t testing.TB, write bool, bytes uint64) {
+	t.Helper()
+	if rpc.write != write {
+		t.Fatalf("expected write=%v for %v, got %v", write, rpc.hostKey, rpc.write)
+	} else if rpc.bytes != bytes {
+		t.Fatalf("expected %d bytes for %v, got %d", bytes, rpc.hostKey, rpc.bytes)
+	} else if rpc.elapsed <= 0 {
+		t.Fatalf("expected a positive elapsed for %v, got %v", rpc.hostKey, rpc.elapsed)
+	}
+}
+
 type mockHostClient struct {
 	provider *client.Provider
 	hosts    *hostCache
@@ -55,6 +77,12 @@ type mockHostClient struct {
 
 	sectorDelayMu sync.Mutex
 	sectorDelays  map[types.Hash256]time.Duration
+
+	timeoutMu    sync.Mutex
+	timedOutRPCs []timedOutRPC
+
+	failedMu   sync.Mutex
+	failedRPCs []types.PublicKey
 
 	readJitter func() time.Duration // set before issuing reads; nil for none
 
@@ -69,10 +97,6 @@ type mockHostClient struct {
 
 	pricesMu    sync.Mutex
 	pricesCalls map[types.PublicKey]int
-
-	failedMu     sync.Mutex
-	failedRPCs   map[types.PublicKey]int
-	timedOutRPCs map[types.PublicKey]int
 }
 
 // Close implements the [hostClient] interface.
@@ -80,38 +104,82 @@ func (m *mockHostClient) Close() error {
 	return nil
 }
 
-// AddFailedRPC implements the [hostClient] interface.
+// AddTimedOutRPC implements the [hostClient] interface, recording the call for
+// inspection by tests.
+func (m *mockHostClient) AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
+	m.timeoutMu.Lock()
+	m.timedOutRPCs = append(m.timedOutRPCs, timedOutRPC{hostKey: hostKey, write: write, bytes: bytes, elapsed: elapsed})
+	m.timeoutMu.Unlock()
+	m.provider.AddTimedOutRPC(hostKey, write, bytes, elapsed)
+}
+
+// waitTimedOutRPCs waits for n timed out RPCs to be recorded, then returns
+// them. Attempts report as they unwind, so a transfer may finish before every
+// host it gave up on has reported.
+func (m *mockHostClient) waitTimedOutRPCs(t testing.TB, n int) []timedOutRPC {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.timeoutMu.Lock()
+		rpcs := slices.Clone(m.timedOutRPCs)
+		m.timeoutMu.Unlock()
+		if len(rpcs) >= n {
+			return rpcs
+		} else if time.Now().After(deadline) {
+			t.Fatalf("expected %d timed out RPCs, got %d", n, len(rpcs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TimedOutRPCs returns the timed out RPCs recorded so far, for tests asserting
+// that a failed RPC carried no throughput sample.
+func (m *mockHostClient) TimedOutRPCs() []timedOutRPC {
+	m.timeoutMu.Lock()
+	defer m.timeoutMu.Unlock()
+	return slices.Clone(m.timedOutRPCs)
+}
+
+// AddFailedRPC implements the [hostClient] interface, recording the call for
+// inspection by tests. Only the failure samples the SDK decides on land here;
+// the ones the client itself records go through
+// [mockHostClient.recordFailedRPC].
 func (m *mockHostClient) AddFailedRPC(hostKey types.PublicKey) {
 	m.failedMu.Lock()
-	m.failedRPCs[hostKey]++
+	m.failedRPCs = append(m.failedRPCs, hostKey)
 	m.failedMu.Unlock()
 	m.provider.AddFailedRPC(hostKey)
 }
 
-// AddTimedOutRPC implements the [hostClient] interface.
-func (m *mockHostClient) AddTimedOutRPC(hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
-	m.failedMu.Lock()
-	m.timedOutRPCs[hostKey]++
-	m.failedMu.Unlock()
-	m.provider.AddTimedOutRPC(hostKey, write, bytes, elapsed)
+// waitFailedRPCs waits for n failed RPCs to be recorded, then returns the hosts
+// they were recorded against. Attempts report as they unwind, so a transfer may
+// finish before every host it gave up on has reported.
+func (m *mockHostClient) waitFailedRPCs(t testing.TB, n int) []types.PublicKey {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.failedMu.Lock()
+		hks := slices.Clone(m.failedRPCs)
+		m.failedMu.Unlock()
+		if len(hks) >= n {
+			return hks
+		} else if time.Now().After(deadline) {
+			t.Fatalf("expected %d failed RPCs, got %d", n, len(hks))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
-// TimedOutRPCs returns the number of AddTimedOutRPC calls per host.
-func (m *mockHostClient) TimedOutRPCs() map[types.PublicKey]int {
-	m.failedMu.Lock()
-	defer m.failedMu.Unlock()
-	timedOut := make(map[types.PublicKey]int, len(m.timedOutRPCs))
-	maps.Copy(timedOut, m.timedOutRPCs)
-	return timedOut
-}
-
-// FailedRPCs returns the number of AddFailedRPC calls per host.
-func (m *mockHostClient) FailedRPCs() map[types.PublicKey]int {
-	m.failedMu.Lock()
-	defer m.failedMu.Unlock()
-	failed := make(map[types.PublicKey]int, len(m.failedRPCs))
-	maps.Copy(failed, m.failedRPCs)
-	return failed
+// recordFailedRPC mirrors the context half of the real client's isFailedRPC: an
+// RPC interrupted by its context is not counted against the host, since the
+// client cannot tell a host that misbehaved from a caller that cancelled. Only
+// the caller owning the deadline can, so it reports those itself with
+// [hostClient.AddTimedOutRPC] or [hostClient.AddFailedRPC].
+func (m *mockHostClient) recordFailedRPC(ctx context.Context, hostKey types.PublicKey) {
+	if ctx.Err() != nil {
+		return
+	}
+	m.provider.AddFailedRPC(hostKey)
 }
 
 // UploadQueue implements the [hostClient] interface.
@@ -243,11 +311,9 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 
 	start := time.Now()
 	defer func() {
-		// the real client skips failure accounting for RPCs interrupted by
-		// their context
-		if err != nil && ctx.Err() == nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else if err == nil {
+		if err != nil {
+			m.recordFailedRPC(ctx, hostKey)
+		} else {
 			m.provider.AddWriteSample(hostKey, uint64(len(data)), time.Since(start))
 		}
 	}()
@@ -284,11 +350,9 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
 	start := time.Now()
 	defer func() {
-		// the real client skips failure accounting for RPCs interrupted by
-		// their context
-		if err != nil && ctx.Err() == nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else if err == nil {
+		if err != nil {
+			m.recordFailedRPC(ctx, hostKey)
+		} else {
 			m.provider.AddReadSample(hostKey, length, time.Since(start))
 		}
 	}()
@@ -323,11 +387,9 @@ func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hos
 func (m *mockHostClient) Prices(ctx context.Context, hostKey types.PublicKey) (_ proto.HostPrices, err error) {
 	start := time.Now()
 	defer func() {
-		// the real client skips failure accounting for RPCs interrupted by
-		// their context
-		if err != nil && ctx.Err() == nil {
-			m.provider.AddFailedRPC(hostKey)
-		} else if err == nil {
+		if err != nil {
+			m.recordFailedRPC(ctx, hostKey)
+		} else {
 			m.provider.AddSettingsSample(hostKey, time.Since(start))
 		}
 	}()
@@ -457,8 +519,6 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 		hostSectors:  make(map[types.PublicKey]map[types.Hash256][]byte),
 		writeCalls:   make(map[types.PublicKey]int),
 		pricesCalls:  make(map[types.PublicKey]int),
-		failedRPCs:   make(map[types.PublicKey]int),
-		timedOutRPCs: make(map[types.PublicKey]int),
 	}
 	return m
 }

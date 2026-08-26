@@ -625,31 +625,34 @@ func TestRefreshHosts(t *testing.T) {
 	}
 }
 
-func TestWriteTimeoutDemotesHost(t *testing.T) {
-	sdk, hosts := newTestSDK(t, 10, zaptest.NewLogger(t))
+// TestWriteSectorTimeout asserts writeSector reports the attempt deadline it
+// owns, but not one inherited from its caller, so only a host that stalled for
+// the whole attempt is reported as having timed out.
+func TestWriteSectorTimeout(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 1, zaptest.NewLogger(t))
 	defer sdk.Close()
 
 	usable, _ := hosts.hosts.UsableHosts()
-	slow := usable[0].PublicKey
-	hosts.SetSlowHostKeys([]types.PublicKey{slow}, time.Minute)
+	hostKey := usable[0].PublicKey
+	hosts.SetSlowHostKeys([]types.PublicKey{hostKey}, time.Second)
+	data := make([]byte, 1024)
 
-	accountKey := types.GeneratePrivateKey()
-	sector := make([]byte, proto.SectorSize)
-
-	// assert the host that reached the write deadline was demoted
-	if _, err := writeSector(t.Context(), hosts, accountKey, slow, sector, 250*time.Millisecond); err == nil {
+	_, timedOut, err := writeSector(t.Context(), hosts, sdk.appKey, hostKey, data, 10*time.Millisecond)
+	if err == nil {
 		t.Fatal("expected the write to fail")
-	} else if timedOut := hosts.TimedOutRPCs(); timedOut[slow] != 1 {
-		t.Fatal("unexpected demotions", timedOut)
+	} else if !timedOut {
+		t.Fatal("a stalled write was not reported as timed out")
 	}
 
-	// assert a write abandoned by its caller is not held against the host
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := writeSector(ctx, hosts, accountKey, slow, sector, time.Minute); err == nil {
+	// a deadline on the caller's context is cancellation from above, not
+	// evidence that the host stalled for the upload timeout
+	parent, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, timedOut, err = writeSector(parent, hosts, sdk.appKey, hostKey, data, time.Second)
+	if err == nil {
 		t.Fatal("expected the write to fail")
-	} else if timedOut := hosts.TimedOutRPCs(); timedOut[slow] != 1 {
-		t.Fatal("unexpected demotions", timedOut)
+	} else if timedOut {
+		t.Fatal("the caller's deadline was reported as a host timeout")
 	}
 }
 
@@ -670,11 +673,11 @@ func TestWarmupDemotesUnresponsiveHost(t *testing.T) {
 	}
 
 	// assert only the host that reached the warmup deadline was demoted
-	failed := hosts.FailedRPCs()
-	if failed[slow] == 0 {
-		t.Fatal("expected the unresponsive host to be demoted")
-	} else if len(failed) != 1 {
+	failed := hosts.waitFailedRPCs(t, 1)
+	if len(failed) != 1 {
 		t.Fatal("unexpected demotions", failed)
+	} else if failed[0] != slow {
+		t.Fatal("expected the unresponsive host to be demoted, got", failed[0])
 	}
 }
 

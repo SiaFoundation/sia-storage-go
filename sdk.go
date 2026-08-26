@@ -181,17 +181,21 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 		wg.Go(func() {
 			defer release()
 			permit := limiter.sample()
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
-			start := time.Now()
-			_, err := s.hosts.ReadSector(timeoutCtx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
-			elapsed := time.Since(start)
+			elapsed, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+				_, err := s.hosts.ReadSector(ctx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+				return err
+			})
 			// a read aborted because the chunk already had enough shards
 			// measured the cancellation, not the network, so it is not a
 			// congestion signal
 			if ctx.Err() == nil {
 				limiter.record(permit, elapsed, err == nil)
+			}
+			// the bytes that landed are the worst-case throughput sample; the
+			// whole region over a short timeout would score a stall as fast
+			if timedOut {
+				s.hosts.AddTimedOutRPC(d.sector.HostKey, false, uint64(buf.Len()), elapsed)
 			}
 			select {
 			case <-ctx.Done():
@@ -203,10 +207,6 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 				elapsed: elapsed,
 			}:
 			}
-			// a host only gets demoted when it hits the shard timeout. reads
-			// cancelled because the chunk completed without them are expected
-			// with overprovisioning and do not count against the host
-			demoteOnTimeout(timeoutCtx, ctx, s.hosts, d.sector.HostKey, false, length, elapsed)
 		})
 	}
 
@@ -1051,14 +1051,17 @@ func (s *SDK) warmConnections(ctx context.Context, hks []types.PublicKey) error 
 				wg.Done()
 				<-sema
 			}()
-			pCtx, pCancel := context.WithTimeout(ctx, time.Second)
-			defer pCancel()
-			_, err := s.hosts.Prices(pCtx, hk)
+			_, timedOut, err := timedAttempt(ctx, time.Second, func(ctx context.Context) error {
+				_, err := s.hosts.Prices(ctx, hk)
+				return err
+			})
+
 			if err == nil {
 				warmed.Add(1)
-			} else if pCtx.Err() != nil && ctx.Err() == nil {
-				// rank hosts that did not answer within the deadline behind
-				// those that did
+			} else if timedOut {
+				// a prices RPC carries no bulk data, so a stalled one says
+				// nothing about throughput. only the failure rate, which
+				// decays, holds the warmup against the host
 				s.hosts.AddFailedRPC(hk)
 			}
 		}(tCtx, hk)
@@ -1083,24 +1086,32 @@ func sectorRegion(ss slabs.SlabSlice) (offset, length uint64) {
 	return uint64(start), uint64(end - start)
 }
 
-// demoteOnTimeout records a host failure and the worst case throughput it
-// implies when the transfer reached its own deadline while the parent context
-// was still live.
-func demoteOnTimeout(timeoutCtx, parentCtx context.Context, client hostClient, hostKey types.PublicKey, write bool, bytes uint64, elapsed time.Duration) {
-	if timeoutCtx.Err() != nil && parentCtx.Err() == nil {
-		client.AddTimedOutRPC(hostKey, write, bytes, elapsed)
-	}
+// timedAttempt runs fn against a single host under its own timeout, reporting
+// how long fn took and whether it ate that deadline rather than one inherited
+// from ctx. Only the caller that owns the deadline can tell a host that stalled
+// from a caller that cancelled, so the verdict is taken here, while the attempt
+// context is still the freshest thing that cancelled.
+func timedAttempt(ctx context.Context, timeout time.Duration, fn func(ctx context.Context) error) (time.Duration, bool, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now()
+	err := fn(attemptCtx)
+	elapsed := time.Since(start)
+	timedOut := err != nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	return elapsed, timedOut, err
 }
 
-// writeSector uploads a single sector to a host with the given timeout,
-// demoting the host when the attempt reaches that deadline.
-func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	start := time.Now()
-	result, err := client.WriteSector(timeoutCtx, accountKey, hostKey, data)
-	demoteOnTimeout(timeoutCtx, ctx, client, hostKey, true, uint64(len(data)), time.Since(start))
-	return result.Root, err
+// writeSector uploads a single sector to a host with the given timeout, also
+// reporting whether the write ate that deadline; see [timedAttempt].
+func writeSector(ctx context.Context, client hostClient, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte, timeout time.Duration) (types.Hash256, bool, error) {
+	var root types.Hash256
+	_, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
+		result, err := client.WriteSector(ctx, accountKey, hostKey, data)
+		root = result.Root
+		return err
+	})
+	return root, timedOut, err
 }
 
 // WithRedundancy sets the number of data and parity shards for the upload.

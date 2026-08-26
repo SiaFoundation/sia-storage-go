@@ -72,7 +72,7 @@ func TestUploadReaderError(t *testing.T) {
 // five fast hosts. Only the fast hosts have write samples, and the picker
 // prefers unsampled hosts, so the slow host wins the initial pick while the
 // seeded samples keep the race timeout small enough for a racer to beat it.
-func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCounter) (*shardUpload, types.PublicKey) {
+func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCounter) (*shardUpload, *mockHostClient, types.PublicKey) {
 	t.Helper()
 	sdk, hosts := newTestSDK(t, 6, zaptest.NewLogger(t))
 	t.Cleanup(func() { sdk.Close() })
@@ -107,7 +107,7 @@ func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCou
 		shardsCh:   make(chan shard, 1),
 		waiting:    waiting,
 	}
-	return su, slow
+	return su, hosts, slow
 }
 
 func TestUploadRacing(t *testing.T) {
@@ -171,7 +171,7 @@ func TestUploadRacing(t *testing.T) {
 	// a shard whose initial host is slow must not race while another shard is
 	// still waiting for its first attempt
 	waiting := newChangeCounter(1)
-	su, slow := racingShardUpload(t, 600*time.Millisecond, waiting)
+	su, _, slow := racingShardUpload(t, 600*time.Millisecond, waiting)
 	waiting.add(1) // this shard's own pending attempt
 	sector := make([]byte, proto.SectorSize)
 	start := time.Now()
@@ -190,7 +190,7 @@ func TestUploadRacing(t *testing.T) {
 	// the other shard starting its attempt at 150ms opens the gate, so racing
 	// should begin then instead of waiting out the 1500ms slow host
 	waiting = newChangeCounter(1)
-	su, slow = racingShardUpload(t, 1500*time.Millisecond, waiting)
+	su, _, slow = racingShardUpload(t, 1500*time.Millisecond, waiting)
 	waiting.add(1) // this shard's own pending attempt
 	time.AfterFunc(150*time.Millisecond, func() { waiting.add(-1) })
 	sector = make([]byte, proto.SectorSize)
@@ -210,9 +210,44 @@ func TestUploadRacing(t *testing.T) {
 	}
 }
 
+// TestUploadInitialHostBeaten asserts the host that took the shard's first
+// attempt and was still uploading when a racer won is demoted, so it does not
+// keep winning the initial pick over the hosts that delivered.
+func TestUploadInitialHostBeaten(t *testing.T) {
+	waiting := newChangeCounter(1)
+	su, hosts, slow := racingShardUpload(t, 1500*time.Millisecond, waiting)
+	waiting.add(1) // this shard's own pending attempt
+
+	// the gate opens at 150ms, so a racer beats the 1500ms slow host
+	time.AfterFunc(150*time.Millisecond, func() { waiting.add(-1) })
+	sector := make([]byte, proto.SectorSize)
+	go su.uploadShard(t.Context(), 0, sector)
+
+	res := <-su.shardsCh
+	if res.err != nil {
+		t.Fatal(res.err)
+	} else if res.host == slow {
+		t.Fatal("expected a racer to win")
+	}
+
+	// only the beaten initial host is demoted, and only against its failure
+	// rate: it was cancelled partway through an upload of unknown progress, so
+	// the sector over the time the racer took to win would score it far faster
+	// than it was
+	hks := hosts.waitFailedRPCs(t, 1)
+	hosts.waitInflightDrained(t) // let every attempt unwind before asserting
+	if len(hks) != 1 {
+		t.Fatalf("expected 1 failed RPC, got %d", len(hks))
+	} else if hks[0] != slow {
+		t.Fatalf("expected the beaten host %v, got %v", slow, hks[0])
+	} else if rpcs := hosts.TimedOutRPCs(); len(rpcs) != 0 {
+		t.Fatalf("expected no throughput sample from a beaten host, got %d", len(rpcs))
+	}
+}
+
 func TestUploadGateReleasedOnCancel(t *testing.T) {
 	waiting := newChangeCounter(0)
-	su, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
+	su, _, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
 
 	// fill the limiter so the initial permit acquire blocks
 	var releases []func()
