@@ -26,6 +26,8 @@ import (
 	"github.com/vbauerster/mpb/v8/decor"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/api"
+	"go.sia.tech/indexd/slabs"
 	siastorage "go.sia.tech/siastorage"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -494,6 +496,20 @@ func listProfiles() error {
 }
 
 func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadMaxBufferedSlabs, downloadMaxBufferedChunks int, hostSummary bool) error {
+	// clean up data from last run
+	existing, err := sdk.ObjectEvents(ctx, slabs.Cursor{}, 500)
+	if err != nil {
+		return fmt.Errorf("failed to list existing objects: %w", err)
+	}
+	for _, obj := range existing {
+		if err := sdk.DeleteObject(ctx, obj.Key); err != nil {
+			log.Printf("failed to delete object: %v", err)
+		}
+	}
+	if err := sdk.PruneSlabs(ctx, api.WithBefore(time.Now())); err != nil {
+		log.Printf("failed to prune slabs: %v", err)
+	}
+
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return fmt.Errorf("failed to generate seed: %w", err)
@@ -532,27 +548,8 @@ func runBenchmark(ctx context.Context, sdk *siastorage.SDK, size uint64, uploadM
 	uploadBar.SetCurrent(int64(size)) // ensure the bar completes
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
-		// The upload succeeded but the slabs were never associated with an
-		// object, so prune them best-effort to avoid leaving orphaned data.
-		if pruneErr := sdk.PruneSlabs(ctx); pruneErr != nil {
-			log.Printf("failed to prune slabs after pin failure: %v", pruneErr)
-		}
-		progress.Wait()
 		return fmt.Errorf("failed to pin object: %w", err)
 	}
-
-	// Best-effort cleanup so a failure during download/verification doesn't
-	// leave a pinned object and its slabs behind in the user's account. Both
-	// steps run independently: PruneSlabs is safe and useful even if the
-	// object delete fails, since it only removes unreferenced slabs.
-	defer func() {
-		if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
-			log.Printf("failed to delete object: %v", err)
-		}
-		if err := sdk.PruneSlabs(ctx); err != nil {
-			log.Printf("failed to prune slabs: %v", err)
-		}
-	}()
 
 	// download and verify the data
 	downloadHosts := newHostStats()
