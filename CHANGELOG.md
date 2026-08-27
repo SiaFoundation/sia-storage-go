@@ -1,3 +1,21 @@
+## 0.2.1 (2026-08-27)
+
+### Features
+
+#### Pin slabs implicitly on upload
+
+`Upload` and `UploadPacked` now pin each slab to the indexer as soon as it finishes uploading, so its sectors are protected before the object itself is pinned. `PinObject` attempts to save the object first and only pins slabs when the indexer reports one is missing, which makes pinning an uploaded object a single request.
+
+### Fixes
+
+- SDK: Demote hosts that reach their attempt deadlines
+- Fix "no more hosts available"
+- SDK: Floor the racing estimate at a full size read
+
+#### SDK: Fix silent slab corruption at the maximum redundancy
+
+`collectSlabs` summed `dataShards` and `parityShards` as `uint8` while the rest of the upload path widened them to `int`. A redundancy summing to exactly 256, such as `WithRedundancy(128, 128)`, wrapped the total to zero, so the shard results were never collected and the upload appended a slab with no sectors. The upload reported success and the object was undownloadable.
+
 ## 0.2.0 (2026-08-12)
 
 ### Breaking Changes
