@@ -348,7 +348,8 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 }
 
 // ReadSector implements the [hostClient] interface.
-func (m *mockHostClient) ReadSector(ctx context.Context, _ types.PrivateKey, hostKey types.PublicKey, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
+func (m *mockHostClient) ReadSector(ctx context.Context, token proto.AccountToken, sectorRoot types.Hash256, w io.Writer, offset, length uint64) (_ rhp.RPCReadSectorResult, err error) {
+	hostKey := token.HostKey
 	start := time.Now()
 	defer func() {
 		if err != nil {
@@ -527,14 +528,15 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 type mockAppClient struct {
 	hosts *hostCache
 
-	mu            sync.Mutex
-	pinned        map[slabs.SlabID]slabs.PinnedSlab
-	pinnedAt      map[slabs.SlabID]time.Time
-	objects       map[types.Hash256]slabs.SealedObject
-	deleted       map[types.Hash256]time.Time
-	hostsOverride []hosts.HostInfo
-	pinSlabsCalls []int
-	pinSlabsFails int
+	mu             sync.Mutex
+	pinned         map[slabs.SlabID]slabs.PinnedSlab
+	pinnedAt       map[slabs.SlabID]time.Time
+	objects        map[types.Hash256]slabs.SealedObject
+	deleted        map[types.Hash256]time.Time
+	hostsOverride  []hosts.HostInfo
+	pinSlabsCalls  []int
+	pinSlabsParams []slabs.SlabPinParams
+	pinSlabsFails  int
 }
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
@@ -562,6 +564,7 @@ func (mc *mockAppClient) PinSlabs(ctx context.Context, _ types.PrivateKey, toPin
 	defer mc.mu.Unlock()
 
 	mc.pinSlabsCalls = append(mc.pinSlabsCalls, len(toPin))
+	mc.pinSlabsParams = append(mc.pinSlabsParams, toPin...)
 	if mc.pinSlabsFails > 0 {
 		mc.pinSlabsFails--
 		return nil, &app.HTTPError{StatusCode: http.StatusInternalServerError, Body: "pin slabs unavailable"}
@@ -795,6 +798,14 @@ func (mc *mockAppClient) PinSlabsCalls() []int {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	return slices.Clone(mc.pinSlabsCalls)
+}
+
+// PinSlabsParams returns the params of every slab passed to PinSlabs,
+// including the calls made to fail.
+func (mc *mockAppClient) PinSlabsParams() []slabs.SlabPinParams {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return slices.Clone(mc.pinSlabsParams)
 }
 
 func (mc *mockAppClient) PinnedSlabs() int {
