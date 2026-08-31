@@ -29,7 +29,7 @@ const (
 // reached, failing the upload.
 func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 	params := slab.Pin()
-	if err := params.Validate(); err != nil {
+	if err := params.Validate(time.Now()); err != nil {
 		return fmt.Errorf("slab invalid: %w", err)
 	}
 
@@ -55,8 +55,9 @@ func (s *SDK) pinSlab(ctx context.Context, slab slabs.SlabSlice) error {
 // pinSlabs validates the given slabs and pins them in batches of pinBatchSize,
 // checking the ids returned by the indexer. Errors are not retried.
 func (s *SDK) pinSlabs(ctx context.Context, params ...slabs.SlabPinParams) error {
+	now := time.Now()
 	for i := range params {
-		if err := params[i].Validate(); err != nil {
+		if err := params[i].Validate(now); err != nil {
 			return fmt.Errorf("slab %d invalid: %w", i, err)
 		}
 	}

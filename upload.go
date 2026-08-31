@@ -573,9 +573,11 @@ func (s *SDK) collectSlab(ctx context.Context, su *shardUpload, uo uploadOption,
 			if sh.err != nil {
 				return slabResult{err: fmt.Errorf("failed to upload slab: shard upload failed: %w", sh.err)}
 			}
+			uploadedAt := time.Now()
 			sectors[sh.index] = slabs.PinnedSector{
-				HostKey: sh.host,
-				Root:    sh.root,
+				UploadedAt: &uploadedAt,
+				HostKey:    sh.host,
+				Root:       sh.root,
 			}
 		}
 	}

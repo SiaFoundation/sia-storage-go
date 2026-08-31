@@ -403,15 +403,36 @@ func TestUploadPinsSlabs(t *testing.T) {
 	data := frand.Bytes(slabSize*2 + 4096)
 
 	obj := NewEmptyObject()
+	start := time.Now()
 	if err := sdk.Upload(t.Context(), &obj, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
+	end := time.Now()
 
 	// every slab is pinned by the upload itself
 	if len(obj.slabs) != 3 {
 		t.Fatal("unexpected", len(obj.slabs))
 	} else if appMock.PinnedSlabs() != 3 {
 		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+
+	// the indexer rejects sectors without a recent upload time, so every
+	// pinned sector reports when its shard finished uploading
+	params := appMock.PinSlabsParams()
+	if len(params) != 3 {
+		t.Fatal("unexpected", len(params))
+	}
+	for i, p := range params {
+		if len(p.Sectors) == 0 {
+			t.Fatalf("slab %d has no sectors", i)
+		}
+		for j, sector := range p.Sectors {
+			if sector.UploadedAt == nil {
+				t.Fatalf("slab %d sector %d: UploadedAt not set", i, j)
+			} else if sector.UploadedAt.Before(start) || sector.UploadedAt.After(end) {
+				t.Fatalf("slab %d sector %d: UploadedAt %v outside upload window [%v, %v]", i, j, *sector.UploadedAt, start, end)
+			}
+		}
 	}
 
 	// the slabs are already pinned, so pinning the object needs no further

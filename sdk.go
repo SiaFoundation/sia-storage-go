@@ -29,7 +29,7 @@ type (
 	// A hostClient is an interface for interacting with hosts.
 	hostClient interface {
 		Prices(ctx context.Context, hostKey types.PublicKey) (prices proto4.HostPrices, err error)
-		ReadSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
+		ReadSector(ctx context.Context, token proto4.AccountToken, root types.Hash256, w io.Writer, offset, length uint64) (rhp.RPCReadSectorResult, error)
 		WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error)
 
 		AddFailedRPC(hostKey types.PublicKey)
@@ -178,8 +178,9 @@ func (s *SDK) downloadSlab(ctx context.Context, slab slabs.SlabSlice, slabIndex,
 			defer release()
 			permit := limiter.sample()
 			buf := bytes.NewBuffer(make([]byte, 0, length))
+			token := proto4.NewAccountToken(s.appKey, d.sector.HostKey)
 			elapsed, timedOut, err := timedAttempt(ctx, timeout, func(ctx context.Context) error {
-				_, err := s.hosts.ReadSector(ctx, s.appKey, d.sector.HostKey, d.sector.Root, buf, offset, length)
+				_, err := s.hosts.ReadSector(ctx, token, d.sector.Root, buf, offset, length)
 				return err
 			})
 			// a read aborted because the chunk already had enough shards
