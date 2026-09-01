@@ -858,6 +858,24 @@ func validateKeyRequest(req sharing.KeyRequest) error {
 	return nil
 }
 
+// validateSharedObjectRequest reimplements the unexported
+// sharing.SharedObjectRequest.validate, which the mock cannot call. The indexer
+// runs it before touching the store, so a request it would reject must not
+// appear to succeed here.
+func validateSharedObjectRequest(req sharing.SharedObjectRequest) error {
+	switch {
+	case req.ObjectID == (types.Hash256{}):
+		return invalidSharingRequest("object ID is required")
+	case len(req.EncryptedDataKey) != sharing.EncryptionKeySize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted data key must be %d bytes", sharing.EncryptionKeySize))
+	case len(req.EncryptedMetadataKey) != 0 && len(req.EncryptedMetadataKey) != sharing.EncryptionKeySize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted metadata key must be %d bytes", sharing.EncryptionKeySize))
+	case len(req.EncryptedMetadata) > sharing.MaxMetadataSize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted metadata exceeds %d bytes", sharing.MaxMetadataSize))
+	}
+	return nil
+}
+
 // paginateSharing applies the offset and limit parameters the way the indexer's
 // paginated routes do. Passing no options means the indexer's default limit of
 // 100, and a longer list comes back cut to it with a success and nothing in the
@@ -915,6 +933,52 @@ func (sk *mockSharingKey) withSharingStats() sharing.Key {
 		key.PinnedSize += att.pinnedSize
 	}
 	return key
+}
+
+// objectSharingSizes computes the sizes the indexer captures when an object is
+// attached: the object's logical size, and its storage footprint before and
+// after redundancy. A slab referenced by more than one slice is stored once, so
+// it only counts once towards the pinned figures. Callers must hold mc.mu.
+func (mc *mockAppClient) objectSharingSizes(obj slabs.SealedObject) (size, pinnedData, pinnedSize uint64) {
+	counted := make(map[slabs.SlabID]bool)
+	for _, slab := range obj.Slabs {
+		size += uint64(slab.Length)
+
+		id := slab.Digest()
+		if counted[id] {
+			continue
+		}
+		counted[id] = true
+
+		pinned := mc.pinned[id]
+		pinnedData += uint64(pinned.MinShards) * proto.SectorSize
+		pinnedSize += uint64(len(pinned.Sectors)) * proto.SectorSize
+	}
+	return
+}
+
+// assertSharedObjectUnique enforces the UNIQUE constraints on the indexer's
+// shared_objects columns, which span every sharing key rather than one.
+// Re-attaching the same object to the same key is an update, so that row is
+// exempt. Callers must hold mc.mu.
+func (mc *mockAppClient) assertSharedObjectUnique(sharingKey types.PublicKey, req sharing.SharedObjectRequest) error {
+	conflicts := func(a, b []byte) bool {
+		return len(a) > 0 && len(b) > 0 && string(a) == string(b)
+	}
+	for pk, sk := range mc.sharingKeys {
+		for objectID, att := range sk.objects {
+			if pk == sharingKey && objectID == req.ObjectID {
+				continue // this is the row being updated
+			}
+			if conflicts(att.req.EncryptedDataKey, req.EncryptedDataKey) ||
+				conflicts(att.req.EncryptedMetadataKey, req.EncryptedMetadataKey) ||
+				att.req.DataSignature == req.DataSignature ||
+				att.req.MetadataSignature == req.MetadataSignature {
+				return sharingError(http.StatusConflict, sharing.ErrSharedObjectConflict)
+			}
+		}
+	}
+	return nil
 }
 
 // AddSharingKey implements the [appClient] interface.
@@ -1014,6 +1078,131 @@ func (mc *mockAppClient) DeleteSharingKey(_ context.Context, appKey types.Privat
 	// shared_objects cascades on the sharing key
 	delete(mc.sharingKeys, publicKey)
 	return nil
+}
+
+// AddSharedObject implements the [appClient] interface.
+func (mc *mockAppClient) AddSharedObject(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, req sharing.SharedObjectRequest) error {
+	// as with AddSharingKey, validation and signature verification happen
+	// before the store is consulted, so a bad request on an unknown key is a
+	// 400 rather than a 404
+	if err := validateSharedObjectRequest(req); err != nil {
+		return err
+	} else if err := req.VerifySignatures(sharingKey); err != nil {
+		return sharingError(http.StatusBadRequest, err)
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, sharingKey)
+	if err != nil {
+		return err
+	}
+
+	// the object must already be pinned; the indexer looks it up in the account's
+	// objects, which PinObject only admits once every slab is pinned. The mock's
+	// object store is not scoped by account, so unlike the indexer it cannot
+	// reject an object owned by someone else.
+	obj, ok := mc.objects[req.ObjectID]
+	if !ok {
+		return sharingError(http.StatusNotFound, slabs.ErrObjectNotFound)
+	}
+	if err := mc.assertSharedObjectUnique(sharingKey, req); err != nil {
+		return err
+	}
+
+	size, pinnedData, pinnedSize := mc.objectSharingSizes(obj)
+	now := time.Now()
+	// the trigger that maintains the key's totals also touches the key itself,
+	// and it is the only thing that does
+	sk.key.UpdatedAt = now
+	if existing, ok := sk.objects[req.ObjectID]; ok {
+		// re-attaching overwrites the re-sealed keys and signatures, keeps the
+		// original attach time, and leaves the key's object count alone
+		existing.req = req
+		existing.size, existing.pinnedData, existing.pinnedSize = size, pinnedData, pinnedSize
+		existing.updatedAt = now
+		return nil
+	}
+	mc.sharingSeq++
+	sk.objects[req.ObjectID] = &mockSharedObject{
+		req:        req,
+		seq:        mc.sharingSeq,
+		size:       size,
+		pinnedData: pinnedData,
+		pinnedSize: pinnedSize,
+		createdAt:  now,
+		updatedAt:  now,
+	}
+	return nil
+}
+
+// DeleteSharedObject implements the [appClient] interface.
+func (mc *mockAppClient) DeleteSharedObject(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, objectKey types.Hash256) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// the indexer deletes by a join across the key, the account and the object,
+	// so every miss is the same not-found
+	sk, ok := mc.sharingKeys[sharingKey]
+	if !ok || sk.key.Account != appKey.PublicKey() {
+		return sharingError(http.StatusNotFound, sharing.ErrSharedObjectNotFound)
+	} else if _, ok := sk.objects[objectKey]; !ok {
+		return sharingError(http.StatusNotFound, sharing.ErrSharedObjectNotFound)
+	}
+	delete(sk.objects, objectKey)
+	sk.key.UpdatedAt = time.Now()
+	return nil
+}
+
+// SharingKeyObjects implements the [appClient] interface.
+func (mc *mockAppClient) SharingKeyObjects(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, opts ...api.URLQueryParameterOption) ([]slabs.SealedObject, error) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, sharingKey)
+	if err != nil {
+		return nil, err
+	}
+
+	attached := make([]*mockSharedObject, 0, len(sk.objects))
+	for _, att := range sk.objects {
+		attached = append(attached, att)
+	}
+	// The indexer orders by attach time, most recently attached first, and
+	// re-attaching keeps the original time rather than moving the object to the
+	// front. It sorts on a timestamp rather than a row ID, so attachments sharing
+	// one transaction tie and their order is unspecified; the mock's is stable.
+	slices.SortFunc(attached, func(a, b *mockSharedObject) int {
+		return cmp.Compare(b.seq, a.seq)
+	})
+
+	page, err := paginateSharing(attached, opts...)
+	if err != nil {
+		return nil, err
+	}
+	objects := make([]slabs.SealedObject, 0, len(page))
+	for _, att := range page {
+		obj, ok := mc.objects[att.req.ObjectID]
+		if !ok {
+			// shared_objects cascades when the owner deletes the object, so the
+			// attachment simply disappears
+			continue
+		}
+		// the slabs come from the owner's object; only the encryption keys and
+		// signatures come from the attachment, re-sealed under the sharing key
+		objects = append(objects, slabs.SealedObject{
+			EncryptedDataKey:     att.req.EncryptedDataKey,
+			Slabs:                obj.Slabs,
+			DataSignature:        att.req.DataSignature,
+			EncryptedMetadataKey: att.req.EncryptedMetadataKey,
+			EncryptedMetadata:    att.req.EncryptedMetadata,
+			MetadataSignature:    att.req.MetadataSignature,
+			CreatedAt:            att.createdAt,
+			UpdatedAt:            att.updatedAt,
+		})
+	}
+	return objects, nil
 }
 
 // SetPinSlabsFailures fails the next n PinSlabs calls before they resume
