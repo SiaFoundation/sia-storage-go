@@ -6,7 +6,7 @@ replace go.sia.tech/siastorage => ../
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/vbauerster/mpb/v8 v8.15.2
+	github.com/vbauerster/mpb/v8 v8.16.0
 	go.sia.tech/core v0.21.7
 	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01
 	go.sia.tech/siastorage v0.0.0-00010101000000-000000000000
@@ -22,7 +22,7 @@ require (
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.2 // indirect
-	github.com/mattn/go-runewidth v0.0.27 // indirect
+	github.com/mattn/go-runewidth v0.0.28 // indirect
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
