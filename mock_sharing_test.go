@@ -107,6 +107,12 @@ func TestMockSharingRules(t *testing.T) {
 	other := types.GeneratePrivateKey()
 	mc := newMockAppClient(newMockHostStore(3))
 
+	// Drive the mock's clock explicitly rather than sleeping: the expiry and
+	// touched-timestamp assertions below otherwise depend on real elapsed time,
+	// and a wider window would only make a stall rarer, not harmless.
+	clock := time.Now()
+	mc.clock = func() time.Time { return clock }
+
 	sharingKey, req := newSharingKeyRequest(appKey, "photos", nil)
 	key, err := mc.AddSharingKey(ctx, appKey, req)
 	if err != nil {
@@ -235,7 +241,7 @@ func TestMockSharingRules(t *testing.T) {
 
 	// re-attaching the same object to the same key overwrites the sealed keys
 	// and signatures, and touches the key without changing its object count
-	time.Sleep(2 * time.Millisecond)
+	clock = clock.Add(time.Second)
 	if err := mc.AddSharedObject(ctx, appKey, sharingKey.PublicKey(), sealSharedObject(obj, sharingKey, false)); err != nil {
 		t.Fatal(err)
 	}
@@ -322,15 +328,17 @@ func TestMockSharingRules(t *testing.T) {
 	// Expiry is asymmetric, and the SDK has to cope with it: the reads treat an
 	// expired key as gone, but it stays deletable until the indexer's pruner
 	// removes it.
-	soon := time.Now().Add(30 * time.Millisecond)
-	expiring, expiringReq := newSharingKeyRequest(appKey, "expiring", &soon)
+	expiresAt := clock.Add(time.Hour)
+
+	expiring, expiringReq := newSharingKeyRequest(appKey, "expiring", &expiresAt)
 	if _, err := mc.AddSharingKey(ctx, appKey, expiringReq); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := mc.SharingKey(ctx, appKey, expiring.PublicKey()); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(60 * time.Millisecond)
+
+	clock = expiresAt.Add(time.Second)
 	_, err = mc.SharingKey(ctx, appKey, expiring.PublicKey())
 	assertHTTPStatus(t, err, http.StatusNotFound, sharing.ErrSharingKeyNotFound)
 	assertHTTPStatus(t, mc.AddSharedObject(ctx, appKey, expiring.PublicKey(), sealSharedObject(obj, expiring, false)), http.StatusNotFound, sharing.ErrSharingKeyNotFound)

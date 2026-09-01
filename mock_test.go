@@ -561,6 +561,12 @@ type (
 type mockAppClient struct {
 	hosts *hostCache
 
+	// clock, when set, replaces time.Now everywhere the mock records or compares
+	// a time, so a test can step past a sharing key's expiry or a slab's prune
+	// cutoff instead of sleeping and hoping. Set it before the mock is used, since
+	// it is read without holding mu.
+	clock func() time.Time
+
 	mu             sync.Mutex
 	pinned         map[slabs.SlabID]slabs.PinnedSlab
 	pinnedAt       map[slabs.SlabID]time.Time
@@ -626,7 +632,7 @@ func (mc *mockAppClient) PinSlabs(ctx context.Context, _ types.PrivateKey, toPin
 		mc.pinned[id] = ps
 		// the indexer refreshes the pin timestamp when an existing slab is
 		// pinned again
-		mc.pinnedAt[id] = time.Now()
+		mc.pinnedAt[id] = mc.now()
 	}
 	return
 }
@@ -779,7 +785,7 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 		return slabs.ErrObjectNotFound
 	}
 	delete(mc.objects, key)
-	mc.deleted[key] = time.Now()
+	mc.deleted[key] = mc.now()
 	return nil
 }
 
@@ -792,7 +798,7 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 	for _, opt := range opts {
 		opt(values)
 	}
-	cutoff := time.Now().Add(-api.DefaultSlabPruneCutoff)
+	cutoff := mc.now().Add(-api.DefaultSlabPruneCutoff)
 	if before := values.Get("before"); before != "" {
 		t, err := time.Parse(time.RFC3339Nano, before)
 		if err != nil {
@@ -834,23 +840,32 @@ func invalidSharingRequest(detail string) error {
 	return sharingError(http.StatusBadRequest, fmt.Errorf("%w: %s", sharing.ErrInvalidRequest, detail))
 }
 
+// now returns the mock's clock. It deliberately does not take mu: most callers
+// already hold it, and Go mutexes are not reentrant.
+func (mc *mockAppClient) now() time.Time {
+	if mc.clock != nil {
+		return mc.clock()
+	}
+	return time.Now()
+}
+
 // sharingKeyExpired reports whether the indexer would treat the key as gone.
 // Every lookup filters on `expires_at IS NULL OR expires_at > NOW()`, so an
 // expired key is indistinguishable from one that never existed.
-func sharingKeyExpired(expiresAt *time.Time) bool {
-	return expiresAt != nil && !expiresAt.After(time.Now())
+func sharingKeyExpired(expiresAt *time.Time, now time.Time) bool {
+	return expiresAt != nil && !expiresAt.After(now)
 }
 
 // validateKeyRequest reimplements the unexported sharing.KeyRequest.validate.
 // The mock has to duplicate it because the indexer runs it before touching the
 // store, and a request it would reject must not appear to succeed here.
-func validateKeyRequest(req sharing.KeyRequest) error {
+func validateKeyRequest(req sharing.KeyRequest, now time.Time) error {
 	switch {
 	case req.PublicKey == (types.PublicKey{}):
 		return invalidSharingRequest("public key is required")
 	case req.Nonce == (sharing.Nonce{}):
 		return invalidSharingRequest("nonce is required")
-	case req.ExpiresAt != nil && req.ExpiresAt.Before(time.Now()):
+	case req.ExpiresAt != nil && req.ExpiresAt.Before(now):
 		return invalidSharingRequest("expires at must be in the future")
 	case len(req.Description) > sharing.MaxDescriptionSize:
 		return invalidSharingRequest(fmt.Sprintf("description exceeds %d bytes", sharing.MaxDescriptionSize))
@@ -915,7 +930,7 @@ func paginateSharing[T any](items []T, opts ...api.URLQueryParameterOption) ([]T
 // 404. Callers must hold mc.mu.
 func (mc *mockAppClient) ownedSharingKey(appKey types.PrivateKey, publicKey types.PublicKey) (*mockSharingKey, error) {
 	sk, ok := mc.sharingKeys[publicKey]
-	if !ok || sk.key.Account != appKey.PublicKey() || sharingKeyExpired(sk.key.ExpiresAt) {
+	if !ok || sk.key.Account != appKey.PublicKey() || sharingKeyExpired(sk.key.ExpiresAt, mc.now()) {
 		return nil, sharingError(http.StatusNotFound, sharing.ErrSharingKeyNotFound)
 	}
 	return sk, nil
@@ -984,7 +999,7 @@ func (mc *mockAppClient) assertSharedObjectUnique(sharingKey types.PublicKey, re
 // AddSharingKey implements the [appClient] interface.
 func (mc *mockAppClient) AddSharingKey(_ context.Context, appKey types.PrivateKey, req sharing.KeyRequest) (sharing.Key, error) {
 	// the indexer validates first, then verifies the signature, then stores
-	if err := validateKeyRequest(req); err != nil {
+	if err := validateKeyRequest(req, mc.now()); err != nil {
 		return sharing.Key{}, err
 	} else if err := req.VerifySignature(); err != nil {
 		return sharing.Key{}, sharingError(http.StatusBadRequest, err)
@@ -1004,7 +1019,7 @@ func (mc *mockAppClient) AddSharingKey(_ context.Context, appKey types.PrivateKe
 		}
 	}
 
-	now := time.Now()
+	now := mc.now()
 	mc.sharingSeq++
 	sk := &mockSharingKey{
 		key: sharing.Key{
@@ -1040,10 +1055,10 @@ func (mc *mockAppClient) SharingKeys(_ context.Context, appKey types.PrivateKey,
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	account := appKey.PublicKey()
+	account, now := appKey.PublicKey(), mc.now()
 	var owned []*mockSharingKey
 	for _, sk := range mc.sharingKeys {
-		if sk.key.Account != account || sharingKeyExpired(sk.key.ExpiresAt) {
+		if sk.key.Account != account || sharingKeyExpired(sk.key.ExpiresAt, now) {
 			continue
 		}
 		owned = append(owned, sk)
@@ -1112,7 +1127,7 @@ func (mc *mockAppClient) AddSharedObject(_ context.Context, appKey types.Private
 	}
 
 	size, pinnedData, pinnedSize := mc.objectSharingSizes(obj)
-	now := time.Now()
+	now := mc.now()
 	// the trigger that maintains the key's totals also touches the key itself,
 	// and it is the only thing that does
 	sk.key.UpdatedAt = now
@@ -1151,7 +1166,7 @@ func (mc *mockAppClient) DeleteSharedObject(_ context.Context, appKey types.Priv
 		return sharingError(http.StatusNotFound, sharing.ErrSharedObjectNotFound)
 	}
 	delete(sk.objects, objectKey)
-	sk.key.UpdatedAt = time.Now()
+	sk.key.UpdatedAt = mc.now()
 	return nil
 }
 
