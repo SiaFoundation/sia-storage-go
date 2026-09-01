@@ -20,6 +20,7 @@ import (
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
+	"go.sia.tech/indexd/sharing"
 	"go.sia.tech/indexd/slabs"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/chacha20"
@@ -61,6 +62,15 @@ type (
 		PinSlabs(context.Context, types.PrivateKey, ...slabs.SlabPinParams) ([]slabs.SlabID, error)
 		UnpinSlab(context.Context, types.PrivateKey, slabs.SlabID) error
 		PruneSlabs(context.Context, types.PrivateKey, ...api.URLQueryParameterOption) error
+
+		AddSharingKey(ctx context.Context, appKey types.PrivateKey, req sharing.KeyRequest) (sharing.Key, error)
+		SharingKey(ctx context.Context, appKey types.PrivateKey, publicKey types.PublicKey) (sharing.Key, error)
+		SharingKeys(ctx context.Context, appKey types.PrivateKey, opts ...api.URLQueryParameterOption) ([]sharing.Key, error)
+		DeleteSharingKey(ctx context.Context, appKey types.PrivateKey, publicKey types.PublicKey) error
+
+		AddSharedObject(ctx context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, req sharing.SharedObjectRequest) error
+		DeleteSharedObject(ctx context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, objectKey types.Hash256) error
+		SharingKeyObjects(ctx context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, opts ...api.URLQueryParameterOption) ([]slabs.SealedObject, error)
 	}
 
 	downloadOption struct {
