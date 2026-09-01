@@ -1,6 +1,7 @@
 package siastorage
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,7 @@ import (
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
+	"go.sia.tech/indexd/sharing"
 	"go.sia.tech/indexd/slabs"
 	"go.sia.tech/mux/v3"
 	"go.uber.org/zap"
@@ -525,6 +528,36 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 	return m
 }
 
+type (
+	// A mockSharingKey is a sharing key together with the objects attached to
+	// it. The indexer keeps the aggregate totals on the key row and maintains
+	// them with a trigger; the mock recomputes them from the attachments so
+	// they cannot drift.
+	mockSharingKey struct {
+		key sharing.Key
+		// seq replaces the auto-incrementing row ID the indexer sorts its key
+		// listing by, which map iteration cannot reproduce on its own.
+		seq     uint64
+		objects map[types.Hash256]*mockSharedObject
+	}
+
+	// A mockSharedObject is one object attached to a sharing key: the keys and
+	// signatures re-sealed under that sharing key, plus the sizes the indexer
+	// captures at attach time to feed the key's totals.
+	mockSharedObject struct {
+		req sharing.SharedObjectRequest
+		// seq orders attachments the way the indexer's attach timestamp does.
+		// There is no row ID to stand in for here: shared_objects is keyed by
+		// (object, sharing key).
+		seq        uint64
+		size       uint64
+		pinnedData uint64
+		pinnedSize uint64
+		createdAt  time.Time
+		updatedAt  time.Time
+	}
+)
+
 type mockAppClient struct {
 	hosts *hostCache
 
@@ -533,6 +566,8 @@ type mockAppClient struct {
 	pinnedAt       map[slabs.SlabID]time.Time
 	objects        map[types.Hash256]slabs.SealedObject
 	deleted        map[types.Hash256]time.Time
+	sharingKeys    map[types.PublicKey]*mockSharingKey
+	sharingSeq     uint64
 	hostsOverride  []hosts.HostInfo
 	pinSlabsCalls  []int
 	pinSlabsParams []slabs.SlabPinParams
@@ -541,11 +576,12 @@ type mockAppClient struct {
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
 	return &mockAppClient{
-		hosts:    hosts,
-		objects:  make(map[types.Hash256]slabs.SealedObject),
-		pinned:   make(map[slabs.SlabID]slabs.PinnedSlab),
-		pinnedAt: make(map[slabs.SlabID]time.Time),
-		deleted:  make(map[types.Hash256]time.Time),
+		hosts:       hosts,
+		objects:     make(map[types.Hash256]slabs.SealedObject),
+		pinned:      make(map[slabs.SlabID]slabs.PinnedSlab),
+		pinnedAt:    make(map[slabs.SlabID]time.Time),
+		deleted:     make(map[types.Hash256]time.Time),
+		sharingKeys: make(map[types.PublicKey]*mockSharingKey),
 	}
 }
 
@@ -781,6 +817,202 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 		delete(mc.pinned, id)
 		delete(mc.pinnedAt, id)
 	}
+	return nil
+}
+
+// sharingError wraps err the way the indexer's HTTP layer does, so callers can
+// classify it with errors.As on [app.HTTPError] exactly as they would a real
+// response.
+func sharingError(status int, err error) error {
+	return &app.HTTPError{StatusCode: status, Body: err.Error()}
+}
+
+// invalidSharingRequest builds the 400 the indexer returns for a request that
+// fails validation, wrapping the sentinel the way the indexer does so the body
+// reads the same.
+func invalidSharingRequest(detail string) error {
+	return sharingError(http.StatusBadRequest, fmt.Errorf("%w: %s", sharing.ErrInvalidRequest, detail))
+}
+
+// sharingKeyExpired reports whether the indexer would treat the key as gone.
+// Every lookup filters on `expires_at IS NULL OR expires_at > NOW()`, so an
+// expired key is indistinguishable from one that never existed.
+func sharingKeyExpired(expiresAt *time.Time) bool {
+	return expiresAt != nil && !expiresAt.After(time.Now())
+}
+
+// validateKeyRequest reimplements the unexported sharing.KeyRequest.validate.
+// The mock has to duplicate it because the indexer runs it before touching the
+// store, and a request it would reject must not appear to succeed here.
+func validateKeyRequest(req sharing.KeyRequest) error {
+	switch {
+	case req.PublicKey == (types.PublicKey{}):
+		return invalidSharingRequest("public key is required")
+	case req.Nonce == (sharing.Nonce{}):
+		return invalidSharingRequest("nonce is required")
+	case req.ExpiresAt != nil && req.ExpiresAt.Before(time.Now()):
+		return invalidSharingRequest("expires at must be in the future")
+	case len(req.Description) > sharing.MaxDescriptionSize:
+		return invalidSharingRequest(fmt.Sprintf("description exceeds %d bytes", sharing.MaxDescriptionSize))
+	}
+	return nil
+}
+
+// paginateSharing applies the offset and limit parameters the way the indexer's
+// paginated routes do. Passing no options means the indexer's default limit of
+// 100, and a longer list comes back cut to it with a success and nothing in the
+// response to say anything was left out. An out of range limit, by contrast, is
+// a 400.
+func paginateSharing[T any](items []T, opts ...api.URLQueryParameterOption) ([]T, error) {
+	values := url.Values{}
+	for _, opt := range opts {
+		opt(values)
+	}
+
+	offset := 0
+	if v := values.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, sharingError(http.StatusBadRequest, api.ErrInvalidOffset)
+		}
+		offset = n
+	}
+	limit := 100 // api's unexported defaultLimit
+	if v := values.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > api.MaxLimit {
+			return nil, sharingError(http.StatusBadRequest, api.ErrInvalidLimit)
+		}
+		limit = n
+	}
+
+	if offset >= len(items) {
+		return nil, nil
+	}
+	return items[offset:min(offset+limit, len(items))], nil
+}
+
+// ownedSharingKey mirrors the indexer's owner-side lookup, where a key that does
+// not exist, has expired, or belongs to another account all produce the same
+// 404. Callers must hold mc.mu.
+func (mc *mockAppClient) ownedSharingKey(appKey types.PrivateKey, publicKey types.PublicKey) (*mockSharingKey, error) {
+	sk, ok := mc.sharingKeys[publicKey]
+	if !ok || sk.key.Account != appKey.PublicKey() || sharingKeyExpired(sk.key.ExpiresAt) {
+		return nil, sharingError(http.StatusNotFound, sharing.ErrSharingKeyNotFound)
+	}
+	return sk, nil
+}
+
+// withSharingStats returns the key with the aggregate totals the indexer keeps
+// on it, summed from the attachments. It reads the attachment map, so callers
+// must hold the mutex of the [mockAppClient] that owns the key.
+func (sk *mockSharingKey) withSharingStats() sharing.Key {
+	key := sk.key
+	for _, att := range sk.objects {
+		key.ObjectCount++
+		key.ObjectSize += att.size
+		key.PinnedData += att.pinnedData
+		key.PinnedSize += att.pinnedSize
+	}
+	return key
+}
+
+// AddSharingKey implements the [appClient] interface.
+func (mc *mockAppClient) AddSharingKey(_ context.Context, appKey types.PrivateKey, req sharing.KeyRequest) (sharing.Key, error) {
+	// the indexer validates first, then verifies the signature, then stores
+	if err := validateKeyRequest(req); err != nil {
+		return sharing.Key{}, err
+	} else if err := req.VerifySignature(); err != nil {
+		return sharing.Key{}, sharingError(http.StatusBadRequest, err)
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// public_key and nonce are both globally unique columns, and either
+	// violation surfaces as the same conflict
+	if _, ok := mc.sharingKeys[req.PublicKey]; ok {
+		return sharing.Key{}, sharingError(http.StatusConflict, sharing.ErrSharingKeyExists)
+	}
+	for _, sk := range mc.sharingKeys {
+		if sk.key.Nonce == req.Nonce {
+			return sharing.Key{}, sharingError(http.StatusConflict, sharing.ErrSharingKeyExists)
+		}
+	}
+
+	now := time.Now()
+	mc.sharingSeq++
+	sk := &mockSharingKey{
+		key: sharing.Key{
+			Account:     appKey.PublicKey(),
+			PublicKey:   req.PublicKey,
+			Nonce:       req.Nonce,
+			Description: req.Description,
+			ExpiresAt:   req.ExpiresAt,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		seq:     mc.sharingSeq,
+		objects: make(map[types.Hash256]*mockSharedObject),
+	}
+	mc.sharingKeys[req.PublicKey] = sk
+	return sk.key, nil
+}
+
+// SharingKey implements the [appClient] interface.
+func (mc *mockAppClient) SharingKey(_ context.Context, appKey types.PrivateKey, publicKey types.PublicKey) (sharing.Key, error) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, publicKey)
+	if err != nil {
+		return sharing.Key{}, err
+	}
+	return sk.withSharingStats(), nil
+}
+
+// SharingKeys implements the [appClient] interface.
+func (mc *mockAppClient) SharingKeys(_ context.Context, appKey types.PrivateKey, opts ...api.URLQueryParameterOption) ([]sharing.Key, error) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	account := appKey.PublicKey()
+	var owned []*mockSharingKey
+	for _, sk := range mc.sharingKeys {
+		if sk.key.Account != account || sharingKeyExpired(sk.key.ExpiresAt) {
+			continue
+		}
+		owned = append(owned, sk)
+	}
+	// the indexer orders by row ID descending, newest first
+	slices.SortFunc(owned, func(a, b *mockSharingKey) int {
+		return cmp.Compare(b.seq, a.seq)
+	})
+
+	page, err := paginateSharing(owned, opts...)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]sharing.Key, 0, len(page))
+	for _, sk := range page {
+		keys = append(keys, sk.withSharingStats())
+	}
+	return keys, nil
+}
+
+// DeleteSharingKey implements the [appClient] interface.
+func (mc *mockAppClient) DeleteSharingKey(_ context.Context, appKey types.PrivateKey, publicKey types.PublicKey) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// unlike the read paths, the delete is not filtered on expiry: an expired
+	// key is invisible but still removable
+	sk, ok := mc.sharingKeys[publicKey]
+	if !ok || sk.key.Account != appKey.PublicKey() {
+		return sharingError(http.StatusNotFound, sharing.ErrSharingKeyNotFound)
+	}
+	// shared_objects cascades on the sharing key
+	delete(mc.sharingKeys, publicKey)
 	return nil
 }
 
