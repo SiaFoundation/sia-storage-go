@@ -295,7 +295,7 @@ func TestMockSharingRules(t *testing.T) {
 	assertHTTPStatus(t, err, http.StatusBadRequest, api.ErrInvalidLimit)
 
 	// detaching reports the same not-found for an object that was never
-	// attached, a key owned by someone else, and a key that does not exist
+	// attached and for a key owned by someone else
 	detachErr := mc.DeleteSharedObject(ctx, appKey, sharingKey.PublicKey(), second.ID())
 	assertHTTPStatus(t, detachErr, http.StatusNotFound, sharing.ErrSharedObjectNotFound)
 	assertHTTPStatus(t, mc.DeleteSharedObject(ctx, other, sharingKey.PublicKey(), obj.ID()), http.StatusNotFound, sharing.ErrSharedObjectNotFound)
@@ -324,6 +324,41 @@ func TestMockSharingRules(t *testing.T) {
 	assertHTTPStatus(t, mc.DeleteSharingKey(ctx, appKey, sharingKey.PublicKey()), http.StatusNotFound, sharing.ErrSharingKeyNotFound)
 	_, err = mc.SharingKey(ctx, appKey, sharingKey.PublicKey())
 	assertHTTPStatus(t, err, http.StatusNotFound, sharing.ErrSharingKeyNotFound)
+
+	// Deleting the object detaches it everywhere, the way
+	// shared_objects.object_id ON DELETE CASCADE does.
+	cascadeKey, cascadeReq := newSharingKeyRequest(appKey, "cascade", nil)
+	if _, err := mc.AddSharingKey(ctx, appKey, cascadeReq); err != nil {
+		t.Fatal(err)
+	}
+	cascadeObj := seedSharedObject(t, mc, appKey, 1)
+	if err := mc.AddSharedObject(ctx, appKey, cascadeKey.PublicKey(), sealSharedObject(cascadeObj, cascadeKey, false)); err != nil {
+		t.Fatal(err)
+	}
+	attached, err := mc.SharingKey(ctx, appKey, cascadeKey.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	} else if attached.ObjectCount != 1 {
+		t.Fatalf("expected the object to be attached, got a count of %d", attached.ObjectCount)
+	}
+
+	clock = clock.Add(time.Second)
+	if err := mc.DeleteObject(ctx, appKey, cascadeObj.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := mc.SharingKey(ctx, appKey, cascadeKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 0 || key.ObjectSize != 0 || key.PinnedData != 0 || key.PinnedSize != 0 {
+		t.Fatalf("deleting the object left totals behind: %+v", key)
+	} else if !key.UpdatedAt.After(attached.UpdatedAt) {
+		t.Fatal("the cascade did not touch the key, which the indexer's trigger does")
+	}
+	if objects, err := mc.SharingKeyObjects(ctx, appKey, cascadeKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if len(objects) != 0 {
+		t.Fatalf("expected the attachment to be gone, got %d", len(objects))
+	}
+	assertHTTPStatus(t, mc.DeleteSharedObject(ctx, appKey, cascadeKey.PublicKey(), cascadeObj.ID()), http.StatusNotFound, sharing.ErrSharedObjectNotFound)
 
 	// Expiry is asymmetric, and the SDK has to cope with it: the reads treat an
 	// expired key as gone, but it stays deletable until the indexer's pruner

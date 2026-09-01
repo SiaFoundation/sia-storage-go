@@ -786,6 +786,19 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 	}
 	delete(mc.objects, key)
 	mc.deleted[key] = mc.now()
+
+	// Attachments cascade on the object in the indexer, and the trigger
+	// decrements the key's totals for those deletes too. Skip this and the
+	// totals, the detach path and the listing each report a deleted object
+	// differently.
+	now := mc.now()
+	for _, sk := range mc.sharingKeys {
+		if _, ok := sk.objects[key]; !ok {
+			continue
+		}
+		delete(sk.objects, key)
+		sk.key.UpdatedAt = now
+	}
 	return nil
 }
 
