@@ -341,11 +341,12 @@ func (l *inflightLimiter) release() {
 }
 
 // commit blocks until n more permits fit in the backlog, then takes them. The
-// backlog may reach the current limit plus n and never exceeds the capacity.
-// Callers must keep n within the capacity, or the first batch never fits.
+// backlog may reach the current limit plus n and otherwise stays within the
+// capacity. A batch larger than the whole capacity is admitted on its own
+// rather than parked forever, since nothing it waits on could ever free enough.
 func (l *inflightLimiter) commit(ctx context.Context, n int) (*commitment, bool) {
 	admit := func() bool {
-		if l.committed >= l.controller.currentLimit()+n || l.committed+n > l.controller.capacity {
+		if l.committed >= l.controller.currentLimit()+n || l.committed+n > max(l.controller.capacity, n) {
 			return false
 		}
 		l.committed += n

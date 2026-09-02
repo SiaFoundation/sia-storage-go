@@ -431,6 +431,47 @@ func TestInflightLimiter(t *testing.T) {
 		}
 	})
 
+	// a batch larger than the whole capacity is admitted alone rather than
+	// parked forever, and nothing else commits until it is done, so oversized
+	// batches take turns
+	t.Run("commit larger than the capacity", func(t *testing.T) {
+		limiter := newInflightLimiter(8, 2, 4, 1, zaptest.NewLogger(t)) // capacity 4
+
+		held, ok := limiter.commit(t.Context(), 30)
+		if !ok {
+			t.Fatal("oversized batch was not admitted")
+		}
+
+		// another oversized batch and one that fits, in either order
+		sizes := []int{30, 1}
+		done := make(chan *commitment, len(sizes))
+		for _, n := range sizes {
+			go func() {
+				c, _ := limiter.commit(t.Context(), n)
+				done <- c
+			}()
+		}
+		waitParked(t, limiter, len(sizes))
+
+		for i := range sizes {
+			held.releaseAll()
+			select {
+			case c := <-done:
+				if c == nil {
+					t.Fatalf("waiter %d failed to commit", i)
+				}
+				held = c
+			case <-time.After(time.Second):
+				t.Fatalf("waiter %d stayed parked after the batch ahead finished", i)
+			}
+			if len(done) != 0 {
+				t.Fatalf("waiter %d committed alongside another batch", i)
+			}
+			waitParked(t, limiter, len(sizes)-i-1)
+		}
+		held.releaseAll()
+	})
+
 	t.Run("commit cancelled", func(t *testing.T) {
 		limiter := newInflightLimiter(8, 2, 2, 1, zaptest.NewLogger(t))
 		if _, ok := limiter.commit(t.Context(), 2); !ok {

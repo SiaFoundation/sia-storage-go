@@ -11,6 +11,7 @@ import (
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/indexd/slabs"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/chacha20"
 )
 
@@ -30,6 +31,14 @@ const (
 	initialUploadInflight = 8
 	minUploadInflight     = 2
 )
+
+// newUploadLimiter creates the limiter shared by every upload an SDK runs. Its
+// capacity is the whole memory budget in encoded shards, so it covers whatever
+// redundancy each upload uses. A shard upload is both the limited and the
+// sampled unit, so the window needs no scaling.
+func newUploadLimiter(log *zap.Logger) *inflightLimiter {
+	return newInflightLimiter(initialUploadInflight, minUploadInflight, defaultShardsInMemory(), 1, log)
+}
 
 type (
 	shard struct {
@@ -68,9 +77,9 @@ type (
 		shardsCh chan shard
 
 		// waiting counts shards that still need their first upload attempt,
-		// across every slab being uploaded. A shard only races slow hosts while
-		// this is zero, so a racer never grabs a slot that another shard still
-		// needs for its first try.
+		// across every upload the SDK runs. A shard only races slow hosts while
+		// this is zero, so a racer never grabs a permit that another shard still
+		// needs for its first attempt.
 		waiting *changeCounter
 	}
 
@@ -189,8 +198,8 @@ func newUploadOption(opts ...UploadOption) (uploadOption, reedsolomon.Encoder, e
 	if uo.maxBufferedSlabs == 0 {
 		uo.maxBufferedSlabs = defaultSlabsInMemory(totalShards)
 	}
-	// a slab holds one permit per encoded shard, so the slab budget becomes a
-	// capacity only once multiplied out
+	// clamp the slab budget so an absurd value cannot become an absurd buffer;
+	// it stays at least 1, or uploadSlabs would deadlock
 	uo.maxBufferedSlabs = clampBufferBudget(uo.maxBufferedSlabs, totalShards)
 
 	return uo, enc, nil
@@ -237,16 +246,11 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 	totalShards := dataShards + parityShards
 	dataSize := dataShards * proto4.SectorSize
 
-	// adapt the number of shard uploads in flight, capped by the memory budget.
-	// newUploadOption already clamped the slab budget, so this cannot exceed
-	// maxInflightLimit. A shard upload is both the limited and the sampled
-	// unit, so the window needs no scaling.
-	capacity := uo.maxBufferedSlabs * totalShards
-	limiter := newInflightLimiter(initialUploadInflight, minUploadInflight, capacity, 1, s.log)
-
-	// counts shards that still need their first attempt. shared across every
-	// slab so a racer never steals a slot another shard still needs.
-	waiting := newChangeCounter(0)
+	// bufferedSlabs holds this upload to its own slab budget, since the shared
+	// limiter's capacity is the whole memory budget. abandon frees a slab that
+	// never reached its encode goroutine, which otherwise frees it
+	bufferedSlabs := make(chan struct{}, uo.maxBufferedSlabs)
+	abandon := func() { <-bufferedSlabs }
 
 	// send guards against blocking on a full channel when the consumer
 	// has stopped reading due to an error or context cancellation
@@ -259,17 +263,17 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 
 	// read slabs in a loop
 	for i := 0; ctx.Err() == nil; i++ {
-		// commit memory for the slab's encoded shards before reading it, so
-		// encoding cannot run away ahead of the uploads
-		slabCommitment, ok := limiter.commit(ctx, totalShards)
-		if !ok {
+		// buffer one more slab
+		select {
+		case bufferedSlabs <- struct{}{}:
+		case <-ctx.Done():
 			return
 		}
 
 		// fetch hosts and drain into a candidate pool for PickWrite
 		queue, err := s.hosts.UploadQueue()
 		if err != nil {
-			slabCommitment.releaseAll()
+			abandon()
 			send(slabUpload{err: fmt.Errorf("failed to get upload queue for slab %d: %w", i, err)})
 			return
 		}
@@ -278,7 +282,7 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			candidates = append(candidates, host)
 		}
 		if len(candidates) < totalShards {
-			slabCommitment.releaseAll()
+			abandon()
 			send(slabUpload{err: fmt.Errorf("not enough hosts available to upload slab %d: %d < %d", i, len(candidates), totalShards)})
 			return
 		}
@@ -289,11 +293,20 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 		n, err := readSlab(r, buf)
 		last := err == io.EOF
 		if err != nil && !last {
-			slabCommitment.releaseAll()
+			abandon()
 			send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, err)})
 			return
 		} else if n == 0 {
-			slabCommitment.releaseAll()
+			abandon()
+			return
+		}
+
+		// commit memory for the slab's encoded shards before encoding, so
+		// encoding cannot run away ahead of the uploads. committing after the
+		// read keeps a packed upload idling between objects from holding permits
+		slabCommitment, ok := s.uploadLimiter.commit(ctx, totalShards)
+		if !ok {
+			abandon()
 			return
 		}
 
@@ -303,24 +316,29 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			onProgress:    uo.onProgress,
 			encryptionKey: slabKeys.key(i),
 			slabIndex:     i,
-			limiter:       limiter,
+			limiter:       s.uploadLimiter,
 			pool:          newUploadPool(s.hosts, candidates, totalShards),
 			commitment:    slabCommitment,
 			shardsCh:      make(chan shard, totalShards),
-			waiting:       waiting,
+			waiting:       s.uploadWaiting,
 		}
 		resultCh := make(chan slabResult, 1)
 
 		// count this slab's shards as waiting before the encode goroutine starts
 		// so the racing gate cannot open between buffering and the first upload
 		// attempts
-		waiting.add(totalShards)
+		su.waiting.add(totalShards)
 
 		// encrypt, stripe, and encode off the read loop; buf starts at a slab
 		// boundary, so the slab's stream starts at offset 0, and encode errors
 		// surface through the shard channel
 		buf = buf[:n]
 		go func() {
+			// the buffered slab is freed once every shard is done, not when the
+			// slab reports, since a failed slab reports first
+			var wg sync.WaitGroup
+			defer func() { wg.Wait(); <-bufferedSlabs }()
+
 			encrypt(su.encryptionKey, buf)
 			shards := make([][]byte, totalShards)
 			for j := range shards {
@@ -329,13 +347,13 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			splitShards(shards[:dataShards], buf)
 			if err := enc.Encode(shards); err != nil {
 				// no shard gets its first attempt, so release the whole slab
-				waiting.add(-totalShards)
+				su.waiting.add(-totalShards)
 				su.commitment.releaseAll()
 				resultCh <- slabResult{err: fmt.Errorf("failed to encode slab %d shards: %w", su.slabIndex, err)}
 				return
 			}
 			for shardIdx, data := range shards {
-				go su.uploadShard(ctx, shardIdx, data)
+				wg.Go(func() { su.uploadShard(ctx, shardIdx, data) })
 			}
 
 			// pin from the slab task so a slab is protected as soon as its
@@ -365,9 +383,9 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 	c, _ := chacha20.NewUnauthenticatedCipher(su.encryptionKey[:], nonce)
 	c.XORKeyStream(sector, sector)
 
-	// this shard counts toward waiting until it gets its first slot. only
+	// this shard counts toward waiting until it gets its first permit. only
 	// release once. the defer keeps the count right even if we bail out early,
-	// like when the context is cancelled before a slot frees up.
+	// like when the context is cancelled before a permit frees up.
 	var releaseOnce sync.Once
 	releaseWaiting := func() { releaseOnce.Do(func() { su.waiting.add(-1) }) }
 	defer releaseWaiting()
@@ -378,7 +396,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 		su.shardsCh <- shard{index: shardIndex, err: ctx.Err()}
 		return
 	}
-	// got a slot, so this shard no longer holds racing back
+	// got a permit, so this shard no longer holds racing back
 	releaseWaiting()
 
 	initialHost, initialRelease, initialAttempts, ok := su.pool.pickInitial()

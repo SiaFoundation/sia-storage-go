@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/coreutils/rhp/v4"
 	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
@@ -245,6 +247,32 @@ func TestUploadInitialHostBeaten(t *testing.T) {
 	}
 }
 
+// TestUploadPackedIdleHoldsNoPermits asserts a packed upload waiting for its
+// first object holds no permits on the shared limiter, so idle packed uploads
+// cannot park every other upload behind the lookahead gate.
+func TestUploadPackedIdleHoldsNoPermits(t *testing.T) {
+	sdk, _ := newTestSDK(t, 15, zaptest.NewLogger(t))
+	t.Cleanup(func() { sdk.Close() })
+
+	for range 2 {
+		u, err := sdk.UploadPacked(WithRedundancy(4, 11))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { u.Close() })
+	}
+
+	// give the read loops time to reach the pipe. an upload that commits before
+	// reading has done so by then
+	time.Sleep(200 * time.Millisecond)
+	sdk.uploadLimiter.mu.Lock()
+	committed := sdk.uploadLimiter.committed
+	sdk.uploadLimiter.mu.Unlock()
+	if committed != 0 {
+		t.Fatalf("idle packed uploads hold %d permits", committed)
+	}
+}
+
 func TestUploadGateReleasedOnCancel(t *testing.T) {
 	waiting := newChangeCounter(0)
 	su, _, _ := racingShardUpload(t, 600*time.Millisecond, waiting)
@@ -302,15 +330,12 @@ func TestUploadMaxBufferedSlabs(t *testing.T) {
 		t.Fatal("unexpected max buffered slabs", uo.maxBufferedSlabs)
 	}
 
-	// an absurd budget is clamped so the shard capacity it converts to stays
-	// within the controller's ceiling, keeping the queues sized from it in step
+	// an absurd budget is clamped, so it cannot turn into an absurd buffer
 	uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(maxInflightLimit+1), WithRedundancy(10, 20))
 	if err != nil {
 		t.Fatal(err)
 	} else if want := maxInflightLimit / 30; uo.maxBufferedSlabs != want {
 		t.Fatalf("expected max buffered slabs clamped to %d, got %d", want, uo.maxBufferedSlabs)
-	} else if capacity := uo.maxBufferedSlabs * 30; capacity > maxInflightLimit {
-		t.Fatal("clamped slab budget still exceeds the inflight ceiling", capacity)
 	}
 }
 
@@ -474,5 +499,94 @@ func TestUploadPinFails(t *testing.T) {
 		t.Fatal("unexpected", calls)
 	} else if appMock.PinnedSlabs() != 0 {
 		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+}
+
+// overloadHostClient models a network that refuses every write in a batch when
+// more than maxConcurrent writes contend for it.
+type overloadHostClient struct {
+	hostClient
+
+	mu            sync.Mutex
+	batch         *overloadBatch
+	maxConcurrent int
+	delay         time.Duration
+}
+
+type overloadBatch struct {
+	done       chan struct{}
+	writes     int
+	overloaded bool
+}
+
+func (c *overloadHostClient) WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error) {
+	c.mu.Lock()
+	if c.batch == nil {
+		c.batch = &overloadBatch{done: make(chan struct{})}
+		batch := c.batch
+		time.AfterFunc(c.delay, func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.batch == batch {
+				c.batch = nil
+				close(batch.done)
+			}
+		})
+	}
+	batch := c.batch
+	batch.writes++
+	if batch.writes > c.maxConcurrent {
+		batch.overloaded = true
+		c.batch = nil
+		close(batch.done)
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return rhp.RPCWriteSectorResult{}, ctx.Err()
+	case <-batch.done:
+	}
+
+	c.mu.Lock()
+	overloaded := batch.overloaded
+	c.mu.Unlock()
+
+	if overloaded {
+		return rhp.RPCWriteSectorResult{}, errors.New("network overloaded")
+	}
+	return c.hostClient.WriteSector(ctx, accountKey, hostKey, data)
+}
+
+// TestUploadNoMoreHostsRegression asserts concurrent uploads adapt to one network
+// together. Independent per-upload limiters never get below the network's
+// combined ceiling, so every retry fails and the candidate pools run dry.
+func TestUploadNoMoreHostsRegression(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+	const totalShards = dataShards + parityShards
+	const uploads = 3
+
+	// there are three times as many hosts as a slab needs, so a pool only runs
+	// dry if the upload pipeline incorrectly overloads the network itself.
+	sdk, hosts := newTestSDK(t, totalShards*3, zaptest.NewLogger(t))
+	defer sdk.Close()
+	sdk.hosts = &overloadHostClient{
+		hostClient:    hosts,
+		maxConcurrent: minUploadInflight,
+		delay:         200 * time.Millisecond,
+	}
+
+	data := frand.Bytes(dataShards * proto.SectorSize)
+	errCh := make(chan error, uploads)
+	for range uploads {
+		go func() {
+			obj := NewEmptyObject()
+			errCh <- sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards))
+		}()
+	}
+	for range uploads {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
