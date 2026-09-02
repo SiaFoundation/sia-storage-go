@@ -2,6 +2,7 @@ package siastorage
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -252,6 +253,8 @@ type inflightLimiter struct {
 	committed int // permits held by buffered work
 	parked    int // callers blocked in wait
 
+	pending []*commitment // callers in commit, in arrival order
+
 	// changed closes whenever a permit is freed or the limit grows, waking
 	// every parked caller to re-check, then a fresh channel takes its place.
 	// Like [changeCounter], handing the channel out under mu is what stops a
@@ -344,9 +347,23 @@ func (l *inflightLimiter) release() {
 // backlog may reach the current limit plus n and otherwise stays within the
 // capacity. A batch larger than the whole capacity is admitted on its own
 // rather than parked forever, since nothing it waits on could ever free enough.
+// Batches are served in arrival order, so a stream of smaller batches cannot
+// keep a larger one parked forever.
 func (l *inflightLimiter) commit(ctx context.Context, n int) (*commitment, bool) {
+	c := &commitment{limiter: l, remaining: n}
+	l.mu.Lock()
+	l.pending = append(l.pending, c)
+	l.mu.Unlock()
+	// leave the line whether admitted or not, so the next batch gets its turn
+	defer func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.pending = slices.DeleteFunc(l.pending, func(p *commitment) bool { return p == c })
+		l.notify()
+	}()
+
 	admit := func() bool {
-		if l.committed >= l.controller.currentLimit()+n || l.committed+n > max(l.controller.capacity, n) {
+		if l.pending[0] != c || l.committed >= l.controller.currentLimit()+n || l.committed+n > max(l.controller.capacity, n) {
 			return false
 		}
 		l.committed += n
@@ -355,7 +372,7 @@ func (l *inflightLimiter) commit(ctx context.Context, n int) (*commitment, bool)
 	if !l.wait(ctx, admit) {
 		return nil, false
 	}
-	return &commitment{limiter: l, remaining: n}, true
+	return c, true
 }
 
 // sample stamps an operation about to be dispatched; see
@@ -409,7 +426,5 @@ func (c *commitment) free(n int) {
 	}
 	c.remaining -= n
 	c.limiter.committed -= n
-	// committers ask for different amounts, so wake them all; handing the
-	// wakeup to one would let a large batch keep a smaller one parked
 	c.limiter.notify()
 }

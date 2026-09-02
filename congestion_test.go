@@ -380,22 +380,17 @@ func TestInflightLimiter(t *testing.T) {
 		}
 	})
 
-	// freed permits are not interchangeable between requests of different sizes,
-	// so a small committer must not stay parked behind a larger one that still
-	// does not fit
-	t.Run("commit mixed sizes", func(t *testing.T) {
+	// batches are served in arrival order, so a small batch that would fit waits
+	// behind a larger one that does not, rather than starving it
+	t.Run("commit in order", func(t *testing.T) {
 		limiter := newInflightLimiter(8, 2, 12, 1, zaptest.NewLogger(t)) // limit 8, capacity 12
 
-		if _, ok := limiter.commit(t.Context(), 8); !ok {
+		first, ok := limiter.commit(t.Context(), 8)
+		if !ok {
 			t.Fatal("failed to commit the first batch")
 		}
-		second, ok := limiter.commit(t.Context(), 4)
-		if !ok {
-			t.Fatal("failed to commit the second batch")
-		}
 
-		// park a batch too large to fit even once the second batch frees up, so
-		// it is first in line ahead of one that will fit
+		// park a batch that does not fit, then one behind it that would
 		big := make(chan *commitment, 1)
 		go func() {
 			c, _ := limiter.commit(t.Context(), 5)
@@ -411,23 +406,58 @@ func TestInflightLimiter(t *testing.T) {
 		waitParked(t, limiter, 2)
 		select {
 		case <-small:
-			t.Fatal("small batch committed while the backlog was full")
+			t.Fatal("small batch committed ahead of the larger one in line")
 		default:
 		}
 
-		second.releaseAll()
+		first.releaseAll()
+		for _, batch := range []chan *commitment{big, small} {
+			select {
+			case c := <-batch:
+				if c == nil {
+					t.Fatal("batch failed to commit")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("batch stayed parked once its turn came")
+			}
+		}
+	})
+
+	// a parked batch that gives up leaves the line, so the one behind it is not
+	// stuck waiting for a turn that never comes
+	t.Run("commit cancelled in line", func(t *testing.T) {
+		limiter := newInflightLimiter(8, 2, 12, 1, zaptest.NewLogger(t)) // limit 8, capacity 12
+
+		if _, ok := limiter.commit(t.Context(), 8); !ok {
+			t.Fatal("failed to commit the first batch")
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		big := make(chan *commitment, 1)
+		go func() {
+			c, _ := limiter.commit(ctx, 5)
+			big <- c
+		}()
+		waitParked(t, limiter, 1)
+
+		small := make(chan *commitment, 1)
+		go func() {
+			c, _ := limiter.commit(t.Context(), 1)
+			small <- c
+		}()
+		waitParked(t, limiter, 2)
+
+		cancel()
+		if c := <-big; c != nil {
+			t.Fatal("cancelled batch committed")
+		}
 		select {
 		case c := <-small:
 			if c == nil {
 				t.Fatal("small batch failed to commit")
 			}
 		case <-time.After(time.Second):
-			t.Fatal("small batch starved behind a larger one")
-		}
-		select {
-		case <-big:
-			t.Fatal("large batch committed beyond the capacity")
-		case <-time.After(25 * time.Millisecond):
+			t.Fatal("small batch stayed parked behind a cancelled one")
 		}
 	})
 
