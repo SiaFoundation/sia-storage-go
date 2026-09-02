@@ -81,10 +81,8 @@ func newSharingKeyRequest(appKey types.PrivateKey, description string, expiresAt
 }
 
 // assertHTTPStatus asserts err carries the given status and matches the given
-// sentinel, the way the SDK will classify indexer responses. Both halves matter:
-// [app.HTTPError.Is] matches a sentinel by looking for its message inside the
-// response body, so the body's wording is load-bearing and not merely
-// descriptive.
+// sentinel. Both matter: [app.HTTPError.Is] only looks for the sentinel's
+// message inside the response body, so the mock's wording is load-bearing.
 func assertHTTPStatus(t *testing.T, err error, want int, sentinel error) {
 	t.Helper()
 	var httpErr *app.HTTPError
@@ -384,5 +382,194 @@ func TestMockSharingRules(t *testing.T) {
 	assertHTTPStatus(t, mc.AddSharedObject(ctx, appKey, expiring.PublicKey(), sealSharedObject(obj, expiring, false)), http.StatusNotFound, sharing.ErrSharingKeyNotFound)
 	if err := mc.DeleteSharingKey(ctx, appKey, expiring.PublicKey()); err != nil {
 		t.Fatalf("an expired key should still be deletable: %v", err)
+	}
+}
+
+// TestMockSharingAttachments covers what TestMockSharingRules cannot reach
+// with one attachment: the totals, listing order and paging, cross-key rules.
+func TestMockSharingAttachments(t *testing.T) {
+	ctx := t.Context()
+	appKey := types.GeneratePrivateKey()
+	mc := newMockAppClient(newMockHostStore(3))
+
+	clock := time.Now()
+	mc.clock = func() time.Time { return clock }
+
+	// the key listing is newest first, which a single key cannot show
+	var keys []types.PrivateKey
+	for _, description := range []string{"oldest", "middle", "newest"} {
+		key, req := newSharingKeyRequest(appKey, description, nil)
+		if _, err := mc.AddSharingKey(ctx, appKey, req); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, key)
+	}
+	listed, err := mc.SharingKeys(ctx, appKey)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(listed) != 3 {
+		t.Fatalf("expected 3 keys, got %d", len(listed))
+	}
+	for i, want := range []types.PrivateKey{keys[2], keys[1], keys[0]} {
+		if listed[i].PublicKey != want.PublicKey() {
+			t.Fatalf("expected key %d of the listing to be %q, got %q", i, want.PublicKey(), listed[i].PublicKey)
+		}
+	}
+
+	sharingKey, otherKey := keys[0], keys[1]
+
+	// three objects of different shapes, so a total cannot come out right by
+	// coincidence: 200 bytes over two slices of one slab, 100 over one, 300
+	// over three
+	first := seedSharedObject(t, mc, appKey, 2)
+	second := seedSharedObject(t, mc, appKey, 1)
+	third := seedSharedObject(t, mc, appKey, 3)
+
+	// attach a second apart so the attach order is unambiguous
+	attach := func(obj slabs.SealedObject, key types.PrivateKey, metadata bool) sharing.SharedObjectRequest {
+		t.Helper()
+		clock = clock.Add(time.Second)
+		req := sealSharedObject(obj, key, metadata)
+		if err := mc.AddSharedObject(ctx, appKey, key.PublicKey(), req); err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	attach(first, sharingKey, false)
+	withMetadata := attach(second, sharingKey, true)
+	attach(third, sharingKey, false)
+
+	// every attachment counts towards the key's totals, which one attachment
+	// cannot distinguish from an assignment
+	key, err := mc.SharingKey(ctx, appKey, sharingKey.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 3 {
+		t.Fatalf("expected 3 objects, got %d", key.ObjectCount)
+	} else if key.ObjectSize != 600 {
+		t.Fatalf("expected size 600, got %d", key.ObjectSize)
+	} else if want := uint64(6) * proto.SectorSize; key.PinnedData != want {
+		t.Fatalf("expected pinned data %d, got %d", want, key.PinnedData)
+	} else if want := uint64(9) * proto.SectorSize; key.PinnedSize != want {
+		t.Fatalf("expected pinned size %d, got %d", want, key.PinnedSize)
+	}
+
+	assertListing := func(want ...slabs.SealedObject) []slabs.SealedObject {
+		t.Helper()
+		objects, err := mc.SharingKeyObjects(ctx, appKey, sharingKey.PublicKey())
+		if err != nil {
+			t.Fatal(err)
+		} else if len(objects) != len(want) {
+			t.Fatalf("expected %d attached objects, got %d", len(want), len(objects))
+		}
+		for i := range want {
+			if objects[i].ID() != want[i].ID() {
+				t.Fatalf("expected object %d of the listing to be %q, got %q", i, want[i].ID(), objects[i].ID())
+			}
+		}
+		return objects
+	}
+	// the listing is most recently attached first
+	attached := assertListing(third, second, first)
+
+	// re-attaching overwrites the sealed keys in place rather than attaching
+	// again, so the object keeps its place in the listing and its attach time
+	// while only its update time moves
+	reattached := attached[2]
+	clock = clock.Add(time.Second)
+	if err := mc.AddSharedObject(ctx, appKey, sharingKey.PublicKey(), sealSharedObject(first, sharingKey, false)); err != nil {
+		t.Fatal(err)
+	}
+	objects := assertListing(third, second, first)
+	if !objects[2].CreatedAt.Equal(reattached.CreatedAt) {
+		t.Fatal("re-attaching moved the attach time")
+	} else if !objects[2].UpdatedAt.After(reattached.UpdatedAt) {
+		t.Fatal("re-attaching did not move the update time")
+	}
+
+	// paging the listing, which needs more than one attachment to mean anything
+	if page, err := mc.SharingKeyObjects(ctx, appKey, sharingKey.PublicKey(), api.WithLimit(2)); err != nil {
+		t.Fatal(err)
+	} else if len(page) != 2 {
+		t.Fatalf("expected 2 objects on the first page, got %d", len(page))
+	} else if page[0].ID() != third.ID() || page[1].ID() != second.ID() {
+		t.Fatal("the first page is not the head of the listing")
+	}
+	if page, err := mc.SharingKeyObjects(ctx, appKey, sharingKey.PublicKey(), api.WithOffset(2)); err != nil {
+		t.Fatal(err)
+	} else if len(page) != 1 {
+		t.Fatalf("expected 1 object on the last page, got %d", len(page))
+	} else if page[0].ID() != first.ID() {
+		t.Fatalf("expected %q on the last page, got %q", first.ID(), page[0].ID())
+	}
+	if page, err := mc.SharingKeyObjects(ctx, appKey, sharingKey.PublicKey(), api.WithOffset(3)); err != nil {
+		t.Fatal(err)
+	} else if len(page) != 0 {
+		t.Fatalf("expected the page past the end to be empty, got %d", len(page))
+	}
+
+	// the totals are per key: attaching to another key leaves this one alone.
+	// The same object can hang off several keys, re-sealed under each one,
+	// which is the whole point of a sharing key.
+	attach(second, otherKey, false)
+	if key, err := mc.SharingKey(ctx, appKey, sharingKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 3 || key.ObjectSize != 600 {
+		t.Fatalf("attaching to another key changed this key's totals: %+v", key)
+	}
+	if key, err := mc.SharingKey(ctx, appKey, otherKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 1 {
+		t.Fatalf("expected 1 object on the other key, got %d", key.ObjectCount)
+	} else if key.ObjectSize != 100 {
+		t.Fatalf("expected size 100 on the other key, got %d", key.ObjectSize)
+	}
+	if objects, err := mc.SharingKeyObjects(ctx, appKey, otherKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if len(objects) != 1 {
+		t.Fatalf("expected 1 attachment on the other key, got %d", len(objects))
+	} else if objects[0].ID() != second.ID() {
+		t.Fatalf("expected %q on the other key, got %q", second.ID(), objects[0].ID())
+	}
+
+	// the encrypted metadata key is unique table-wide, so reusing another key's
+	// is a conflict. The data key is fresh so only the metadata clause fires.
+	duplicate := slabs.SealedObject{
+		Slabs:                third.Slabs,
+		EncryptedDataKey:     frand.Bytes(sharing.EncryptionKeySize),
+		EncryptedMetadataKey: withMetadata.EncryptedMetadataKey,
+		EncryptedMetadata:    frand.Bytes(64),
+	}
+	duplicate.Sign(otherKey)
+	assertHTTPStatus(t, mc.AddSharedObject(ctx, appKey, otherKey.PublicKey(), sharing.SharedObjectRequest{
+		ObjectID:             duplicate.ID(),
+		EncryptedDataKey:     duplicate.EncryptedDataKey,
+		DataSignature:        duplicate.DataSignature,
+		EncryptedMetadataKey: duplicate.EncryptedMetadataKey,
+		EncryptedMetadata:    duplicate.EncryptedMetadata,
+		MetadataSignature:    duplicate.MetadataSignature,
+	}), http.StatusConflict, sharing.ErrSharedObjectConflict)
+	if key, err := mc.SharingKey(ctx, appKey, otherKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 1 {
+		t.Fatalf("a conflict changed the other key's object count to %d", key.ObjectCount)
+	}
+
+	// deleting the object detaches it from every key holding it, and only
+	// those keys
+	clock = clock.Add(time.Second)
+	if err := mc.DeleteObject(ctx, appKey, second.ID()); err != nil {
+		t.Fatal(err)
+	}
+	assertListing(third, first)
+	if key, err := mc.SharingKey(ctx, appKey, otherKey.PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if key.ObjectCount != 0 {
+		t.Fatalf("expected the other key to be emptied by the cascade, got %d", key.ObjectCount)
+	}
+	if key, err := mc.SharingKey(ctx, appKey, keys[2].PublicKey()); err != nil {
+		t.Fatal(err)
+	} else if !key.UpdatedAt.Equal(key.CreatedAt) {
+		t.Fatal("the cascade touched a key holding none of the object's attachments")
 	}
 }
