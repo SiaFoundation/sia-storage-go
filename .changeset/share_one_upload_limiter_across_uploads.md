@@ -2,4 +2,4 @@
 default: patch
 ---
 
-# Share one upload limiter across uploads
+# Share upload concurrency and memory budgets across SDK uploads
