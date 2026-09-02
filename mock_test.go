@@ -788,9 +788,7 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 	mc.deleted[key] = mc.now()
 
 	// Attachments cascade on the object in the indexer, and the trigger
-	// decrements the key's totals for those deletes too. Skip this and the
-	// totals, the detach path and the listing each report a deleted object
-	// differently.
+	// decrements the key's totals for those deletes too.
 	now := mc.now()
 	for _, sk := range mc.sharingKeys {
 		if _, ok := sk.objects[key]; !ok {
@@ -909,11 +907,8 @@ type sharingPage struct {
 	offset, limit int
 }
 
-// parseSharingPage reads the offset and limit parameters the way the indexer's
-// paginated routes do. Passing no options means the indexer's default limit of
-// 100, and a longer list comes back cut to it with a success and nothing in the
-// response to say anything was left out. An out of range limit, by contrast, is
-// a 400.
+// parseSharingPage reads offset and limit the way the indexer's paginated routes
+// do, with the same defaults and bounds.
 func parseSharingPage(opts ...api.URLQueryParameterOption) (sharingPage, error) {
 	values := url.Values{}
 	for _, opt := range opts {
