@@ -26,8 +26,13 @@ var defaultMemoryBudget = sync.OnceValue(func() uint64 {
 })
 
 func defaultSlabsInMemory(totalShards int) int {
-	slabSize := uint64(totalShards) * uint64(proto4.SectorSize)
-	return max(int(defaultMemoryBudget()/slabSize), 1)
+	return max(defaultShardsInMemory()/totalShards, 1)
+}
+
+// defaultShardsInMemory is how many encoded shards fit in the memory budget, a
+// count that holds across redundancies so one budget can cover every upload.
+func defaultShardsInMemory() int {
+	return max(int(defaultMemoryBudget()/proto4.SectorSize), 1)
 }
 
 func defaultChunksInMemory() int {

@@ -97,6 +97,14 @@ type (
 
 		appKey types.PrivateKey
 
+		// uploadLimiter is shared by every upload, so concurrent uploads adapt
+		// to the network together and split one memory budget rather than each
+		// probing and buffering on its own.
+		uploadLimiter *inflightLimiter
+		// uploadWaiting counts shards across every upload that have not started
+		// their first attempt, so racers cannot take their shared permits.
+		uploadWaiting *changeCounter
+
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
 	}
@@ -1114,9 +1122,9 @@ func WithRedundancy(dataShards, parityShards uint8) UploadOption {
 }
 
 // WithUploadMaxBufferedSlabs sets the maximum number of fully encoded slabs
-// held in memory. Upload concurrency adapts to network conditions up to that
-// ceiling. Each slab uses (dataShards+parityShards) * 4 MiB; zero uses the
-// default, roughly 10% of the memory available to the process.
+// held in memory. Each slab uses (dataShards+parityShards) * 4 MiB; zero uses
+// the default, roughly 10% of the memory available to the process. Concurrent
+// uploads also share one budget of that default size across the SDK.
 func WithUploadMaxBufferedSlabs(maxBufferedSlabs int) UploadOption {
 	return func(uo *uploadOption) {
 		uo.maxBufferedSlabs = maxBufferedSlabs
@@ -1183,11 +1191,13 @@ func WithLogger(log *zap.Logger) Option {
 	}
 }
 
-func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
+// newSDK creates an SDK with its defaults and opts applied. The caller sets the
+// host client.
+func newSDK(appKey types.PrivateKey, app appClient, hostsCache *hostCache, opts ...Option) *SDK {
 	sdk := &SDK{
 		appKey:     appKey,
 		app:        app,
-		hostsCache: newHostCache(),
+		hostsCache: hostsCache,
 
 		tg:  threadgroup.New(),
 		log: zap.NewNop(), // no logging by default
@@ -1195,6 +1205,13 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 	for _, opt := range opts {
 		opt(sdk)
 	}
+	sdk.uploadLimiter = newUploadLimiter(sdk.log)
+	sdk.uploadWaiting = newChangeCounter(0)
+	return sdk
+}
+
+func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
+	sdk := newSDK(appKey, app, newHostCache(), opts...)
 
 	// create the host client
 	sdk.hosts = client.New(client.NewProvider(sdk.hostsCache), sdk.log.Named("client"))

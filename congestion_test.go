@@ -380,22 +380,17 @@ func TestInflightLimiter(t *testing.T) {
 		}
 	})
 
-	// freed permits are not interchangeable between requests of different sizes,
-	// so a small committer must not stay parked behind a larger one that still
-	// does not fit
-	t.Run("commit mixed sizes", func(t *testing.T) {
+	// batches are served in arrival order, so a small batch that would fit waits
+	// behind a larger one that does not, rather than starving it
+	t.Run("commit in order", func(t *testing.T) {
 		limiter := newInflightLimiter(8, 2, 12, 1, zaptest.NewLogger(t)) // limit 8, capacity 12
 
-		if _, ok := limiter.commit(t.Context(), 8); !ok {
+		first, ok := limiter.commit(t.Context(), 8)
+		if !ok {
 			t.Fatal("failed to commit the first batch")
 		}
-		second, ok := limiter.commit(t.Context(), 4)
-		if !ok {
-			t.Fatal("failed to commit the second batch")
-		}
 
-		// park a batch too large to fit even once the second batch frees up, so
-		// it is first in line ahead of one that will fit
+		// park a batch that does not fit, then one behind it that would
 		big := make(chan *commitment, 1)
 		go func() {
 			c, _ := limiter.commit(t.Context(), 5)
@@ -411,24 +406,100 @@ func TestInflightLimiter(t *testing.T) {
 		waitParked(t, limiter, 2)
 		select {
 		case <-small:
-			t.Fatal("small batch committed while the backlog was full")
+			t.Fatal("small batch committed ahead of the larger one in line")
 		default:
 		}
 
-		second.releaseAll()
+		first.releaseAll()
+		for _, batch := range []chan *commitment{big, small} {
+			select {
+			case c := <-batch:
+				if c == nil {
+					t.Fatal("batch failed to commit")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("batch stayed parked once its turn came")
+			}
+		}
+	})
+
+	// a parked batch that gives up leaves the line, so the one behind it is not
+	// stuck waiting for a turn that never comes
+	t.Run("commit cancelled in line", func(t *testing.T) {
+		limiter := newInflightLimiter(8, 2, 12, 1, zaptest.NewLogger(t)) // limit 8, capacity 12
+
+		if _, ok := limiter.commit(t.Context(), 8); !ok {
+			t.Fatal("failed to commit the first batch")
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		big := make(chan *commitment, 1)
+		go func() {
+			c, _ := limiter.commit(ctx, 5)
+			big <- c
+		}()
+		waitParked(t, limiter, 1)
+
+		small := make(chan *commitment, 1)
+		go func() {
+			c, _ := limiter.commit(t.Context(), 1)
+			small <- c
+		}()
+		waitParked(t, limiter, 2)
+
+		cancel()
+		if c := <-big; c != nil {
+			t.Fatal("cancelled batch committed")
+		}
 		select {
 		case c := <-small:
 			if c == nil {
 				t.Fatal("small batch failed to commit")
 			}
 		case <-time.After(time.Second):
-			t.Fatal("small batch starved behind a larger one")
+			t.Fatal("small batch stayed parked behind a cancelled one")
 		}
-		select {
-		case <-big:
-			t.Fatal("large batch committed beyond the capacity")
-		case <-time.After(25 * time.Millisecond):
+	})
+
+	// a batch larger than the whole capacity is admitted alone rather than
+	// parked forever, and nothing else commits until it is done, so oversized
+	// batches take turns
+	t.Run("commit larger than the capacity", func(t *testing.T) {
+		limiter := newInflightLimiter(8, 2, 4, 1, zaptest.NewLogger(t)) // capacity 4
+
+		held, ok := limiter.commit(t.Context(), 30)
+		if !ok {
+			t.Fatal("oversized batch was not admitted")
 		}
+
+		// another oversized batch and one that fits, in either order
+		sizes := []int{30, 1}
+		done := make(chan *commitment, len(sizes))
+		for _, n := range sizes {
+			go func() {
+				c, _ := limiter.commit(t.Context(), n)
+				done <- c
+			}()
+		}
+		waitParked(t, limiter, len(sizes))
+
+		for i := range sizes {
+			held.releaseAll()
+			select {
+			case c := <-done:
+				if c == nil {
+					t.Fatalf("waiter %d failed to commit", i)
+				}
+				held = c
+			case <-time.After(time.Second):
+				t.Fatalf("waiter %d stayed parked after the batch ahead finished", i)
+			}
+			if len(done) != 0 {
+				t.Fatalf("waiter %d committed alongside another batch", i)
+			}
+			waitParked(t, limiter, len(sizes)-i-1)
+		}
+		held.releaseAll()
 	})
 
 	t.Run("commit cancelled", func(t *testing.T) {

@@ -8,11 +8,9 @@ import (
 	"time"
 
 	"go.sia.tech/core/types"
-	"go.sia.tech/coreutils/threadgroup"
 	"go.sia.tech/coreutils/wallet"
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/keys"
-	"go.uber.org/zap"
 	"lukechampine.com/frand"
 )
 
@@ -217,17 +215,8 @@ func (b *Builder) SDK(appKey types.PrivateKey, opts ...Option) (*SDK, error) {
 		if err := b.consume(); err != nil {
 			return nil, err
 		}
-		sdk := &SDK{
-			appKey:     appKey,
-			app:        b.mockApp,
-			hosts:      b.mockHost,
-			hostsCache: b.mockHostCache,
-			tg:         threadgroup.New(),
-			log:        zap.NewNop(),
-		}
-		for _, opt := range opts {
-			opt(sdk)
-		}
+		sdk := newSDK(appKey, b.mockApp, b.mockHostCache, opts...)
+		sdk.hosts = b.mockHost
 		return sdk, nil
 	}
 
