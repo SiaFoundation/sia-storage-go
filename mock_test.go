@@ -1,6 +1,7 @@
 package siastorage
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,7 @@ import (
 	"go.sia.tech/indexd/api/app"
 	"go.sia.tech/indexd/client/v2"
 	"go.sia.tech/indexd/hosts"
+	"go.sia.tech/indexd/sharing"
 	"go.sia.tech/indexd/slabs"
 	"go.sia.tech/mux/v3"
 	"go.uber.org/zap"
@@ -525,14 +528,52 @@ func newMockHostClient(hosts *hostCache) *mockHostClient {
 	return m
 }
 
+type (
+	// A mockSharingKey is a sharing key together with the objects attached to
+	// it. The indexer keeps the aggregate totals on the key row and maintains
+	// them with a trigger; the mock recomputes them from the attachments so
+	// they cannot drift.
+	mockSharingKey struct {
+		key sharing.Key
+		// seq replaces the auto-incrementing row ID the indexer sorts its key
+		// listing by, which map iteration cannot reproduce on its own.
+		seq     uint64
+		objects map[types.Hash256]*mockSharedObject
+	}
+
+	// A mockSharedObject is one object attached to a sharing key: the keys and
+	// signatures re-sealed under that sharing key, plus the sizes the indexer
+	// captures at attach time to feed the key's totals.
+	mockSharedObject struct {
+		req sharing.SharedObjectRequest
+		// seq orders attachments the way the indexer's attach timestamp does.
+		// There is no row ID to stand in for here: shared_objects is keyed by
+		// (object, sharing key).
+		seq        uint64
+		size       uint64
+		pinnedData uint64
+		pinnedSize uint64
+		createdAt  time.Time
+		updatedAt  time.Time
+	}
+)
+
 type mockAppClient struct {
 	hosts *hostCache
+
+	// clock, when set, replaces time.Now everywhere the mock records or compares
+	// a time, so a test can step past a sharing key's expiry or a slab's prune
+	// cutoff instead of sleeping and hoping. Set it before the mock is used, since
+	// it is read without holding mu.
+	clock func() time.Time
 
 	mu             sync.Mutex
 	pinned         map[slabs.SlabID]slabs.PinnedSlab
 	pinnedAt       map[slabs.SlabID]time.Time
 	objects        map[types.Hash256]slabs.SealedObject
 	deleted        map[types.Hash256]time.Time
+	sharingKeys    map[types.PublicKey]*mockSharingKey
+	sharingSeq     uint64
 	hostsOverride  []hosts.HostInfo
 	pinSlabsCalls  []int
 	pinSlabsParams []slabs.SlabPinParams
@@ -541,11 +582,12 @@ type mockAppClient struct {
 
 func newMockAppClient(hosts *hostCache) *mockAppClient {
 	return &mockAppClient{
-		hosts:    hosts,
-		objects:  make(map[types.Hash256]slabs.SealedObject),
-		pinned:   make(map[slabs.SlabID]slabs.PinnedSlab),
-		pinnedAt: make(map[slabs.SlabID]time.Time),
-		deleted:  make(map[types.Hash256]time.Time),
+		hosts:       hosts,
+		objects:     make(map[types.Hash256]slabs.SealedObject),
+		pinned:      make(map[slabs.SlabID]slabs.PinnedSlab),
+		pinnedAt:    make(map[slabs.SlabID]time.Time),
+		deleted:     make(map[types.Hash256]time.Time),
+		sharingKeys: make(map[types.PublicKey]*mockSharingKey),
 	}
 }
 
@@ -590,7 +632,7 @@ func (mc *mockAppClient) PinSlabs(ctx context.Context, _ types.PrivateKey, toPin
 		mc.pinned[id] = ps
 		// the indexer refreshes the pin timestamp when an existing slab is
 		// pinned again
-		mc.pinnedAt[id] = time.Now()
+		mc.pinnedAt[id] = mc.now()
 	}
 	return
 }
@@ -743,7 +785,18 @@ func (mc *mockAppClient) DeleteObject(_ context.Context, _ types.PrivateKey, key
 		return slabs.ErrObjectNotFound
 	}
 	delete(mc.objects, key)
-	mc.deleted[key] = time.Now()
+	mc.deleted[key] = mc.now()
+
+	// Attachments cascade on the object in the indexer, and the trigger
+	// decrements the key's totals for those deletes too.
+	now := mc.now()
+	for _, sk := range mc.sharingKeys {
+		if _, ok := sk.objects[key]; !ok {
+			continue
+		}
+		delete(sk.objects, key)
+		sk.key.UpdatedAt = now
+	}
 	return nil
 }
 
@@ -756,7 +809,7 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 	for _, opt := range opts {
 		opt(values)
 	}
-	cutoff := time.Now().Add(-api.DefaultSlabPruneCutoff)
+	cutoff := mc.now().Add(-api.DefaultSlabPruneCutoff)
 	if before := values.Get("before"); before != "" {
 		t, err := time.Parse(time.RFC3339Nano, before)
 		if err != nil {
@@ -782,6 +835,410 @@ func (mc *mockAppClient) PruneSlabs(_ context.Context, _ types.PrivateKey, opts 
 		delete(mc.pinnedAt, id)
 	}
 	return nil
+}
+
+// sharingError wraps err the way the indexer's HTTP layer does, so callers can
+// classify it with errors.As on [app.HTTPError] exactly as they would a real
+// response.
+func sharingError(status int, err error) error {
+	return &app.HTTPError{StatusCode: status, Body: err.Error()}
+}
+
+// invalidSharingRequest builds the 400 the indexer returns for a request that
+// fails validation, wrapping the sentinel the way the indexer does so the body
+// reads the same.
+func invalidSharingRequest(detail string) error {
+	return sharingError(http.StatusBadRequest, fmt.Errorf("%w: %s", sharing.ErrInvalidRequest, detail))
+}
+
+// now returns the mock's clock. It deliberately does not take mu: most callers
+// already hold it, and Go mutexes are not reentrant.
+func (mc *mockAppClient) now() time.Time {
+	if mc.clock != nil {
+		return mc.clock()
+	}
+	return time.Now()
+}
+
+// sharingKeyExpired reports whether the indexer would treat the key as gone.
+// Every lookup filters on `expires_at IS NULL OR expires_at > NOW()`, so an
+// expired key is indistinguishable from one that never existed.
+func sharingKeyExpired(expiresAt *time.Time, now time.Time) bool {
+	return expiresAt != nil && !expiresAt.After(now)
+}
+
+// validateKeyRequest reimplements the unexported sharing.KeyRequest.validate.
+// The mock has to duplicate it because the indexer runs it before touching the
+// store, and a request it would reject must not appear to succeed here.
+func validateKeyRequest(req sharing.KeyRequest, now time.Time) error {
+	switch {
+	case req.PublicKey == (types.PublicKey{}):
+		return invalidSharingRequest("public key is required")
+	case req.Nonce == (sharing.Nonce{}):
+		return invalidSharingRequest("nonce is required")
+	case req.ExpiresAt != nil && req.ExpiresAt.Before(now):
+		return invalidSharingRequest("expires at must be in the future")
+	case len(req.Description) > sharing.MaxDescriptionSize:
+		return invalidSharingRequest(fmt.Sprintf("description exceeds %d bytes", sharing.MaxDescriptionSize))
+	}
+	return nil
+}
+
+// validateSharedObjectRequest reimplements the unexported
+// sharing.SharedObjectRequest.validate, which the mock cannot call. The indexer
+// runs it before touching the store, so a request it would reject must not
+// appear to succeed here.
+func validateSharedObjectRequest(req sharing.SharedObjectRequest) error {
+	switch {
+	case req.ObjectID == (types.Hash256{}):
+		return invalidSharingRequest("object ID is required")
+	case len(req.EncryptedDataKey) != sharing.EncryptionKeySize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted data key must be %d bytes", sharing.EncryptionKeySize))
+	case len(req.EncryptedMetadataKey) != 0 && len(req.EncryptedMetadataKey) != sharing.EncryptionKeySize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted metadata key must be %d bytes", sharing.EncryptionKeySize))
+	case len(req.EncryptedMetadata) > sharing.MaxMetadataSize:
+		return invalidSharingRequest(fmt.Sprintf("encrypted metadata exceeds %d bytes", sharing.MaxMetadataSize))
+	}
+	return nil
+}
+
+// A sharingPage is the offset and limit a paginated route has accepted.
+type sharingPage struct {
+	offset, limit int
+}
+
+// parseSharingPage reads offset and limit the way the indexer's paginated routes
+// do, with the same defaults and bounds.
+func parseSharingPage(opts ...api.URLQueryParameterOption) (sharingPage, error) {
+	values := url.Values{}
+	for _, opt := range opts {
+		opt(values)
+	}
+
+	page := sharingPage{limit: 100} // api's unexported defaultLimit
+	if v := values.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return sharingPage{}, sharingError(http.StatusBadRequest, api.ErrInvalidOffset)
+		}
+		page.offset = n
+	}
+	if v := values.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > api.MaxLimit {
+			return sharingPage{}, sharingError(http.StatusBadRequest, api.ErrInvalidLimit)
+		}
+		page.limit = n
+	}
+	return page, nil
+}
+
+// paginateSharing cuts items down to the page, the way the indexer's LIMIT and
+// OFFSET do.
+func paginateSharing[T any](items []T, page sharingPage) []T {
+	if page.offset >= len(items) {
+		return nil
+	}
+	return items[page.offset:min(page.offset+page.limit, len(items))]
+}
+
+// ownedSharingKey mirrors the indexer's owner-side lookup, where a key that does
+// not exist, has expired, or belongs to another account all produce the same
+// 404. Callers must hold mc.mu.
+func (mc *mockAppClient) ownedSharingKey(appKey types.PrivateKey, publicKey types.PublicKey) (*mockSharingKey, error) {
+	sk, ok := mc.sharingKeys[publicKey]
+	if !ok || sk.key.Account != appKey.PublicKey() || sharingKeyExpired(sk.key.ExpiresAt, mc.now()) {
+		return nil, sharingError(http.StatusNotFound, sharing.ErrSharingKeyNotFound)
+	}
+	return sk, nil
+}
+
+// withSharingStats returns the key with the aggregate totals the indexer keeps
+// on it, summed from the attachments. It reads the attachment map, so callers
+// must hold the mutex of the [mockAppClient] that owns the key.
+func (sk *mockSharingKey) withSharingStats() sharing.Key {
+	key := sk.key
+	for _, att := range sk.objects {
+		key.ObjectCount++
+		key.ObjectSize += att.size
+		key.PinnedData += att.pinnedData
+		key.PinnedSize += att.pinnedSize
+	}
+	return key
+}
+
+// objectSharingSizes computes the sizes the indexer captures when an object is
+// attached: the object's logical size, and its storage footprint before and
+// after redundancy. A slab referenced by more than one slice is stored once, so
+// it only counts once towards the pinned figures. Callers must hold mc.mu.
+func (mc *mockAppClient) objectSharingSizes(obj slabs.SealedObject) (size, pinnedData, pinnedSize uint64) {
+	counted := make(map[slabs.SlabID]bool)
+	for _, slab := range obj.Slabs {
+		size += uint64(slab.Length)
+
+		id := slab.Digest()
+		if counted[id] {
+			continue
+		}
+		counted[id] = true
+
+		pinned := mc.pinned[id]
+		pinnedData += uint64(pinned.MinShards) * proto.SectorSize
+		pinnedSize += uint64(len(pinned.Sectors)) * proto.SectorSize
+	}
+	return
+}
+
+// assertSharedObjectUnique enforces the UNIQUE constraints on the indexer's
+// shared_objects columns, which span every sharing key rather than one.
+// Re-attaching the same object to the same key is an update, so that row is
+// exempt. Callers must hold mc.mu.
+func (mc *mockAppClient) assertSharedObjectUnique(sharingKey types.PublicKey, req sharing.SharedObjectRequest) error {
+	conflicts := func(a, b []byte) bool {
+		return len(a) > 0 && len(b) > 0 && string(a) == string(b)
+	}
+	for pk, sk := range mc.sharingKeys {
+		for objectID, att := range sk.objects {
+			if pk == sharingKey && objectID == req.ObjectID {
+				continue // this is the row being updated
+			}
+			if conflicts(att.req.EncryptedDataKey, req.EncryptedDataKey) ||
+				conflicts(att.req.EncryptedMetadataKey, req.EncryptedMetadataKey) ||
+				att.req.DataSignature == req.DataSignature ||
+				att.req.MetadataSignature == req.MetadataSignature {
+				return sharingError(http.StatusConflict, sharing.ErrSharedObjectConflict)
+			}
+		}
+	}
+	return nil
+}
+
+// AddSharingKey implements the [appClient] interface.
+func (mc *mockAppClient) AddSharingKey(_ context.Context, appKey types.PrivateKey, req sharing.KeyRequest) (sharing.Key, error) {
+	// the indexer validates first, then verifies the signature, then stores
+	if err := validateKeyRequest(req, mc.now()); err != nil {
+		return sharing.Key{}, err
+	} else if err := req.VerifySignature(); err != nil {
+		return sharing.Key{}, sharingError(http.StatusBadRequest, err)
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// public_key and nonce are both globally unique columns, and either
+	// violation surfaces as the same conflict
+	if _, ok := mc.sharingKeys[req.PublicKey]; ok {
+		return sharing.Key{}, sharingError(http.StatusConflict, sharing.ErrSharingKeyExists)
+	}
+	for _, sk := range mc.sharingKeys {
+		if sk.key.Nonce == req.Nonce {
+			return sharing.Key{}, sharingError(http.StatusConflict, sharing.ErrSharingKeyExists)
+		}
+	}
+
+	now := mc.now()
+	mc.sharingSeq++
+	sk := &mockSharingKey{
+		key: sharing.Key{
+			Account:     appKey.PublicKey(),
+			PublicKey:   req.PublicKey,
+			Nonce:       req.Nonce,
+			Description: req.Description,
+			ExpiresAt:   req.ExpiresAt,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		seq:     mc.sharingSeq,
+		objects: make(map[types.Hash256]*mockSharedObject),
+	}
+	mc.sharingKeys[req.PublicKey] = sk
+	return sk.key, nil
+}
+
+// SharingKey implements the [appClient] interface.
+func (mc *mockAppClient) SharingKey(_ context.Context, appKey types.PrivateKey, publicKey types.PublicKey) (sharing.Key, error) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, publicKey)
+	if err != nil {
+		return sharing.Key{}, err
+	}
+	return sk.withSharingStats(), nil
+}
+
+// SharingKeys implements the [appClient] interface.
+func (mc *mockAppClient) SharingKeys(_ context.Context, appKey types.PrivateKey, opts ...api.URLQueryParameterOption) ([]sharing.Key, error) {
+	page, err := parseSharingPage(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	account, now := appKey.PublicKey(), mc.now()
+	var owned []*mockSharingKey
+	for _, sk := range mc.sharingKeys {
+		if sk.key.Account != account || sharingKeyExpired(sk.key.ExpiresAt, now) {
+			continue
+		}
+		owned = append(owned, sk)
+	}
+	// the indexer orders by row ID descending, newest first
+	slices.SortFunc(owned, func(a, b *mockSharingKey) int {
+		return cmp.Compare(b.seq, a.seq)
+	})
+
+	owned = paginateSharing(owned, page)
+	keys := make([]sharing.Key, 0, len(owned))
+	for _, sk := range owned {
+		keys = append(keys, sk.withSharingStats())
+	}
+	return keys, nil
+}
+
+// DeleteSharingKey implements the [appClient] interface.
+func (mc *mockAppClient) DeleteSharingKey(_ context.Context, appKey types.PrivateKey, publicKey types.PublicKey) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// unlike the read paths, the delete is not filtered on expiry: an expired
+	// key is invisible but still removable
+	sk, ok := mc.sharingKeys[publicKey]
+	if !ok || sk.key.Account != appKey.PublicKey() {
+		return sharingError(http.StatusNotFound, sharing.ErrSharingKeyNotFound)
+	}
+	// shared_objects cascades on the sharing key
+	delete(mc.sharingKeys, publicKey)
+	return nil
+}
+
+// AddSharedObject implements the [appClient] interface.
+func (mc *mockAppClient) AddSharedObject(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, req sharing.SharedObjectRequest) error {
+	// as with AddSharingKey, validation and signature verification happen
+	// before the store is consulted, so a bad request on an unknown key is a
+	// 400 rather than a 404
+	if err := validateSharedObjectRequest(req); err != nil {
+		return err
+	} else if err := req.VerifySignatures(sharingKey); err != nil {
+		return sharingError(http.StatusBadRequest, err)
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, sharingKey)
+	if err != nil {
+		return err
+	}
+
+	// the object must already be pinned; the indexer looks it up in the account's
+	// objects, which PinObject only admits once every slab is pinned. The mock's
+	// object store is not scoped by account, so unlike the indexer it cannot
+	// reject an object owned by someone else.
+	obj, ok := mc.objects[req.ObjectID]
+	if !ok {
+		return sharingError(http.StatusNotFound, slabs.ErrObjectNotFound)
+	}
+	if err := mc.assertSharedObjectUnique(sharingKey, req); err != nil {
+		return err
+	}
+
+	size, pinnedData, pinnedSize := mc.objectSharingSizes(obj)
+	now := mc.now()
+	// the trigger that maintains the key's totals also touches the key itself,
+	// and it is the only thing that does
+	sk.key.UpdatedAt = now
+	if existing, ok := sk.objects[req.ObjectID]; ok {
+		// re-attaching overwrites the re-sealed keys and signatures, keeps the
+		// original attach time, and leaves the key's object count alone
+		existing.req = req
+		existing.size, existing.pinnedData, existing.pinnedSize = size, pinnedData, pinnedSize
+		existing.updatedAt = now
+		return nil
+	}
+	mc.sharingSeq++
+	sk.objects[req.ObjectID] = &mockSharedObject{
+		req:        req,
+		seq:        mc.sharingSeq,
+		size:       size,
+		pinnedData: pinnedData,
+		pinnedSize: pinnedSize,
+		createdAt:  now,
+		updatedAt:  now,
+	}
+	return nil
+}
+
+// DeleteSharedObject implements the [appClient] interface.
+func (mc *mockAppClient) DeleteSharedObject(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, objectKey types.Hash256) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// the indexer deletes by a join across the key, the account and the object,
+	// so every miss is the same not-found
+	sk, ok := mc.sharingKeys[sharingKey]
+	if !ok || sk.key.Account != appKey.PublicKey() {
+		return sharingError(http.StatusNotFound, sharing.ErrSharedObjectNotFound)
+	} else if _, ok := sk.objects[objectKey]; !ok {
+		return sharingError(http.StatusNotFound, sharing.ErrSharedObjectNotFound)
+	}
+	delete(sk.objects, objectKey)
+	sk.key.UpdatedAt = mc.now()
+	return nil
+}
+
+// SharingKeyObjects implements the [appClient] interface.
+func (mc *mockAppClient) SharingKeyObjects(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, opts ...api.URLQueryParameterOption) ([]slabs.SealedObject, error) {
+	page, err := parseSharingPage(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	sk, err := mc.ownedSharingKey(appKey, sharingKey)
+	if err != nil {
+		return nil, err
+	}
+
+	attached := make([]*mockSharedObject, 0, len(sk.objects))
+	for _, att := range sk.objects {
+		attached = append(attached, att)
+	}
+	// The indexer orders by attach time, most recently attached first, and
+	// re-attaching keeps the original time rather than moving the object to the
+	// front. It sorts on a timestamp rather than a row ID, so attachments sharing
+	// one transaction tie and their order is unspecified; the mock's is stable.
+	slices.SortFunc(attached, func(a, b *mockSharedObject) int {
+		return cmp.Compare(b.seq, a.seq)
+	})
+
+	attached = paginateSharing(attached, page)
+	objects := make([]slabs.SealedObject, 0, len(attached))
+	for _, att := range attached {
+		obj, ok := mc.objects[att.req.ObjectID]
+		if !ok {
+			// shared_objects cascades when the owner deletes the object, so the
+			// attachment simply disappears
+			continue
+		}
+		// the slabs come from the owner's object; only the encryption keys and
+		// signatures come from the attachment, re-sealed under the sharing key
+		objects = append(objects, slabs.SealedObject{
+			EncryptedDataKey:     att.req.EncryptedDataKey,
+			Slabs:                obj.Slabs,
+			DataSignature:        att.req.DataSignature,
+			EncryptedMetadataKey: att.req.EncryptedMetadataKey,
+			EncryptedMetadata:    att.req.EncryptedMetadata,
+			MetadataSignature:    att.req.MetadataSignature,
+			CreatedAt:            att.createdAt,
+			UpdatedAt:            att.updatedAt,
+		})
+	}
+	return objects, nil
 }
 
 // SetPinSlabsFailures fails the next n PinSlabs calls before they resume
