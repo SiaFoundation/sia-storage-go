@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	proto "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
+	"go.sia.tech/coreutils/rhp/v4"
 	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
@@ -99,15 +102,34 @@ func racingShardUpload(t *testing.T, slowDelay time.Duration, waiting *changeCou
 
 	candidates := append([]types.PublicKey{slow}, fast...)
 	su := &shardUpload{
-		hosts:      hosts,
-		accountKey: sdk.appKey,
-		limiter:    limiter,
-		pool:       newUploadPool(hosts, candidates, 1),
-		commitment: slabCommitment,
-		shardsCh:   make(chan shard, 1),
-		waiting:    waiting,
+		hosts:       hosts,
+		accountKey:  sdk.appKey,
+		hostTimeout: defaultUploadHostTimeout,
+		limiter:     limiter,
+		pool:        newUploadPool(hosts, candidates, 1),
+		commitment:  slabCommitment,
+		shardsCh:    make(chan shard, 1),
+		waiting:     waiting,
 	}
 	return su, hosts, slow
+}
+
+// waitAvailable waits for host to be back in the pool. A cancelled attempt
+// returns its host asynchronously, after releasing its reservation.
+func waitAvailable(t testing.TB, p *uploadPool, host types.PublicKey) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.Lock()
+		available := slices.Contains(p.available, host)
+		p.mu.Unlock()
+		if available {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatal("expected the host back in the pool", host)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestUploadRacing(t *testing.T) {
@@ -141,11 +163,7 @@ func TestUploadRacing(t *testing.T) {
 	}
 
 	// assert racers fired: more than the 30 primary shards got write calls
-	var totalWrites int
-	for _, n := range hosts.WriteCalls() {
-		totalWrites += n
-	}
-	if totalWrites <= 30 {
+	if totalWrites := hosts.TotalWrites(); totalWrites <= 30 {
 		t.Fatal("expected racing to produce extra writes", totalWrites)
 	}
 
@@ -210,6 +228,44 @@ func TestUploadRacing(t *testing.T) {
 	}
 }
 
+// TestUploadPoolRetry asserts only failed writes spend a host's attempt budget.
+func TestUploadPoolRetry(t *testing.T) {
+	sdk, hosts := newTestSDK(t, 1, zaptest.NewLogger(t))
+	defer sdk.Close()
+
+	usable, _ := hosts.hosts.UsableHosts()
+	host := usable[0].PublicKey
+	pool := newUploadPool(hosts, []types.PublicKey{host}, 0)
+
+	// a host that loses a race was canceled, not failed. repeated races must
+	// not spend its attempt budget or racing alone can empty the pool.
+	for i := range maxHostAttempts + 1 {
+		got, release, ok := pool.pickRacer()
+		if !ok {
+			t.Fatalf("race %d: pool ran dry without a failed write", i+1)
+		} else if got != host {
+			t.Fatal("unexpected host", got)
+		}
+		release()
+		pool.restore(got)
+	}
+
+	// actual failures still spend the budget and eventually retire the host
+	for i := range maxHostAttempts {
+		got, release, ok := pool.pickRacer()
+		if !ok {
+			t.Fatalf("failure %d: expected the host back in the pool", i+1)
+		} else if got != host {
+			t.Fatal("unexpected host", got)
+		}
+		release()
+		pool.retry(got)
+	}
+	if _, _, ok := pool.pickRacer(); ok {
+		t.Fatal("expected the host removed after its last failed attempt")
+	}
+}
+
 // TestUploadInitialHostBeaten asserts the host that took the shard's first
 // attempt and was still uploading when a racer won is demoted, so it does not
 // keep winning the initial pick over the hosts that delivered.
@@ -242,6 +298,36 @@ func TestUploadInitialHostBeaten(t *testing.T) {
 		t.Fatalf("expected the beaten host %v, got %v", slow, hks[0])
 	} else if rpcs := hosts.TimedOutRPCs(); len(rpcs) != 0 {
 		t.Fatalf("expected no throughput sample from a beaten host, got %d", len(rpcs))
+	}
+
+	// the beaten host did not fail, so it returns to the slab's pool for other
+	// shards to use
+	waitAvailable(t, su.pool, slow)
+}
+
+// TestUploadPackedIdleHoldsNoPermits asserts a packed upload waiting for its
+// first object holds no permits on the shared limiter, so idle packed uploads
+// cannot park every other upload behind the lookahead gate.
+func TestUploadPackedIdleHoldsNoPermits(t *testing.T) {
+	sdk, _ := newTestSDK(t, 15, zaptest.NewLogger(t))
+	t.Cleanup(func() { sdk.Close() })
+
+	for range 2 {
+		u, err := sdk.UploadPacked(WithRedundancy(4, 11))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { u.Close() })
+	}
+
+	// give the read loops time to reach the pipe. an upload that commits before
+	// reading has done so by then
+	time.Sleep(200 * time.Millisecond)
+	sdk.uploadLimiter.mu.Lock()
+	committed := sdk.uploadLimiter.committed
+	sdk.uploadLimiter.mu.Unlock()
+	if committed != 0 {
+		t.Fatalf("idle packed uploads hold %d permits", committed)
 	}
 }
 
@@ -302,15 +388,31 @@ func TestUploadMaxBufferedSlabs(t *testing.T) {
 		t.Fatal("unexpected max buffered slabs", uo.maxBufferedSlabs)
 	}
 
-	// an absurd budget is clamped so the shard capacity it converts to stays
-	// within the controller's ceiling, keeping the queues sized from it in step
+	// an absurd budget is clamped, so it cannot turn into an absurd buffer
 	uo, _, err := newUploadOption(WithUploadMaxBufferedSlabs(maxInflightLimit+1), WithRedundancy(10, 20))
 	if err != nil {
 		t.Fatal(err)
 	} else if want := maxInflightLimit / 30; uo.maxBufferedSlabs != want {
 		t.Fatalf("expected max buffered slabs clamped to %d, got %d", want, uo.maxBufferedSlabs)
-	} else if capacity := uo.maxBufferedSlabs * 30; capacity > maxInflightLimit {
-		t.Fatal("clamped slab budget still exceeds the inflight ceiling", capacity)
+	}
+}
+
+func TestUploadHostTimeout(t *testing.T) {
+	if _, _, err := newUploadOption(WithUploadHostTimeout(-time.Second)); err == nil {
+		t.Fatal("expected a negative host timeout to fail")
+	}
+
+	// zero uses the default
+	if uo, _, err := newUploadOption(WithUploadHostTimeout(0)); err != nil {
+		t.Fatal(err)
+	} else if uo.hostTimeout != defaultUploadHostTimeout {
+		t.Fatal("unexpected default host timeout", uo.hostTimeout)
+	}
+
+	if uo, _, err := newUploadOption(WithUploadHostTimeout(time.Second)); err != nil {
+		t.Fatal(err)
+	} else if uo.hostTimeout != time.Second {
+		t.Fatal("unexpected host timeout", uo.hostTimeout)
 	}
 }
 
@@ -474,5 +576,130 @@ func TestUploadPinFails(t *testing.T) {
 		t.Fatal("unexpected", calls)
 	} else if appMock.PinnedSlabs() != 0 {
 		t.Fatal("unexpected", appMock.PinnedSlabs())
+	}
+}
+
+// overloadHostClient models a network that refuses every write in a batch when
+// more than maxConcurrent writes contend for it.
+type overloadHostClient struct {
+	hostClient
+
+	mu            sync.Mutex
+	batch         *overloadBatch
+	maxConcurrent int
+	delay         time.Duration
+}
+
+type overloadBatch struct {
+	done       chan struct{}
+	writes     int
+	overloaded bool
+}
+
+func (c *overloadHostClient) WriteSector(ctx context.Context, accountKey types.PrivateKey, hostKey types.PublicKey, data []byte) (rhp.RPCWriteSectorResult, error) {
+	c.mu.Lock()
+	if c.batch == nil {
+		c.batch = &overloadBatch{done: make(chan struct{})}
+		batch := c.batch
+		time.AfterFunc(c.delay, func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.batch == batch {
+				c.batch = nil
+				close(batch.done)
+			}
+		})
+	}
+	batch := c.batch
+	batch.writes++
+	if batch.writes > c.maxConcurrent {
+		batch.overloaded = true
+		c.batch = nil
+		close(batch.done)
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return rhp.RPCWriteSectorResult{}, ctx.Err()
+	case <-batch.done:
+	}
+
+	c.mu.Lock()
+	overloaded := batch.overloaded
+	c.mu.Unlock()
+
+	if overloaded {
+		return rhp.RPCWriteSectorResult{}, errors.New("network overloaded")
+	}
+	return c.hostClient.WriteSector(ctx, accountKey, hostKey, data)
+}
+
+// TestUploadNoMoreHostsRegression asserts concurrent uploads adapt to one network
+// together. Independent per-upload limiters never get below the network's
+// combined ceiling, so every retry fails and the candidate pools run dry.
+func TestUploadNoMoreHostsRegression(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+	const totalShards = dataShards + parityShards
+	const uploads = 3
+
+	// there are three times as many hosts as a slab needs, so a pool only runs
+	// dry if the upload pipeline incorrectly overloads the network itself.
+	sdk, hosts := newTestSDK(t, totalShards*3, zaptest.NewLogger(t))
+	defer sdk.Close()
+	sdk.hosts = &overloadHostClient{
+		hostClient:    hosts,
+		maxConcurrent: minUploadInflight,
+		delay:         200 * time.Millisecond,
+	}
+
+	data := frand.Bytes(dataShards * proto.SectorSize)
+	errCh := make(chan error, uploads)
+	for range uploads {
+		go func() {
+			obj := NewEmptyObject()
+			errCh <- sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards))
+		}()
+	}
+	for range uploads {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestUploadSaturatedNetwork asserts concurrent uploads sharing one saturated
+// network still land their shards: on one limiter they back off together, where
+// each probing upward alone would time every write out and empty the pool.
+func TestUploadSaturatedNetwork(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+	const totalShards = dataShards + parityShards
+	const uploads = 6
+
+	// hosts to spare, so only timeouts can exhaust the pool
+	sdk, hosts := newTestSDK(t, totalShards*3, zaptest.NewLogger(t))
+	defer sdk.Close()
+	hosts.SetSharedBandwidth(30 * time.Millisecond)
+
+	// the host timeout sits between what the network carries at one shared
+	// limit and at uploads-many independent ones
+	data := frand.Bytes(dataShards * proto.SectorSize)
+	errCh := make(chan error, uploads)
+	for range uploads {
+		go func() {
+			obj := NewEmptyObject()
+			errCh <- sdk.Upload(t.Context(), &obj, bytes.NewReader(data), WithRedundancy(dataShards, parityShards), WithUploadHostTimeout(time.Second))
+		}()
+	}
+	for range uploads {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// racing and retries duplicate writes, and duplicates are what saturate a
+	// slow network, so hold them to a small multiple of the shards to land
+	if writes, maxWrites := hosts.TotalWrites(), uploads*totalShards*5/2; writes > maxWrites {
+		t.Fatalf("expected at most %d writes to land %d shards, got %d", maxWrites, uploads*totalShards, writes)
 	}
 }

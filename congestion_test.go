@@ -35,6 +35,24 @@ func congestionStepSaturating(c *inflightController, sat int, base float64) int 
 	return congestionStep(c, seconds)
 }
 
+// congestionWindowsUntilProbe feeds windows of successes at the settled limit
+// and returns how many it took for the controller to probe upward, giving up
+// after twice the schedule.
+func congestionWindowsUntilProbe(c *inflightController, seconds float64) int {
+	start := c.currentLimit()
+	var windows int
+	for windows < 2*probeInterval && c.currentLimit() == start {
+		c.mu.Lock()
+		window := c.window()
+		c.mu.Unlock()
+		for range window {
+			c.record(c.sample(), time.Duration(seconds*float64(time.Second)), true)
+		}
+		windows++
+	}
+	return windows
+}
+
 // waitParked waits for n callers to be parked on the limiter. Callers park
 // asynchronously, so a goroutine that has started may not be waiting yet.
 func waitParked(t testing.TB, l *inflightLimiter, n int) {
@@ -127,6 +145,58 @@ func TestInflightController(t *testing.T) {
 			if got := congestionStepFailing(c); got != want {
 				t.Fatalf("expected %d, got %d", want, got)
 			}
+		}
+	})
+
+	// a limit whose doubling times every operation out must not be climbed
+	// straight back to on the next window, or every other window is a total
+	// loss; it is retried on the usual probe schedule
+	t.Run("failed probe settles", func(t *testing.T) {
+		c := newInflightController(8, 2, 1000, 1, zaptest.NewLogger(t))
+		// settle at 8: the doubling to 16 does not raise goodput
+		for _, want := range []int{16, 8} {
+			if got := congestionStepSaturating(c, 8, 1); got != want {
+				t.Fatalf("expected %d, got %d", want, got)
+			}
+		}
+		for range 3 {
+			if got := congestionWindowsUntilProbe(c, 1); got != probeInterval {
+				t.Fatalf("expected a probe after %d healthy windows, got %d", probeInterval, got)
+			} else if got := congestionStepFailing(c); got != 8 {
+				t.Fatalf("expected the failed probe to settle at 8, got %d", got)
+			} else if c.probing {
+				t.Fatal("still probing after a probe without a single success")
+			}
+		}
+	})
+
+	// a healthy window at the capacity leaves the limit where it is, so a window
+	// without a success there has no lower level to return to and must halve
+	t.Run("failure at capacity backs off", func(t *testing.T) {
+		c := newInflightController(8, 2, 16, 1, zaptest.NewLogger(t))
+		if got := congestionStep(c, 1); got != 16 {
+			t.Fatalf("expected 16, got %d", got)
+		}
+		for range minWindow {
+			c.record(c.sample(), time.Second, true)
+		}
+		if got := congestionStepFailing(c); got != 8 {
+			t.Fatalf("expected 8, got %d", got)
+		}
+	})
+
+	// an initial limit that fails outright is halved and held, not climbed back
+	// to on the next window as a fresh start
+	t.Run("failed start holds below", func(t *testing.T) {
+		c := newInflightController(8, 2, 1000, 1, zaptest.NewLogger(t))
+		if got := congestionStepFailing(c); got != 4 {
+			t.Fatalf("expected 4, got %d", got)
+		} else if c.probing {
+			t.Fatal("still probing after the initial limit failed outright")
+		} else if got := congestionWindowsUntilProbe(c, 1); got != probeInterval {
+			t.Fatalf("expected a probe after %d healthy windows, got %d", probeInterval, got)
+		} else if got := c.currentLimit(); got != 8 {
+			t.Fatalf("expected the probe to try 8 again, got %d", got)
 		}
 	})
 
@@ -429,6 +499,47 @@ func TestInflightLimiter(t *testing.T) {
 			t.Fatal("large batch committed beyond the capacity")
 		case <-time.After(25 * time.Millisecond):
 		}
+	})
+
+	// a batch larger than the whole capacity is admitted alone rather than
+	// parked forever, and nothing else commits until it is done, so oversized
+	// batches take turns
+	t.Run("commit larger than the capacity", func(t *testing.T) {
+		limiter := newInflightLimiter(8, 2, 4, 1, zaptest.NewLogger(t)) // capacity 4
+
+		held, ok := limiter.commit(t.Context(), 30)
+		if !ok {
+			t.Fatal("oversized batch was not admitted")
+		}
+
+		// another oversized batch and one that fits, in either order
+		sizes := []int{30, 1}
+		done := make(chan *commitment, len(sizes))
+		for _, n := range sizes {
+			go func() {
+				c, _ := limiter.commit(t.Context(), n)
+				done <- c
+			}()
+		}
+		waitParked(t, limiter, len(sizes))
+
+		for i := range sizes {
+			held.releaseAll()
+			select {
+			case c := <-done:
+				if c == nil {
+					t.Fatalf("waiter %d failed to commit", i)
+				}
+				held = c
+			case <-time.After(time.Second):
+				t.Fatalf("waiter %d stayed parked after the batch ahead finished", i)
+			}
+			if len(done) != 0 {
+				t.Fatalf("waiter %d committed alongside another batch", i)
+			}
+			waitParked(t, limiter, len(sizes)-i-1)
+		}
+		held.releaseAll()
 	})
 
 	t.Run("commit cancelled", func(t *testing.T) {

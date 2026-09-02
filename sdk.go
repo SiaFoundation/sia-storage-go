@@ -97,6 +97,14 @@ type (
 
 		appKey types.PrivateKey
 
+		// uploadLimiter is shared by every upload, so concurrent uploads adapt
+		// to the network together and split one memory budget rather than each
+		// probing and buffering on its own.
+		uploadLimiter *inflightLimiter
+		// uploadWaiting counts shards across every upload that have not started
+		// their first attempt, so racers cannot take their shared permits.
+		uploadWaiting *changeCounter
+
 		tg  *threadgroup.ThreadGroup
 		log *zap.Logger
 	}
@@ -524,8 +532,7 @@ func (d *downloadStream) Close() error {
 // with defaults, applies the given options, and validates them.
 func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOption, error) {
 	do := downloadOption{
-		hostTimeout: 60 * time.Second, // long to handle slow hosts; racing routes around stragglers
-		length:      objectSize,
+		length: objectSize,
 	}
 	for _, opt := range opts {
 		opt(&do)
@@ -533,7 +540,13 @@ func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOptio
 
 	if do.maxBufferedChunks < 0 {
 		return do, fmt.Errorf("max buffered chunks must not be negative, got %d", do.maxBufferedChunks)
-	} else if do.maxBufferedChunks == 0 {
+	} else if do.hostTimeout < 0 {
+		return do, fmt.Errorf("host timeout must not be negative, got %v", do.hostTimeout)
+	}
+	if do.hostTimeout == 0 {
+		do.hostTimeout = defaultDownloadHostTimeout
+	}
+	if do.maxBufferedChunks == 0 {
 		do.maxBufferedChunks = defaultChunksInMemory()
 	}
 	// a chunk holds a single permit, so the budget is already a capacity
@@ -590,6 +603,11 @@ const (
 	// minDownloadInflight is the floor it may back off to.
 	initialDownloadInflight = 8
 	minDownloadInflight     = 1
+
+	// defaultDownloadHostTimeout is the per-attempt timeout for reading a
+	// sector from a host; see [WithDownloadHostTimeout]. It is long to handle
+	// slow hosts, since racing routes around stragglers.
+	defaultDownloadHostTimeout = 60 * time.Second
 
 	// initialChunkSize is the size of a download's first chunk. Starting
 	// small keeps the time to first byte low, since the first chunk only
@@ -1114,12 +1132,20 @@ func WithRedundancy(dataShards, parityShards uint8) UploadOption {
 }
 
 // WithUploadMaxBufferedSlabs sets the maximum number of fully encoded slabs
-// held in memory. Upload concurrency adapts to network conditions up to that
-// ceiling. Each slab uses (dataShards+parityShards) * 4 MiB; zero uses the
-// default, roughly 10% of the memory available to the process.
+// held in memory. Each slab uses (dataShards+parityShards) * 4 MiB; zero uses
+// the default, roughly 10% of the memory available to the process. Concurrent
+// uploads also share one budget of that default size across the SDK.
 func WithUploadMaxBufferedSlabs(maxBufferedSlabs int) UploadOption {
 	return func(uo *uploadOption) {
 		uo.maxBufferedSlabs = maxBufferedSlabs
+	}
+}
+
+// WithUploadHostTimeout sets the timeout for writing a sector to an individual
+// host. Zero uses the default, 90 seconds.
+func WithUploadHostTimeout(timeout time.Duration) UploadOption {
+	return func(uo *uploadOption) {
+		uo.hostTimeout = timeout
 	}
 }
 
@@ -1132,8 +1158,8 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 	}
 }
 
-// WithDownloadHostTimeout sets the timeout for reading sectors
-// from individual hosts. The default is 60 seconds.
+// WithDownloadHostTimeout sets the timeout for reading a sector from an
+// individual host. Zero uses the default, 60 seconds.
 func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 	return func(do *downloadOption) {
 		do.hostTimeout = timeout
@@ -1183,11 +1209,13 @@ func WithLogger(log *zap.Logger) Option {
 	}
 }
 
-func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
+// newSDK creates an SDK with its defaults and opts applied. The caller sets the
+// host client.
+func newSDK(appKey types.PrivateKey, app appClient, hostsCache *hostCache, opts ...Option) *SDK {
 	sdk := &SDK{
 		appKey:     appKey,
 		app:        app,
-		hostsCache: newHostCache(),
+		hostsCache: hostsCache,
 
 		tg:  threadgroup.New(),
 		log: zap.NewNop(), // no logging by default
@@ -1195,6 +1223,13 @@ func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, erro
 	for _, opt := range opts {
 		opt(sdk)
 	}
+	sdk.uploadLimiter = newUploadLimiter(sdk.log)
+	sdk.uploadWaiting = newChangeCounter(0)
+	return sdk
+}
+
+func initSDK(appKey types.PrivateKey, app appClient, opts ...Option) (*SDK, error) {
+	sdk := newSDK(appKey, app, newHostCache(), opts...)
 
 	// create the host client
 	sdk.hosts = client.New(client.NewProvider(sdk.hostsCache), sdk.log.Named("client"))
