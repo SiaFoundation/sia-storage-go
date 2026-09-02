@@ -904,38 +904,47 @@ func validateSharedObjectRequest(req sharing.SharedObjectRequest) error {
 	return nil
 }
 
-// paginateSharing applies the offset and limit parameters the way the indexer's
+// A sharingPage is the offset and limit a paginated route has accepted.
+type sharingPage struct {
+	offset, limit int
+}
+
+// parseSharingPage reads the offset and limit parameters the way the indexer's
 // paginated routes do. Passing no options means the indexer's default limit of
 // 100, and a longer list comes back cut to it with a success and nothing in the
 // response to say anything was left out. An out of range limit, by contrast, is
 // a 400.
-func paginateSharing[T any](items []T, opts ...api.URLQueryParameterOption) ([]T, error) {
+func parseSharingPage(opts ...api.URLQueryParameterOption) (sharingPage, error) {
 	values := url.Values{}
 	for _, opt := range opts {
 		opt(values)
 	}
 
-	offset := 0
+	page := sharingPage{limit: 100} // api's unexported defaultLimit
 	if v := values.Get("offset"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			return nil, sharingError(http.StatusBadRequest, api.ErrInvalidOffset)
+			return sharingPage{}, sharingError(http.StatusBadRequest, api.ErrInvalidOffset)
 		}
-		offset = n
+		page.offset = n
 	}
-	limit := 100 // api's unexported defaultLimit
 	if v := values.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > api.MaxLimit {
-			return nil, sharingError(http.StatusBadRequest, api.ErrInvalidLimit)
+			return sharingPage{}, sharingError(http.StatusBadRequest, api.ErrInvalidLimit)
 		}
-		limit = n
+		page.limit = n
 	}
+	return page, nil
+}
 
-	if offset >= len(items) {
-		return nil, nil
+// paginateSharing cuts items down to the page, the way the indexer's LIMIT and
+// OFFSET do.
+func paginateSharing[T any](items []T, page sharingPage) []T {
+	if page.offset >= len(items) {
+		return nil
 	}
-	return items[offset:min(offset+limit, len(items))], nil
+	return items[page.offset:min(page.offset+page.limit, len(items))]
 }
 
 // ownedSharingKey mirrors the indexer's owner-side lookup, where a key that does
@@ -1065,6 +1074,11 @@ func (mc *mockAppClient) SharingKey(_ context.Context, appKey types.PrivateKey, 
 
 // SharingKeys implements the [appClient] interface.
 func (mc *mockAppClient) SharingKeys(_ context.Context, appKey types.PrivateKey, opts ...api.URLQueryParameterOption) ([]sharing.Key, error) {
+	page, err := parseSharingPage(opts...)
+	if err != nil {
+		return nil, err
+	}
+
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
@@ -1081,12 +1095,9 @@ func (mc *mockAppClient) SharingKeys(_ context.Context, appKey types.PrivateKey,
 		return cmp.Compare(b.seq, a.seq)
 	})
 
-	page, err := paginateSharing(owned, opts...)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]sharing.Key, 0, len(page))
-	for _, sk := range page {
+	owned = paginateSharing(owned, page)
+	keys := make([]sharing.Key, 0, len(owned))
+	for _, sk := range owned {
 		keys = append(keys, sk.withSharingStats())
 	}
 	return keys, nil
@@ -1185,6 +1196,11 @@ func (mc *mockAppClient) DeleteSharedObject(_ context.Context, appKey types.Priv
 
 // SharingKeyObjects implements the [appClient] interface.
 func (mc *mockAppClient) SharingKeyObjects(_ context.Context, appKey types.PrivateKey, sharingKey types.PublicKey, opts ...api.URLQueryParameterOption) ([]slabs.SealedObject, error) {
+	page, err := parseSharingPage(opts...)
+	if err != nil {
+		return nil, err
+	}
+
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
@@ -1205,12 +1221,9 @@ func (mc *mockAppClient) SharingKeyObjects(_ context.Context, appKey types.Priva
 		return cmp.Compare(b.seq, a.seq)
 	})
 
-	page, err := paginateSharing(attached, opts...)
-	if err != nil {
-		return nil, err
-	}
-	objects := make([]slabs.SealedObject, 0, len(page))
-	for _, att := range page {
+	attached = paginateSharing(attached, page)
+	objects := make([]slabs.SealedObject, 0, len(attached))
+	for _, att := range attached {
 		obj, ok := mc.objects[att.req.ObjectID]
 		if !ok {
 			// shared_objects cascades when the owner deletes the object, so the

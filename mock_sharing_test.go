@@ -294,6 +294,11 @@ func TestMockSharingRules(t *testing.T) {
 	_, err = mc.SharingKeys(ctx, appKey, api.WithLimit(api.MaxLimit+1))
 	assertHTTPStatus(t, err, http.StatusBadRequest, api.ErrInvalidLimit)
 
+	// paging is parsed before the key is looked up, so this outranks the
+	// not-found another account would otherwise get
+	_, err = mc.SharingKeyObjects(ctx, other, sharingKey.PublicKey(), api.WithLimit(api.MaxLimit+1))
+	assertHTTPStatus(t, err, http.StatusBadRequest, api.ErrInvalidLimit)
+
 	// detaching reports the same not-found for an object that was never
 	// attached and for a key owned by someone else
 	detachErr := mc.DeleteSharedObject(ctx, appKey, sharingKey.PublicKey(), second.ID())
