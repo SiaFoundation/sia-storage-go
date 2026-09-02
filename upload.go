@@ -287,10 +287,12 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// read the next raw slab; io.EOF means the stream ended, every other
-		// error is fatal
-		buf := make([]byte, dataSize)
-		n, err := readSlab(r, buf)
+		// io.Reader has no readiness signal, so use a one-byte lookahead to keep
+		// an unused packed upload waiting on its pipe without holding a
+		// commitment. Once data arrives, reserve the slab before allocating or
+		// filling the complete raw buffer
+		var lookahead [1]byte
+		n, err := readSlab(r, lookahead[:])
 		last := err == io.EOF
 		if err != nil && !last {
 			abandon()
@@ -301,13 +303,24 @@ func (s *SDK) uploadSlabs(ctx context.Context, respCh chan slabUpload, r io.Read
 			return
 		}
 
-		// commit memory for the slab's encoded shards before encoding, so
-		// encoding cannot run away ahead of the uploads. committing after the
-		// read keeps a packed upload idling between objects from holding permits
 		slabCommitment, ok := s.uploadLimiter.commit(ctx, totalShards)
 		if !ok {
 			abandon()
 			return
+		}
+
+		buf := make([]byte, dataSize)
+		buf[0] = lookahead[0]
+		if !last {
+			nn, readErr := readSlab(r, buf[1:])
+			n += nn
+			last = readErr == io.EOF
+			if readErr != nil && !last {
+				slabCommitment.releaseAll()
+				abandon()
+				send(slabUpload{err: fmt.Errorf("failed to read slab %d: %w", i, readErr)})
+				return
+			}
 		}
 
 		su := shardUpload{

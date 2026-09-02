@@ -35,6 +35,27 @@ func (r *erroringReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// gatedReader reports when its first and second reads happen and blocks the
+// second until released.
+type gatedReader struct {
+	firstRead  chan struct{}
+	secondRead chan struct{}
+	unblock    chan struct{}
+	reads      int
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	r.reads++
+	if r.reads == 1 {
+		p[0] = 1
+		close(r.firstRead)
+		return 1, nil
+	}
+	close(r.secondRead)
+	<-r.unblock
+	return 0, io.EOF
+}
+
 // TestUploadReaderError asserts a failing reader is not mistaken for the end
 // of the stream, which would silently truncate the object.
 func TestUploadReaderError(t *testing.T) {
@@ -270,6 +291,76 @@ func TestUploadPackedIdleHoldsNoPermits(t *testing.T) {
 	sdk.uploadLimiter.mu.Unlock()
 	if committed != 0 {
 		t.Fatalf("idle packed uploads hold %d permits", committed)
+	}
+}
+
+// TestUploadReservesMemoryBeforeReadingSlab asserts a blocked upload retains
+// only its one-byte data probe, not a complete unaccounted raw slab.
+func TestUploadReservesMemoryBeforeReadingSlab(t *testing.T) {
+	const dataShards, parityShards = 3, 9
+	const totalShards = dataShards + parityShards
+
+	sdk, _ := newTestSDK(t, dataShards+parityShards, zaptest.NewLogger(t))
+	t.Cleanup(func() { sdk.Close() })
+	sdk.uploadLimiter = newInflightLimiter(1, 1, totalShards, 1, zaptest.NewLogger(t))
+
+	// fill the shared memory budget so the upload has to park after probing
+	// the reader but before allocating and filling its raw slab
+	occupied, ok := sdk.uploadLimiter.commit(t.Context(), totalShards)
+	if !ok {
+		t.Fatal("failed to fill upload memory budget")
+	}
+
+	r := &gatedReader{
+		firstRead:  make(chan struct{}),
+		secondRead: make(chan struct{}),
+		unblock:    make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		obj := NewEmptyObject()
+		done <- sdk.Upload(ctx, &obj, r, WithRedundancy(dataShards, parityShards))
+	}()
+
+	select {
+	case <-r.firstRead:
+	case err := <-done:
+		t.Fatal("upload stopped before probing reader:", err)
+	case <-time.After(time.Second):
+		t.Fatal("upload did not probe reader")
+	}
+	select {
+	case <-r.secondRead:
+		close(r.unblock)
+		occupied.releaseAll()
+		t.Fatal("upload continued filling slab before reserving memory")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	occupied.releaseAll()
+	select {
+	case <-r.secondRead:
+	case <-time.After(time.Second):
+		t.Fatal("upload did not resume reading after memory was released")
+	}
+	sdk.uploadLimiter.mu.Lock()
+	committed := sdk.uploadLimiter.committed
+	sdk.uploadLimiter.mu.Unlock()
+	if committed != totalShards {
+		t.Fatalf("expected slab to hold %d permits, got %d", totalShards, committed)
+	}
+	close(r.unblock)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	sdk.uploadLimiter.mu.Lock()
+	committed = sdk.uploadLimiter.committed
+	sdk.uploadLimiter.mu.Unlock()
+	if committed != 0 {
+		t.Fatalf("upload leaked %d memory permits", committed)
 	}
 }
 
