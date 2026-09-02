@@ -77,6 +77,25 @@ func TestDownloadMaxBufferedChunks(t *testing.T) {
 	}
 }
 
+func TestDownloadHostTimeout(t *testing.T) {
+	if _, err := newDownloadOption(1, WithDownloadHostTimeout(-time.Second)); err == nil {
+		t.Fatal("expected a negative host timeout to fail")
+	}
+
+	// zero uses the default
+	if do, err := newDownloadOption(1, WithDownloadHostTimeout(0)); err != nil {
+		t.Fatal(err)
+	} else if do.hostTimeout != defaultDownloadHostTimeout {
+		t.Fatal("unexpected default host timeout", do.hostTimeout)
+	}
+
+	if do, err := newDownloadOption(1, WithDownloadHostTimeout(time.Second)); err != nil {
+		t.Fatal(err)
+	} else if do.hostTimeout != time.Second {
+		t.Fatal("unexpected host timeout", do.hostTimeout)
+	}
+}
+
 func TestDownloadTimeoutDemotesHost(t *testing.T) {
 	sdk, hosts := newTestSDK(t, 30, zaptest.NewLogger(t))
 	defer sdk.Close()
