@@ -534,6 +534,10 @@ func (b *sharedBandwidth) transfer(ctx context.Context) error {
 // SetSharedBandwidth routes every write through one network that takes
 // soloWrite to carry a sector on its own. It must be set before issuing writes.
 func (m *mockHostClient) SetSharedBandwidth(soloWrite time.Duration) {
+	if soloWrite <= 0 {
+		m.bandwidth = nil
+		return
+	}
 	m.bandwidth = &sharedBandwidth{soloWrite: soloWrite}
 }
 
