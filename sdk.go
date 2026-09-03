@@ -532,8 +532,7 @@ func (d *downloadStream) Close() error {
 // with defaults, applies the given options, and validates them.
 func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOption, error) {
 	do := downloadOption{
-		hostTimeout: 60 * time.Second, // long to handle slow hosts; racing routes around stragglers
-		length:      objectSize,
+		length: objectSize,
 	}
 	for _, opt := range opts {
 		opt(&do)
@@ -541,7 +540,13 @@ func newDownloadOption(objectSize uint64, opts ...DownloadOption) (downloadOptio
 
 	if do.maxBufferedChunks < 0 {
 		return do, fmt.Errorf("max buffered chunks must not be negative, got %d", do.maxBufferedChunks)
-	} else if do.maxBufferedChunks == 0 {
+	} else if do.hostTimeout < 0 {
+		return do, fmt.Errorf("host timeout must not be negative, got %v", do.hostTimeout)
+	}
+	if do.hostTimeout == 0 {
+		do.hostTimeout = defaultDownloadHostTimeout
+	}
+	if do.maxBufferedChunks == 0 {
 		do.maxBufferedChunks = defaultChunksInMemory()
 	}
 	// a chunk holds a single permit, so the budget is already a capacity
@@ -598,6 +603,11 @@ const (
 	// minDownloadInflight is the floor it may back off to.
 	initialDownloadInflight = 8
 	minDownloadInflight     = 1
+
+	// defaultDownloadHostTimeout is the per-attempt timeout for reading a
+	// sector from a host; see [WithDownloadHostTimeout]. It is long to handle
+	// slow hosts, since racing routes around stragglers.
+	defaultDownloadHostTimeout = 60 * time.Second
 
 	// initialChunkSize is the size of a download's first chunk. Starting
 	// small keeps the time to first byte low, since the first chunk only
@@ -1131,6 +1141,14 @@ func WithUploadMaxBufferedSlabs(maxBufferedSlabs int) UploadOption {
 	}
 }
 
+// WithUploadHostTimeout sets the timeout for writing a sector to an individual
+// host. Zero uses the default, 90 seconds.
+func WithUploadHostTimeout(timeout time.Duration) UploadOption {
+	return func(uo *uploadOption) {
+		uo.hostTimeout = timeout
+	}
+}
+
 // WithUploadProgress sets a callback that is invoked for each shard that
 // completes uploading successfully. Callers should keep the callback short or
 // hand off work to a goroutine. The callback may be called concurrently.
@@ -1140,8 +1158,8 @@ func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 	}
 }
 
-// WithDownloadHostTimeout sets the timeout for reading sectors
-// from individual hosts. The default is 60 seconds.
+// WithDownloadHostTimeout sets the timeout for reading a sector from an
+// individual host. Zero uses the default, 60 seconds.
 func WithDownloadHostTimeout(timeout time.Duration) DownloadOption {
 	return func(do *downloadOption) {
 		do.hostTimeout = timeout

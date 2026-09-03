@@ -153,9 +153,18 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 	c.completions, c.successes, c.elapsed = 0, 0, 0
 
 	// no goodput at all, however fast the failures came back, so back off
-	// without waiting out the strike count
+	// without waiting out the strike count, and settle rather than probe back
+	// up to the limit that just timed every operation out
 	if successes == 0 {
-		c.backOff(old)
+		if c.probing && c.prevGoodput > 0 && c.prevLimit < old {
+			// a failed probe returns to the level that was working
+			c.settle(c.prevLimit)
+		} else {
+			// a new level, whose first healthy window seeds the baseline
+			c.settle(old / 2)
+			c.goodputEMA = 0
+		}
+		c.prevGoodput = 0
 		return c.applyLimit(old, 0)
 	}
 	if windowElapsed <= 0 {
@@ -190,7 +199,12 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 		c.prevGoodput = goodput
 
 	case !adverse: // settled and healthy
-		c.goodputEMA = emaAlpha*goodput + (1-emaAlpha)*c.goodputEMA
+		if c.goodputEMA == 0 {
+			// a window without a success cleared the baseline, so seed it
+			c.goodputEMA = goodput
+		} else {
+			c.goodputEMA = emaAlpha*goodput + (1-emaAlpha)*c.goodputEMA
+		}
 		c.steadyRun++
 		if c.steadyRun >= probeInterval && old < c.capacity {
 			// probe upward in case capacity has freed up
@@ -201,16 +215,23 @@ func (c *inflightController) record(permit samplePermit, elapsed time.Duration, 
 		c.prevGoodput = goodput
 
 	case c.probing: // the last doubling did not pay off, settle at the level below it
-		c.limit = min(max(c.prevLimit, c.floor), c.capacity)
-		c.probing = false
+		c.settle(c.prevLimit)
 		c.goodputEMA = goodput
 		c.prevGoodput = goodput
-		c.steadyRun = 0
 
 	default: // sustained decline at a settled limit, back off and probe again
 		c.backOff(old)
 	}
 	return c.applyLimit(old, goodput)
+}
+
+// settle holds the limit at limit, within the bounds, and stops probing. The
+// caller must hold c.mu.
+func (c *inflightController) settle(limit int) {
+	c.limit = min(max(limit, c.floor), c.capacity)
+	c.strikes = 0
+	c.probing = false
+	c.steadyRun = 0
 }
 
 // backOff halves the limit, down to the floor, and clears the baseline so the
