@@ -6,7 +6,7 @@ replace go.sia.tech/siastorage => ../
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/vbauerster/mpb/v8 v8.16.0
+	github.com/vbauerster/mpb/v8 v8.16.1
 	go.sia.tech/core v0.21.7
 	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01
 	go.sia.tech/siastorage v0.0.0-00010101000000-000000000000
@@ -33,7 +33,7 @@ require (
 	go.sia.tech/jape v0.14.1 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
