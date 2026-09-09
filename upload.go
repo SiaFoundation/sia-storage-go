@@ -20,11 +20,6 @@ const (
 	// tracked by the per-slab uploadPool across all shard goroutines.
 	maxHostAttempts = 3
 
-	// maxShardAttemptsInflight caps the attempts one shard may have in flight,
-	// so racing a shard that is slow because the network is saturated cannot
-	// keep adding copies of the same sector to it.
-	maxShardAttemptsInflight = 2
-
 	// initialUploadInflight is the number of shard uploads allowed in flight
 	// before the controller has measured anything, and minUploadInflight is the
 	// floor it may back off to.
@@ -505,7 +500,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 		// on an availability signal that might never come
 		waiting, idleCh := su.waiting.snapshot()
 		var raceCh <-chan time.Time
-		if waiting == 0 && active < maxShardAttemptsInflight {
+		if waiting == 0 {
 			// Go cleans up this timer even if we never read the channel
 			raceCh = time.After(time.Until(lastEvent.Add(raceTimeout)))
 			// while racing we wait on the timer, not shards starting
@@ -572,8 +567,7 @@ func (su *shardUpload) uploadShard(ctx context.Context, shardIndex int, sector [
 
 		case <-raceCh:
 			lastEvent = time.Now()
-			// check the gate again, a shard may have started waiting since.
-			// active is only touched by this goroutine, so it needs no re-check
+			// check the gate again, a shard may have started waiting since
 			if su.waiting.load() != 0 {
 				continue
 			}
