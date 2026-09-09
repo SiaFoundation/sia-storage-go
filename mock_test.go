@@ -86,6 +86,7 @@ type mockHostClient struct {
 	failedRPCs []types.PublicKey
 
 	readJitter func() time.Duration // set before issuing reads; nil for none
+	bandwidth  *sharedBandwidth     // set before issuing writes; nil for none
 
 	errHostsMu sync.Mutex
 	errHosts   map[types.PublicKey]hostErr
@@ -329,7 +330,9 @@ func (m *mockHostClient) WriteSector(ctx context.Context, _ types.PrivateKey, ho
 	}
 
 	// simulate i/o
-	if err := m.delay(ctx, hostKey); err != nil {
+	if err := m.bandwidth.transfer(ctx); err != nil {
+		return rhp.RPCWriteSectorResult{}, err
+	} else if err := m.delay(ctx, hostKey); err != nil {
 		return rhp.RPCWriteSectorResult{}, err
 	}
 
@@ -423,6 +426,17 @@ func (m *mockHostClient) WriteCalls() map[types.PublicKey]int {
 	return calls
 }
 
+// TotalWrites returns the number of WriteSector calls across every host.
+func (m *mockHostClient) TotalWrites() int {
+	m.writesMu.Lock()
+	defer m.writesMu.Unlock()
+	var total int
+	for _, n := range m.writeCalls {
+		total += n
+	}
+	return total
+}
+
 // ResetPricesCalls clears the Prices call counters.
 func (m *mockHostClient) ResetPricesCalls() {
 	m.pricesMu.Lock()
@@ -480,6 +494,51 @@ func (m *mockHostClient) jitterDelay(ctx context.Context) error {
 // it. It must be set before issuing reads.
 func (m *mockHostClient) SetReadJitter(fn func() time.Duration) {
 	m.readJitter = fn
+}
+
+// sharedBandwidth models one bandwidth-limited network every write goes
+// through, so concurrent writes slow each other down instead of adding
+// throughput.
+type sharedBandwidth struct {
+	soloWrite time.Duration // one sector write with the network to itself
+	active    atomic.Int64
+}
+
+// transfer drains a sector write through the network, sharing its bandwidth
+// evenly with the other writes in flight.
+func (b *sharedBandwidth) transfer(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	b.active.Add(1)
+	defer b.active.Add(-1)
+
+	// advance by wall-clock time, not by the nominal step, so a late timer
+	// wakeup under load does not make the network slower than modeled
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	last := time.Now()
+	for remaining := 1.0; remaining > 0; {
+		var now time.Time
+		select {
+		case <-ctx.Done():
+			return timeoutErr(ctx)
+		case now = <-tick.C:
+		}
+		remaining -= float64(now.Sub(last)) / float64(b.soloWrite*time.Duration(b.active.Load()))
+		last = now
+	}
+	return nil
+}
+
+// SetSharedBandwidth routes every write through one network that takes
+// soloWrite to carry a sector on its own. It must be set before issuing writes.
+func (m *mockHostClient) SetSharedBandwidth(soloWrite time.Duration) {
+	if soloWrite <= 0 {
+		m.bandwidth = nil
+		return
+	}
+	m.bandwidth = &sharedBandwidth{soloWrite: soloWrite}
 }
 
 func (m *mockHostClient) SetSectorReadDelay(root types.Hash256, d time.Duration) {
