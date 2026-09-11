@@ -1,0 +1,62 @@
+name: Lint & Test
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+        with:
+          skip-cache: true
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      # The archive is linked from the siastorage-libs module, so the Go jobs
+      # need no Rust toolchain and build nothing native themselves.
+      - name: Test
+        uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
+        with:
+          args: -race;-failfast
+  contract:
+    name: Contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: master
+          path: sia-sdk-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: sia-sdk-rs
+      # Fails when the vendored header no longer matches the Rust it describes,
+      # which is the only thing keeping the cgo declarations honest.
+      - name: Check header
+        run: make check-header SIA_SDK_RS=sia-sdk-rs
+      # Covers the C ABI itself, including the streaming roundtrip against
+      # in-process hosts. Go tests cannot reach cgo directly, so the entry
+      # points are exercised here.
+      - name: Test FFI crate
+        run: cargo test --manifest-path sia-sdk-rs/sia_storage_cabi/Cargo.toml --features mock
