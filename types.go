@@ -46,4 +46,16 @@ var (
 	// ErrNoMoreHosts is returned when there are no more hosts available to
 	// attempt to upload a shard.
 	ErrNoMoreHosts = errors.New("no more hosts available")
+
+	// ErrObjectNotAttached is returned when detaching an object from a sharing
+	// key it was never attached to.
+	ErrObjectNotAttached = errors.New("object is not attached to the sharing key")
+
+	// ErrKeyMismatch is returned when a sharing key does not belong to the
+	// account the call was made on.
+	ErrKeyMismatch = errors.New("sharing key does not belong to this account")
+
+	// ErrInvalidState is returned when a handle is used in a way its current
+	// state does not allow, such as finishing an upload twice.
+	ErrInvalidState = errors.New("invalid state for this operation")
 )

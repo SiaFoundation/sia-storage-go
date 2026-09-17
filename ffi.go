@@ -258,6 +258,12 @@ func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 		return ErrUserRejected
 	case C.SIA_ERR_REQUEST_EXPIRED:
 		return ErrRequestExpired
+	case C.SIA_ERR_OBJECT_NOT_ATTACHED:
+		return ErrObjectNotAttached
+	case C.SIA_ERR_KEY_MISMATCH:
+		return ErrKeyMismatch
+	case C.SIA_ERR_INVALID_STATE:
+		return &wrappedError{msg: msg, sentinel: ErrInvalidState}
 	}
 	// preserve errors.Is compatibility for well-known failure modes
 	if strings.Contains(msg, "not enough shards") {
