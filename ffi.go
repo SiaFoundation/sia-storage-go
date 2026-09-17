@@ -156,6 +156,15 @@ func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
 	if ctx == nil || ctx.Done() == nil {
 		return tok, free
 	}
+	// An already cancelled context has to fire the token before this returns.
+	// Leaving it to the watcher goroutine is a race that a fast call wins, and
+	// the call then runs as though it were never cancelled.
+	select {
+	case <-ctx.Done():
+		cancel()
+		return tok, free
+	default:
+	}
 	done := make(chan struct{})
 	exited := make(chan struct{})
 	go func() {
