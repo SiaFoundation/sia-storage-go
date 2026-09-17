@@ -135,6 +135,14 @@ func lookupProgress(id uintptr) *progressSink {
 	return v.(*progressSink)
 }
 
+// SetLogger routes the Rust SDK's process-wide log output to the given zap
+// logger, which is the only way to see what the native side is doing.
+//
+// The C side hook is installed once, on the first call. The target logger can
+// be swapped at any time, and a nil logger silences the output without
+// uninstalling the hook.
+func SetLogger(log *zap.Logger) { setGlobalLogger(log) }
+
 // setGlobalLogger routes the Rust SDK's process-wide log output to the given
 // zap logger. The C-side hook is installed once; the target logger can be
 // swapped at any time.

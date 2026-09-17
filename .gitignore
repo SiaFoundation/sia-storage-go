@@ -6,3 +6,8 @@ go.work.sum
 
 # test-only mock transport library, never committed
 ffi/lib/*/libsia_storage_cabi_mock.a
+
+# benchmark and demo binaries, built in place by go build
+/benchmark
+/demo
+examples/*/siastorage-benchmark-native
