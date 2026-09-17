@@ -5,6 +5,7 @@ package siastorage
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -206,5 +207,96 @@ func TestObjectFromBadShareURL(t *testing.T) {
 	}
 	if errors.Is(err, errClosed) {
 		t.Fatalf("unexpected error shape: %v", err)
+	}
+}
+
+// TestSealedObjectRoundTrip proves an object survives being persisted as JSON
+// and opened again, which is what a consumer storing objects in its own schema
+// depends on.
+func TestSealedObjectRoundTrip(t *testing.T) {
+	_, sdk := transferSDK(t)
+	ctx := context.Background()
+	want := payload(payloadSize)
+
+	uploaded := uploadPinned(t, sdk, want)
+	defer uploaded.Close()
+	uploaded.UpdateMetadata([]byte(`{"filename":"sealed.bin"}`))
+
+	sealed, err := sdk.SealObject(uploaded)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if !json.Valid(sealed) {
+		t.Fatalf("the sealed form is not valid JSON: %s", sealed)
+	}
+
+	opened, err := sdk.ObjectFromSealed(sealed)
+	if err != nil {
+		t.Fatalf("open sealed: %v", err)
+	}
+	defer opened.Close()
+
+	if opened.ID() != uploaded.ID() {
+		t.Fatal("the opened object has a different ID")
+	}
+	if opened.Size() != uploaded.Size() {
+		t.Fatalf("opened size %d, sealed %d", opened.Size(), uploaded.Size())
+	}
+	if got := opened.Metadata(); !bytes.Equal(got, []byte(`{"filename":"sealed.bin"}`)) {
+		t.Fatalf("metadata did not survive sealing, got %q", got)
+	}
+
+	// The keys have to come back usable, not just the numbers.
+	dl, err := sdk.Download(ctx, opened, DownloadOptions{})
+	if err != nil {
+		t.Fatalf("download the opened object: %v", err)
+	}
+	defer dl.Close()
+	got, err := io.ReadAll(dl)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("the object opened from sealed JSON did not download to the same bytes")
+	}
+}
+
+// TestSealedObjectRejectsForeignKey proves the signature check is real, so a
+// sealed object from another account fails to open rather than yielding a
+// handle that reads nothing.
+func TestSealedObjectRejectsForeignKey(t *testing.T) {
+	net, sdk := transferSDK(t)
+
+	uploaded := uploadPinned(t, sdk, payload(1<<20))
+	defer uploaded.Close()
+	sealed, err := sdk.SealObject(uploaded)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	var otherSeed [32]byte
+	otherSeed[0] = 200
+	other, err := net.SDK(context.Background(), otherSeed)
+	if err != nil {
+		t.Fatalf("second sdk: %v", err)
+	}
+	defer other.Close()
+
+	if obj, err := other.ObjectFromSealed(sealed); err == nil {
+		obj.Close()
+		t.Fatal("a sealed object opened under a different app key")
+	}
+}
+
+// TestSealedObjectRejectsGarbage proves a malformed document is an error rather
+// than a panic crossing the boundary.
+func TestSealedObjectRejectsGarbage(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	for _, bad := range [][]byte{nil, []byte(""), []byte("{"), []byte(`{"slabs":[]}`)} {
+		if obj, err := sdk.ObjectFromSealed(bad); err == nil {
+			obj.Close()
+			t.Fatalf("%q opened as a sealed object", bad)
+		}
 	}
 }

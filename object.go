@@ -245,3 +245,41 @@ func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object,
 	}
 	return wrapObject(ptr), nil
 }
+
+// SealObject encodes obj as the sealed JSON the indexer API exchanges, with the
+// data and metadata keys encrypted to the account's app key and signed by it.
+//
+// This is the one type a caller sees inside rather than holds as a handle,
+// because a consumer persisting objects into its own schema needs the fields.
+// Store the result unchanged and hand it back to [SDK.ObjectFromSealed].
+//
+// It is derived locally and reaches no indexer.
+func (s *SDK) SealObject(obj *Object) ([]byte, error) {
+	var cJSON, cerr *C.char
+	code := C.sia_object_seal_json(s.ptr, obj.ptr, &cJSON, &cerr)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(obj)
+	if code != C.SIA_OK {
+		return nil, goError(nil, code, cerr)
+	}
+	return []byte(goString(cJSON)), nil
+}
+
+// ObjectFromSealed decodes and opens sealed JSON from [SDK.SealObject],
+// verifying its signatures against the account's app key.
+//
+// A sealed object produced under a different app key fails here rather than
+// producing a handle that cannot read anything.
+func (s *SDK) ObjectFromSealed(sealed []byte) (*Object, error) {
+	cJSON := C.CString(string(sealed))
+	defer C.free(unsafe.Pointer(cJSON))
+
+	var ptr *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_object_from_sealed_json(s.ptr, cJSON, &ptr, &cerr)
+	runtime.KeepAlive(s)
+	if code != C.SIA_OK {
+		return nil, goError(nil, code, cerr)
+	}
+	return wrapObject(ptr), nil
+}
