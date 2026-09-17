@@ -8,6 +8,8 @@ package siastorage
 import "C"
 
 import (
+	"context"
+	"errors"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -126,4 +128,120 @@ func unixMicro(us int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMicro(us).UTC()
+}
+
+// Object fetches the object with the given ID from the indexer, decrypting the
+// keys and metadata it carries.
+func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var ptr *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_sdk_object(s.ptr, cBytes32((*[32]byte)(&id)), tok, &ptr, &cerr)
+	runtime.KeepAlive(s)
+	if code != C.SIA_OK {
+		return nil, goError(ctx, code, cerr)
+	}
+	return wrapObject(ptr), nil
+}
+
+// PinObject registers obj with the indexer, pinning any of its slabs that are
+// not already pinned.
+//
+// An upload pins the slabs it writes but not the object itself, so until this
+// is called the object exists only as a local handle and no lookup by ID, share
+// URL or delete can find it.
+func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var cerr *C.char
+	code := C.sia_sdk_pin_object(s.ptr, obj.ptr, tok, &cerr)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(obj)
+	return goError(ctx, code, cerr)
+}
+
+// UpdateObjectMetadata persists the metadata currently on obj, which
+// [Object.UpdateMetadata] only changes locally.
+//
+// It pins the object as a side effect, so it also serves to persist an object
+// whose metadata is the only thing that changed.
+//
+// The indexer caps the encrypted form at 1 KiB, and encryption adds a 24 byte
+// nonce and a 16 byte tag, so the usable budget is 984 bytes. Exceeding it
+// fails here rather than at the point the metadata was set.
+func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var cerr *C.char
+	code := C.sia_sdk_update_object_metadata(s.ptr, obj.ptr, tok, &cerr)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(obj)
+	return goError(ctx, code, cerr)
+}
+
+// DeleteObject removes the object from the indexer. The slabs it held survive
+// until they are pruned, so an object sharing slabs with another is unaffected.
+func (s *SDK) DeleteObject(ctx context.Context, id types.Hash256) error {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var cerr *C.char
+	code := C.sia_sdk_delete_object(s.ptr, cBytes32((*[32]byte)(&id)), tok, &cerr)
+	runtime.KeepAlive(s)
+	return goError(ctx, code, cerr)
+}
+
+// PruneSlabs releases the slabs no remaining object references, which is what
+// actually frees the pinned storage a deleted object was using.
+func (s *SDK) PruneSlabs(ctx context.Context) error {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var cerr *C.char
+	code := C.sia_sdk_prune_slabs(s.ptr, tok, &cerr)
+	runtime.KeepAlive(s)
+	return goError(ctx, code, cerr)
+}
+
+// ObjectShareURL returns a URL granting read access to obj until validUntil,
+// without the recipient needing an account. It is derived locally, so it
+// reaches no indexer and cannot be revoked once handed out.
+//
+// validUntil must be a real time; there is no sentinel for an unexpiring URL.
+func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) {
+	if validUntil.IsZero() {
+		return "", errors.New("share URL requires an expiration time")
+	}
+	var cURL, cerr *C.char
+	code := C.sia_sdk_object_share_url(s.ptr, obj.ptr,
+		C.int64_t(validUntil.UnixMicro()), &cURL, &cerr)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(obj)
+	if code != C.SIA_OK {
+		return "", goError(nil, code, cerr)
+	}
+	return goString(cURL), nil
+}
+
+// ObjectFromShareURL resolves a URL from [SDK.ObjectShareURL] into an object
+// the holder can download, paid for by the account that shared it.
+func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object, error) {
+	cURL := C.CString(shareURL)
+	defer C.free(unsafe.Pointer(cURL))
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var ptr *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_sdk_object_from_share_url(s.ptr, cURL, tok, &ptr, &cerr)
+	runtime.KeepAlive(s)
+	if code != C.SIA_OK {
+		return nil, goError(ctx, code, cerr)
+	}
+	return wrapObject(ptr), nil
 }
