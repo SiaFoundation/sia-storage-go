@@ -34,6 +34,10 @@ var (
 // cancellation token outside of a context (e.g. by closing a stream).
 var errCancelled = errors.New("operation cancelled")
 
+// errClosed is returned when a streaming handle is used after it has been
+// closed or finished.
+var errClosed = errors.New("handle is closed")
+
 // A progressSink separates the Rust runtime thread that reports a finished
 // shard from the goroutine that runs the caller's handler.
 type progressSink struct {
@@ -152,9 +156,17 @@ func newCancelToken() (tok *C.sia_cancel_t, cancel func(), release func()) {
 // cancelToken creates a C cancellation token wired to ctx. release must be
 // called once the FFI call(s) using the token have returned.
 func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
+	tok, _, release = streamToken(ctx)
+	return tok, release
+}
+
+// streamToken is cancelToken plus the explicit cancel, which a streaming handle
+// needs so Close can interrupt a call already blocked inside the native side.
+// release must be called once every FFI call using the token has returned.
+func streamToken(ctx context.Context) (tok *C.sia_cancel_t, cancel func(), release func()) {
 	tok, cancel, free := newCancelToken()
 	if ctx == nil || ctx.Done() == nil {
-		return tok, free
+		return tok, cancel, free
 	}
 	// An already cancelled context has to fire the token before this returns.
 	// Leaving it to the watcher goroutine is a race that a fast call wins, and
@@ -162,7 +174,7 @@ func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
 	select {
 	case <-ctx.Done():
 		cancel()
-		return tok, free
+		return tok, cancel, free
 	default:
 	}
 	done := make(chan struct{})
@@ -175,11 +187,49 @@ func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
 		case <-done:
 		}
 	}()
-	return tok, func() {
+	return tok, cancel, func() {
 		close(done)
 		<-exited
 		free()
 	}
+}
+
+// A streamCancel owns a streaming handle's cancellation token. fire may be
+// called at any time, including while an FFI call is blocked on the token, and
+// becomes a no op once close has run, so a handle can be interrupted without
+// racing the free that retires it.
+type streamCancel struct {
+	mu      sync.Mutex
+	live    bool
+	cancel  func()
+	release func()
+}
+
+// newStreamCancel wires a token to ctx and returns it alongside its owner.
+func newStreamCancel(ctx context.Context) (*C.sia_cancel_t, *streamCancel) {
+	tok, cancel, release := streamToken(ctx)
+	return tok, &streamCancel{live: true, cancel: cancel, release: release}
+}
+
+// fire cancels the token if it is still live.
+func (s *streamCancel) fire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live {
+		s.cancel()
+	}
+}
+
+// close stops the context watcher and frees the token, exactly once. The
+// caller must have ensured no FFI call is still using it.
+func (s *streamCancel) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live {
+		return
+	}
+	s.live = false
+	s.release()
 }
 
 // goError converts an FFI status code and error message into a Go error,
