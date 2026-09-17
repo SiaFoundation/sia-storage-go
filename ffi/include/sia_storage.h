@@ -189,9 +189,8 @@ void sia_packed_upload_free(sia_packed_upload_t* up);
 // A sealed object is the one type a caller sees inside rather than holds as an
 // opaque handle, because consumers persist its fields into their own schema.
 //
-// It crosses as the JSON the indexer API already exchanges, so a Go caller can
-// unmarshal it directly into go.sia.tech/indexd/slabs.SealedObject and store it
-// exactly as before.
+// It crosses as the JSON the indexer API already exchanges, so a caller can
+// decode it into its own type and persist it unchanged.
 //
 // *out_json receives an owned string. Free it with sia_string_free.
 int32_t sia_object_seal_json(const sia_sdk_t* sdk, const sia_object_t* obj, char** out_json, char** err);
