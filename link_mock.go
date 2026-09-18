@@ -9,7 +9,7 @@ package siastorage
 //
 // Directive order matters: GNU ld resolves symbols left to right, so the
 // system libraries must come after the archive that references them. The
-// platform list must match siastorage-libs.
+// platform list must match link.go.
 
 /*
 #cgo CFLAGS: -DSIA_STORAGE_MOCK

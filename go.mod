@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	go.sia.tech/core v0.21.7
-	go.sia.tech/siastorage-libs v0.1.0
 	go.uber.org/zap v1.28.0
 )
 
