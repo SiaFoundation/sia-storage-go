@@ -45,8 +45,13 @@ REPO ?= SiaFoundation/sia-storage-go
 # The workflow run to take archives from. Defaults to the most recent
 # successful one, which is what you want unless you are reproducing an older
 # build. Lazy so that `gh` is only invoked by the target that needs it.
-RUN = $(shell gh run list --repo $(REPO) --workflow build-libs.yml \
-	--status success --limit 1 --json databaseId --jq '.[0].databaseId')
+# Matched on the run name rather than --workflow build-libs.yml, because
+# resolving a workflow by path goes through an API that only knows about the
+# default branch. Until this workflow reaches master that lookup 404s even
+# though the runs themselves exist.
+RUN = $(shell gh run list --repo $(REPO) --limit 50 \
+	--json databaseId,name,conclusion \
+	--jq '[.[] | select(.name == "Build FFI Libraries" and .conclusion == "success")][0].databaseId')
 
 # Downloads this platform's archive from a workflow run. The archive that lands
 # is the same artifact the committed one came from, so a clean tree stays clean
