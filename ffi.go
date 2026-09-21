@@ -137,9 +137,14 @@ func lookupProgress(id uintptr) *progressSink {
 // SetLogger routes the Rust SDK's process-wide log output to the given zap
 // logger, which is the only way to see what the native side is doing.
 //
-// The C side hook is installed once, on the first call. The target logger can
-// be swapped at any time, and a nil logger silences the output without
-// uninstalling the hook.
+// The verbosity the native side is asked for is taken from what log itself
+// accepts, so an info level logger no longer has Rust format debug records
+// only for them to be discarded on this side of the boundary.
+//
+// The C side hook can only be installed once, so that ceiling is fixed by the
+// first call: a later, more verbose logger sees no more than the first one
+// asked for. The target logger can be swapped at any time, and a nil logger
+// silences the output without uninstalling the hook.
 func SetLogger(log *zap.Logger) { setGlobalLogger(log) }
 
 // setGlobalLogger routes the Rust SDK's process-wide log output to the given
@@ -148,7 +153,7 @@ func SetLogger(log *zap.Logger) { setGlobalLogger(log) }
 func setGlobalLogger(log *zap.Logger) {
 	globalLogger.Store(log)
 	loggerOnce.Do(func() {
-		C.sia_set_logger(C.sia_go_log_cb(), 0, 4)
+		C.sia_set_logger(C.sia_go_log_cb(), 0, C.int32_t(rustLogLevel(log)))
 	})
 }
 
