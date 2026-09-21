@@ -8,8 +8,8 @@ package siastorage
 // it with `make testlib`; it is not committed.
 //
 // Directive order matters: GNU ld resolves symbols left to right, so the
-// system libraries must come after the archive that references them. Keep
-// link.go in sync.
+// system libraries must come after the archive that references them. The
+// platform list must match link.go.
 
 /*
 #cgo CFLAGS: -DSIA_STORAGE_MOCK

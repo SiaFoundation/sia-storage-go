@@ -2,12 +2,15 @@
 
 package siastorage
 
-// Links the production FFI library, built without the mock transport. These
-// are the libraries committed under ffi/lib/ so the module is `go get`-able.
+// Links the production FFI library. These archives are committed under ffi/lib/
+// so the module is `go get`-able: Go modules have no build hooks, so a consumer
+// running `go build` cannot compile Rust first.
 //
-// Directive order matters: GNU ld resolves symbols left to right, so the
-// system libraries must come after the archive that references them. Keep
-// link_mock.go in sync.
+// link_mock.go links the test-only mock archive instead, which is never
+// committed. The two platform lists must stay in step.
+//
+// Directive order matters: GNU ld resolves symbols left to right, so the system
+// libraries must come after the archive that references them.
 
 /*
 #cgo darwin,arm64 LDFLAGS: ${SRCDIR}/ffi/lib/darwin_arm64/libsia_storage_cabi.a
