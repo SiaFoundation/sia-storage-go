@@ -45,6 +45,12 @@ type PackedUpload struct {
 //
 // ctx cancels the whole upload, not just the call that starts it.
 func (s *SDK) PackedUpload(ctx context.Context, opts UploadOptions) (*PackedUpload, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	progressID := registerProgress(opts.OnShard)
 
 	copts := C.sia_upload_options_t{
@@ -87,6 +93,11 @@ func (s *SDK) PackedUpload(ctx context.Context, opts UploadOptions) (*PackedUplo
 //
 // Objects are added one at a time and an add runs to completion before the next
 // one starts, so this blocks for the whole object.
+//
+// A failed add contributes no object. The bytes that reached the pack before
+// the failure stay in the slab and are paid for, but nothing references them,
+// so [PackedUpload.Finalize] still returns exactly one object per successful
+// Add, in order.
 func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -109,9 +120,10 @@ func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
 				(*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(n), p.tok, &cerr)
 			runtime.KeepAlive(p)
 			if code != C.SIA_OK {
-				// Finish the object anyway, so the handle is not left with an
-				// add in progress that would block Finalize.
-				p.finishAdd()
+				// Abandon the object rather than finishing it. Finishing would
+				// leave a short but structurally valid object in the pack that
+				// the caller cannot tell apart from a complete one.
+				p.abortAdd()
 				return 0, goError(p.ctx, code, cerr)
 			}
 		}
@@ -119,7 +131,7 @@ func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
 			break
 		}
 		if rerr != nil {
-			p.finishAdd()
+			p.abortAdd()
 			return 0, rerr
 		}
 	}
@@ -134,39 +146,56 @@ func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
 	return uint64(written), nil
 }
 
-// finishAdd closes off an add that failed part way, discarding the outcome.
-// The caller holds mu.
-func (p *PackedUpload) finishAdd() {
-	var written C.uint64_t
+// abortAdd abandons an add that failed part way, so the pack is left with no
+// object for it and the handle is free to take the next one. The caller holds
+// mu.
+func (p *PackedUpload) abortAdd() {
 	var cerr *C.char
-	C.sia_packed_upload_add_finish(p.ptr, p.tok, &written, &cerr)
+	C.sia_packed_upload_add_abort(p.ptr, p.tok, &cerr)
 	runtime.KeepAlive(p)
 	if cerr != nil {
 		C.sia_string_free(cerr)
 	}
 }
 
-// Remaining reports how many more bytes fit in the slab being packed.
+// Remaining reports how many more bytes fit in the slab being packed, and
+// zero once the upload has been finalized or closed.
 //
-// It blocks while an Add is running, because both take the same native lock.
+// It blocks while an Add is running, because both take the same lock.
 func (p *PackedUpload) Remaining() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return 0
+	}
 	n := uint64(C.sia_packed_upload_remaining(p.ptr))
 	runtime.KeepAlive(p)
 	return n
 }
 
-// Length reports how many bytes have been packed so far. It blocks while an Add
-// is running, as Remaining does.
+// Length reports how many bytes have been packed so far, and zero once the
+// upload has been finalized or closed. It blocks while an Add is running, as
+// Remaining does.
 func (p *PackedUpload) Length() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return 0
+	}
 	n := uint64(C.sia_packed_upload_length(p.ptr))
 	runtime.KeepAlive(p)
 	return n
 }
 
 // OptimalDataSize reports the payload size that fills a slab exactly, which is
-// the size to aim a batch at. It blocks while an Add is running, as Remaining
-// does.
+// the size to aim a batch at, and zero once the upload has been finalized or
+// closed. It blocks while an Add is running, as Remaining does.
 func (p *PackedUpload) OptimalDataSize() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return 0
+	}
 	n := uint64(C.sia_packed_upload_optimal_data_size(p.ptr))
 	runtime.KeepAlive(p)
 	return n

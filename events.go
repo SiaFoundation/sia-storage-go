@@ -44,6 +44,12 @@ type EventCursor struct {
 // default. Reaching the end returns no events rather than an error, so a
 // consumer polls by passing the cursor it built from the last page.
 func (s *SDK) ObjectEvents(ctx context.Context, after *EventCursor, limit uint64) ([]ObjectEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 

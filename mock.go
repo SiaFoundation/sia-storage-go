@@ -12,7 +12,7 @@ import "C"
 import (
 	"context"
 	"runtime"
-	"sync/atomic"
+	"sync"
 )
 
 // A MockNetwork is a set of in-process hosts backed by memory. Real erasure
@@ -25,7 +25,9 @@ import (
 type MockNetwork struct {
 	ptr     *C.sia_mock_t
 	cleanup runtime.Cleanup
-	closed  atomic.Bool
+
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewMockNetwork starts numHosts in-process hosts.
@@ -40,9 +42,12 @@ func NewMockNetwork(numHosts int) *MockNetwork {
 
 // Close releases the hosts. It is safe to call more than once.
 func (m *MockNetwork) Close() error {
-	if m.closed.Swap(true) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
 		return nil
 	}
+	m.closed = true
 	m.cleanup.Stop()
 	C.sia_mock_free(m.ptr)
 	return nil
@@ -54,6 +59,12 @@ func (m *MockNetwork) Close() error {
 func (m *MockNetwork) SDK(ctx context.Context, appKeySeed [32]byte) (*SDK, error) {
 	tok, release := cancelToken(ctx)
 	defer release()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, errClosed
+	}
 
 	var ptr *C.sia_sdk_t
 	var cerr *C.char
@@ -68,12 +79,22 @@ func (m *MockNetwork) SDK(ctx context.Context, appKeySeed [32]byte) (*SDK, error
 // ClearSectors drops every sector the hosts hold, so a download of an object
 // already uploaded fails the way it would if the hosts had lost the data.
 func (m *MockNetwork) ClearSectors() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return
+	}
 	C.sia_mock_clear_sectors(m.ptr)
 	runtime.KeepAlive(m)
 }
 
 // PinnedSlabs reports how many slabs the mock indexer has pinned.
 func (m *MockNetwork) PinnedSlabs() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0
+	}
 	n := int(C.sia_mock_pinned_slabs(m.ptr))
 	runtime.KeepAlive(m)
 	return n
