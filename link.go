@@ -18,6 +18,7 @@ package siastorage
 #cgo linux,arm64 LDFLAGS: ${SRCDIR}/ffi/lib/linux_arm64/libsia_storage_cabi.a
 #cgo linux,amd64 LDFLAGS: ${SRCDIR}/ffi/lib/linux_amd64/libsia_storage_cabi.a
 #cgo windows,amd64 LDFLAGS: ${SRCDIR}/ffi/lib/windows_amd64/libsia_storage_cabi.a
+#cgo windows,arm64 LDFLAGS: ${SRCDIR}/ffi/lib/windows_arm64/libsia_storage_cabi.a
 #cgo darwin LDFLAGS: -framework Security -framework CoreFoundation -framework SystemConfiguration -framework IOKit
 #cgo linux LDFLAGS: -lm -ldl -lpthread
 #cgo windows LDFLAGS: -lws2_32 -lbcrypt -luserenv -lntdll -lcrypt32 -lsecur32 -lncrypt -liphlpapi

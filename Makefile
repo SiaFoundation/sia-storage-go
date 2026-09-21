@@ -9,7 +9,7 @@
 # compile on this machine can reach the path the cgo directives link.
 #
 # To refresh the committed archives, run the `Build FFI Libraries` workflow.
-# It builds all five platforms and opens a PR with the results.
+# It builds all six platforms and opens a PR with the results.
 #
 # To run against a real indexer locally, `make fetch-lib` downloads the archive
 # for this platform from a workflow run rather than building one.

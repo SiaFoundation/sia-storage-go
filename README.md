@@ -14,9 +14,9 @@ through cgo, so there is one implementation of that logic rather than two.
 That has consequences worth knowing before you depend on it:
 
 - **cgo is required.** `CGO_ENABLED=0` and `GOOS=js` do not work.
-- **Only five platforms are supported**, because each needs a prebuilt static
+- **Only six platforms are supported**, because each needs a prebuilt static
   archive committed to this repository: `darwin/arm64`, `darwin/amd64`,
-  `linux/amd64`, `linux/arm64` and `windows/amd64`.
+  `linux/amd64`, `linux/arm64`, `windows/amd64` and `windows/arm64`.
 - **The linux archives are gnu.** A musl based image, which is common for
   containers, needs an archive of its own.
 
