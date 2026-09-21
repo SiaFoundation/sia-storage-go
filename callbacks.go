@@ -15,18 +15,19 @@ import (
 )
 
 // goShardProgress is invoked by the Rust runtime for every completed shard
-// transfer. It runs on a Rust thread; the registered handler must be fast and
-// must not call back into the SDK.
+// transfer. It runs on a Rust thread, so it copies the event out of C memory
+// and enqueues it, leaving the caller's handler to run on a goroutine the sink
+// owns. The pointer is only valid for the duration of this call.
 //
 //export goShardProgress
 func goShardProgress(userdata C.uintptr_t, progress *C.sia_shard_progress_t) {
-	fn := progressHandler(uintptr(userdata))
-	if fn == nil {
+	s := lookupProgress(uintptr(userdata))
+	if s == nil {
 		return
 	}
 	var hostKey types.PublicKey
 	copy(hostKey[:], (*[32]byte)(unsafe.Pointer(&progress.host_key[0]))[:])
-	fn(ShardProgress{
+	s.send(ShardProgress{
 		HostKey:    hostKey,
 		SlabIndex:  int(progress.slab_index),
 		ShardIndex: int(progress.shard_index),
@@ -35,10 +36,13 @@ func goShardProgress(userdata C.uintptr_t, progress *C.sia_shard_progress_t) {
 	})
 }
 
-// goLogMessage bridges the Rust `log` crate to the configured zap logger.
+// goLogMessage bridges the Rust `log` crate to the configured zap logger. It
+// also runs on a Rust thread, so it recovers rather than letting a panic from
+// the logger unwind into Rust and terminate the process.
 //
 //export goLogMessage
 func goLogMessage(_ C.uintptr_t, level C.int32_t, target *C.char, message *C.char) {
+	defer func() { _ = recover() }()
 	log := globalLogger.Load()
 	if log == nil {
 		return
