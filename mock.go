@@ -13,6 +13,7 @@ import (
 	"context"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // A MockNetwork is a set of in-process hosts backed by memory. Real erasure
@@ -98,4 +99,31 @@ func (m *MockNetwork) PinnedSlabs() int {
 	n := int(C.sia_mock_pinned_slabs(m.ptr))
 	runtime.KeepAlive(m)
 	return n
+}
+
+// SetSlowHosts makes the first n hosts delay every RPC by d, so that host
+// selection, racing and timeout behaviour can be exercised. Passing an n above
+// the host count marks every host.
+//
+// Nothing about host selection shows up in a run where every host is fast,
+// which is why the benchmarks have never covered it.
+func (m *MockNetwork) SetSlowHosts(n int, d time.Duration) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed || n < 0 {
+		return
+	}
+	C.sia_mock_set_slow_hosts(m.ptr, C.size_t(n), C.uint64_t(d.Milliseconds()))
+	runtime.KeepAlive(m)
+}
+
+// ResetSlowHosts returns every host to uniformly fast.
+func (m *MockNetwork) ResetSlowHosts() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return
+	}
+	C.sia_mock_reset_slow_hosts(m.ptr)
+	runtime.KeepAlive(m)
 }
