@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"io"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -132,6 +133,13 @@ func (u *Upload) Write(p []byte) (int, error) {
 	runtime.KeepAlive(p)
 	if code != C.SIA_OK {
 		return int(written), goError(u.ctx, code, cerr)
+	}
+	// io.Writer requires a non-nil error whenever fewer bytes were taken than
+	// offered, and io.Copy turns a violation into a confusing short write far
+	// from its cause. The C ABI only promises *written on every status, not
+	// that a successful write is a complete one.
+	if int(written) < len(p) {
+		return int(written), io.ErrShortWrite
 	}
 	return int(written), nil
 }
