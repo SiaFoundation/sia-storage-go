@@ -6,16 +6,36 @@
 # reproduced by anyone else, so the Makefile has no target that writes one to
 # the committed path and the Archives check on main.yml rejects a hand-edited
 # ffi/lib/.
+#
+# GitHub only offers the Run workflow button for workflow_dispatch workflows
+# that exist on the default branch, so until this file reaches master the only
+# way to start it is a push. Pushing all five platform builds on every commit
+# would be wasteful, so the push path is gated on a marker in the commit
+# message:
+#
+#     git commit --allow-empty -m "refresh the FFI archives [build-libs]"
+#     git push
+#
+# Once this file is on the default branch, drop the push trigger and the
+# `if` on the resolve job and use the button instead.
 name: Build FFI Libraries
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "matt/**"
 
 jobs:
   # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
   # job resolves `master` independently, so a merge landing mid-run would ship
   # a set of archives built from two different revisions.
+  #
+  # Skipping this job skips build and commit with it, since both depend on it.
   resolve:
     name: Resolve sia-sdk-rs
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[build-libs]')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -142,9 +162,15 @@ jobs:
           git add ffi/lib/
           git commit -m "Refresh the FFI archives from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
           git push --set-upstream origin "$branch"
-          gh pr create \
-            --base "${{ github.ref_name }}" \
-            --title "Refresh the FFI archives" \
-            --body "Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
+          body="Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
 
           Every archive in this PR came from that workflow run. Nothing here was built on a developer machine."
+
+          if ! gh pr create --base "${{ github.ref_name }}" \
+               --title "Refresh the FFI archives" --body "$body"; then
+            echo "::warning::could not open the PR automatically. This usually"
+            echo "::warning::means 'Allow GitHub Actions to create and approve"
+            echo "::warning::pull requests' is off for the repo or org."
+            echo "The archives are pushed to $branch; open the PR by hand:"
+            echo "  ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.ref_name }}...$branch"
+          fi
