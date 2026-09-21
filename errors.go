@@ -3,7 +3,6 @@ package siastorage
 import (
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // mapError turns a C ABI status code and its message into a Go error. It is
@@ -29,6 +28,10 @@ func mapError(code int32, msg string) error {
 		return ErrKeyMismatch
 	case statusInvalidState:
 		return &wrappedError{msg: msg, sentinel: ErrInvalidState}
+	case statusNotEnoughShards:
+		return &wrappedError{msg: msg, sentinel: ErrNotEnoughShards}
+	case statusNoMoreHosts:
+		return &wrappedError{msg: msg, sentinel: ErrNoMoreHosts}
 	case statusInvalidHandle:
 		// The C ABI returns this one without setting *err, so there is no
 		// message to fall through to. It means a nil handle reached the
@@ -41,23 +44,5 @@ func mapError(code int32, msg string) error {
 	if msg == "" {
 		return fmt.Errorf("sia storage error %d", code)
 	}
-	for _, m := range messageSentinels {
-		if strings.Contains(msg, m.substring) {
-			return &wrappedError{msg: msg, sentinel: m.sentinel}
-		}
-	}
 	return errors.New(msg)
-}
-
-// messageSentinels recovers the two failure modes the C ABI does not give a
-// status code of its own. Matching on message text is fragile: nothing on
-// either side of the boundary pins these strings, so a rewording in Rust
-// silently downgrades them to opaque errors. TestMessageSentinels is what
-// makes that a test failure rather than a support ticket.
-var messageSentinels = []struct {
-	substring string
-	sentinel  error
-}{
-	{"not enough shards", ErrNotEnoughShards},
-	{"no more hosts available", ErrNoMoreHosts},
 }
