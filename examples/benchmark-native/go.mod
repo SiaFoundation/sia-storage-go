@@ -1,38 +1,30 @@
-module go.sia.tech/siastorage/examples
+// A module of its own because the native engine and the cgo engine publish the
+// same import path and cannot be linked into one binary. Build with GOWORK=off.
+module siastorage-benchmark-native
 
 go 1.27.0
 
-replace go.sia.tech/siastorage => ../
-
 require (
-	github.com/BurntSushi/toml v1.6.0
-	github.com/vbauerster/mpb/v8 v8.15.2
 	go.sia.tech/core v0.21.7
-	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01
-	go.sia.tech/siastorage v0.0.0-00010101000000-000000000000
-	go.uber.org/zap v1.28.0
-	golang.org/x/term v0.45.0
+	go.sia.tech/siastorage v0.2.2-0.20260831091740-f9961f7e5391
 )
 
 require (
-	github.com/VividCortex/ewma v1.2.0 // indirect
-	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
-	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.2 // indirect
-	github.com/mattn/go-runewidth v0.0.27 // indirect
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.61.0 // indirect
 	github.com/quic-go/webtransport-go v0.12.0 // indirect
-	github.com/vbauerster/cupwriter v0.0.4 // indirect
 	go.sia.tech/coreutils v0.24.0 // indirect
+	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01 // indirect
 	go.sia.tech/jape v0.14.1 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
