@@ -262,6 +262,22 @@ const (
 	statusNoMoreHosts       = int32(C.SIA_ERR_NO_MORE_HOSTS)
 )
 
+// localError is goError for the calls that reach no indexer and take no
+// cancellation token, so there is no context to draw a cause from. Keeping it
+// separate means goError's ctx is always a real one, rather than a nil the
+// function has to defend against.
+func localError(code C.int32_t, cerr *C.char) error {
+	if code == C.SIA_OK {
+		return nil
+	}
+	var msg string
+	if cerr != nil {
+		msg = C.GoString(cerr)
+		C.sia_string_free(cerr)
+	}
+	return mapError(int32(code), msg)
+}
+
 // goError converts an FFI status code and error message into a Go error,
 // freeing the C message. ctx, when non-nil, supplies the cause for
 // SIA_ERR_CANCELLED.
@@ -279,7 +295,7 @@ func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 	}
 	// The cause is the one part that depends on the caller's context rather
 	// than on the status alone.
-	if int32(code) == statusCancelled && ctx != nil {
+	if int32(code) == statusCancelled {
 		if cause := context.Cause(ctx); cause != nil {
 			return cause
 		}
