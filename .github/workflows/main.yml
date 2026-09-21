@@ -139,3 +139,64 @@ jobs:
         with:
           args: --build-tags=siastorage_mock ./...
           skip-cache: true
+
+  link:
+    name: Link (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      # Every platform is reported, rather than the first failure hiding the
+      # rest. A bad archive is usually bad on one platform only.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            os: ubuntu-latest
+            goarch: amd64
+          - platform: linux_arm64
+            os: ubuntu-24.04-arm
+            goarch: arm64
+          - platform: darwin_arm64
+            os: macos-latest
+            goarch: arm64
+          # No Intel macOS runner, so this one cross compiles. clang needs the
+          # architecture spelled out or it produces an arm64 object that will
+          # not link against the amd64 archive.
+          - platform: darwin_amd64
+            os: macos-latest
+            goarch: amd64
+            cross_cc: clang -arch x86_64
+          - platform: windows_amd64
+            os: windows-latest
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      # Proves the committed archive for this platform actually links. Four of
+      # the five were never exercised, so a truncated or wrong-arch .a could
+      # ship and only fail for whoever imported the module.
+      #
+      # go build over several packages is documented to discard the result and
+      # only check that they compile, so it does not necessarily link at all.
+      # go test -c does, which is the whole point here.
+      - name: Link against the committed archive
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          CROSS_CC: ${{ matrix.cross_cc }}
+        run: |
+          a="ffi/lib/${{ matrix.platform }}/libsia_storage_cabi.a"
+          if [ ! -f "$a" ]; then
+            echo "FAIL: $a is missing. Run the Build FFI Libraries workflow."
+            exit 1
+          fi
+          if [ -n "$CROSS_CC" ]; then
+            export CC="$CROSS_CC"
+          fi
+          export CGO_ENABLED=1
+          go build ./...
+          go test -c -o "${RUNNER_TEMP}/linkcheck" .
+          echo "ok: $a links on ${{ matrix.platform }}"
