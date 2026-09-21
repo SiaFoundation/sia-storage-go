@@ -6,6 +6,13 @@
 //     sia_string_free.
 //   - Handles are opaque pointers owned by the caller and released with the
 //     matching *_free function.
+//   - Passing a null handle is reported rather than dereferenced. A fallible
+//     function returns SIA_ERR_INVALID_HANDLE without setting *err; a getter
+//     returns a zero value (0, false, or NULL); a void function does nothing.
+//     A *_free function accepts null and does nothing, as free(3) does.
+//     Non-null handles must still be live: this catches a missing handle, not
+//     a dangling one. Out parameters are not checked; they are written only on
+//     success, and passing a null one is undefined.
 //   - Blocking functions accept an optional sia_cancel_t. Cancelling the
 //     token unblocks the call with SIA_ERR_CANCELLED.
 //   - Timestamps are Unix microseconds (UTC).
@@ -30,6 +37,9 @@ enum {
 	SIA_ERR_INVALID_STATE = 6,
 	SIA_ERR_OBJECT_NOT_ATTACHED = 7,
 	SIA_ERR_KEY_MISMATCH = 8,
+	// A required handle was missing. A handle that is present must still be
+	// live: this catches an absent handle, not a dangling one.
+	SIA_ERR_INVALID_HANDLE = 9,
 };
 
 typedef struct sia_builder sia_builder_t;
@@ -185,6 +195,18 @@ int32_t sia_packed_upload_add_finish(sia_packed_upload_t* up, sia_cancel_t* canc
 int32_t sia_packed_upload_finalize(sia_packed_upload_t* up, sia_cancel_t* cancel, sia_object_t*** out_objs, size_t* out_len, char** err);
 void sia_object_array_free(sia_object_t** objs, size_t len);
 void sia_packed_upload_free(sia_packed_upload_t* up);
+
+// A sealed object is the one type a caller sees inside rather than holds as an
+// opaque handle, because consumers persist its fields into their own schema.
+//
+// It crosses as the JSON the indexer API already exchanges, so a caller can
+// decode it into its own type and persist it unchanged.
+//
+// *out_json receives an owned string. Free it with sia_string_free.
+int32_t sia_object_seal_json(const sia_sdk_t* sdk, const sia_object_t* obj, char** out_json, char** err);
+// Decodes and opens a sealed object, verifying its signatures against the
+// account's app key. Free the result with sia_object_free.
+int32_t sia_object_from_sealed_json(const sia_sdk_t* sdk, const char* json, sia_object_t** out, char** err);
 
 // A sharing key grants read-only access to whatever the account attaches to
 // it. The seed is the whole credential, so exporting one hands over access to
