@@ -19,10 +19,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// progressQueue bounds how many shard events may be waiting for a handler
+// before the sink starts dropping them.
+const progressQueue = 1024
+
 var (
-	progressMu       sync.Mutex
-	progressHandlers = make(map[uintptr]func(ShardProgress))
-	progressNextID   uintptr
+	progressSinks  sync.Map
+	progressNextID atomic.Uintptr
 
 	globalLogger atomic.Pointer[zap.Logger]
 	loggerOnce   sync.Once
@@ -32,33 +35,114 @@ var (
 // cancellation token outside of a context (e.g. by closing a stream).
 var errCancelled = errors.New("operation cancelled")
 
-// registerProgress registers a shard progress callback and returns its
-// handle. A zero handle (nil fn) is ignored by the trampoline.
+// errClosed is returned when a streaming handle is used after it has been
+// closed or finished.
+var errClosed = errors.New("handle is closed")
+
+// A progressSink separates the Rust runtime thread that reports a finished
+// shard from the goroutine that runs the caller's handler.
+type progressSink struct {
+	ch      chan ShardProgress
+	done    chan struct{}
+	bytes   atomic.Uint64
+	dropped atomic.Uint64
+
+	mu     sync.RWMutex
+	closed bool
+}
+
+// send stamps the running total onto the event and enqueues it without ever
+// blocking. The read lock keeps a concurrent close from closing the channel
+// underneath the send.
+func (s *progressSink) send(p ShardProgress) {
+	p.Transferred = s.bytes.Add(p.ShardSize)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.ch <- p:
+	default:
+		s.dropped.Add(1)
+	}
+}
+
+// close stops the sink and waits for the queue to drain, so once it returns the
+// handler is guaranteed not to fire again. The returned total counts dropped
+// events.
+func (s *progressSink) close() (transferred, dropped uint64) {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		close(s.ch)
+	}
+	s.mu.Unlock()
+	<-s.done
+	return s.bytes.Load(), s.dropped.Load()
+}
+
+// registerProgress starts a sink delivering to fn on its own goroutine and
+// returns the handle the C side carries as userdata. A nil fn registers nothing
+// and yields the zero handle, which the trampoline ignores.
 func registerProgress(fn func(ShardProgress)) uintptr {
 	if fn == nil {
 		return 0
 	}
-	progressMu.Lock()
-	defer progressMu.Unlock()
-	progressNextID++
-	progressHandlers[progressNextID] = fn
-	return progressNextID
-}
-
-func unregisterProgress(id uintptr) {
-	if id == 0 {
-		return
+	s := &progressSink{
+		ch:   make(chan ShardProgress, progressQueue),
+		done: make(chan struct{}),
 	}
-	progressMu.Lock()
-	defer progressMu.Unlock()
-	delete(progressHandlers, id)
+	id := progressNextID.Add(1)
+	progressSinks.Store(id, s)
+	go func() {
+		defer close(s.done)
+		for p := range s.ch {
+			deliver(fn, p)
+		}
+	}()
+	return id
 }
 
-func progressHandler(id uintptr) func(ShardProgress) {
-	progressMu.Lock()
-	defer progressMu.Unlock()
-	return progressHandlers[id]
+// deliver runs the caller's handler with a recover in place. A panic unwinding
+// from Go into Rust would terminate the process, so a handler that panics costs
+// its own event and nothing further.
+func deliver(fn func(ShardProgress), p ShardProgress) {
+	defer func() { _ = recover() }()
+	fn(p)
 }
+
+// unregisterProgress closes the sink for id and waits for its queued events to
+// reach the handler. It must be called only once the FFI call that can produce
+// events has returned.
+func unregisterProgress(id uintptr) (transferred, dropped uint64) {
+	if id == 0 {
+		return 0, 0
+	}
+	v, ok := progressSinks.LoadAndDelete(id)
+	if !ok {
+		return 0, 0
+	}
+	return v.(*progressSink).close()
+}
+
+// lookupProgress returns the sink registered for id, or nil once it has been
+// unregistered.
+func lookupProgress(id uintptr) *progressSink {
+	v, ok := progressSinks.Load(id)
+	if !ok {
+		return nil
+	}
+	return v.(*progressSink)
+}
+
+// SetLogger routes the Rust SDK's process-wide log output to the given zap
+// logger, which is the only way to see what the native side is doing.
+//
+// The C side hook is installed once, on the first call. The target logger can
+// be swapped at any time, and a nil logger silences the output without
+// uninstalling the hook.
+func SetLogger(log *zap.Logger) { setGlobalLogger(log) }
 
 // setGlobalLogger routes the Rust SDK's process-wide log output to the given
 // zap logger. The C-side hook is installed once; the target logger can be
@@ -70,7 +154,7 @@ func setGlobalLogger(log *zap.Logger) {
 	})
 }
 
-// cancelTokenFunc creates a C cancellation token that fires when cancel is
+// newCancelToken creates a C cancellation token that fires when cancel is
 // invoked. release frees the token; it must only be called once no FFI call
 // is using it.
 func newCancelToken() (tok *C.sia_cancel_t, cancel func(), release func()) {
@@ -81,9 +165,26 @@ func newCancelToken() (tok *C.sia_cancel_t, cancel func(), release func()) {
 // cancelToken creates a C cancellation token wired to ctx. release must be
 // called once the FFI call(s) using the token have returned.
 func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
+	tok, _, release = streamToken(ctx)
+	return tok, release
+}
+
+// streamToken is cancelToken plus the explicit cancel, which a streaming handle
+// needs so Close can interrupt a call already blocked inside the native side.
+// release must be called once every FFI call using the token has returned.
+func streamToken(ctx context.Context) (tok *C.sia_cancel_t, cancel func(), release func()) {
 	tok, cancel, free := newCancelToken()
 	if ctx == nil || ctx.Done() == nil {
-		return tok, free
+		return tok, cancel, free
+	}
+	// An already cancelled context has to fire the token before this returns.
+	// Leaving it to the watcher goroutine is a race that a fast call wins, and
+	// the call then runs as though it were never cancelled.
+	select {
+	case <-ctx.Done():
+		cancel()
+		return tok, cancel, free
+	default:
 	}
 	done := make(chan struct{})
 	exited := make(chan struct{})
@@ -95,11 +196,49 @@ func cancelToken(ctx context.Context) (tok *C.sia_cancel_t, release func()) {
 		case <-done:
 		}
 	}()
-	return tok, func() {
+	return tok, cancel, func() {
 		close(done)
 		<-exited
 		free()
 	}
+}
+
+// A streamCancel owns a streaming handle's cancellation token. fire may be
+// called at any time, including while an FFI call is blocked on the token, and
+// becomes a no op once close has run, so a handle can be interrupted without
+// racing the free that retires it.
+type streamCancel struct {
+	mu      sync.Mutex
+	live    bool
+	cancel  func()
+	release func()
+}
+
+// newStreamCancel wires a token to ctx and returns it alongside its owner.
+func newStreamCancel(ctx context.Context) (*C.sia_cancel_t, *streamCancel) {
+	tok, cancel, release := streamToken(ctx)
+	return tok, &streamCancel{live: true, cancel: cancel, release: release}
+}
+
+// fire cancels the token if it is still live.
+func (s *streamCancel) fire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live {
+		s.cancel()
+	}
+}
+
+// close stops the context watcher and frees the token, exactly once. The
+// caller must have ensured no FFI call is still using it.
+func (s *streamCancel) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live {
+		return
+	}
+	s.live = false
+	s.release()
 }
 
 // goError converts an FFI status code and error message into a Go error,
@@ -128,6 +267,12 @@ func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 		return ErrUserRejected
 	case C.SIA_ERR_REQUEST_EXPIRED:
 		return ErrRequestExpired
+	case C.SIA_ERR_OBJECT_NOT_ATTACHED:
+		return ErrObjectNotAttached
+	case C.SIA_ERR_KEY_MISMATCH:
+		return ErrKeyMismatch
+	case C.SIA_ERR_INVALID_STATE:
+		return &wrappedError{msg: msg, sentinel: ErrInvalidState}
 	case C.SIA_ERR_INVALID_HANDLE:
 		// The header returns this one without setting *err, so there is no
 		// message to fall through to. It means a nil handle reached the
