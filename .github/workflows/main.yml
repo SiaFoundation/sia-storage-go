@@ -36,34 +36,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      POSTGRES_USER: indexd_test
-      POSTGRES_PASSWORD: indexd_test
-      POSTGRES_DB: indexd_test
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_USER: indexd_test
-          POSTGRES_PASSWORD: indexd_test
-          POSTGRES_DB: indexd_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
-      - name: Cache GeoLite2 database
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: GeoLite2-City.mmdb
-          key: geolite2-city-mmdb-2026-04
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: SiaFoundation/sia-sdk-rs
@@ -85,15 +62,29 @@ jobs:
             exit 1
           fi
           make check-no-mock
+      # The vendored header is the contract between the cgo declarations and
+      # the Rust. Checked before make testlib, which would otherwise re-sync
+      # it and hide the drift.
+      - name: Check header
+        run: make check-header SIA_SDK_RS=sia-sdk-rs
       # Covers the C ABI itself, including the streaming roundtrip against
       # in-process hosts. Go tests cannot reach cgo directly, so the entry
       # points are exercised here.
       - name: Test FFI crate
         run: cargo test --manifest-path sia-sdk-rs/sia_storage_cabi/Cargo.toml --features mock
+      # Runs before the mock archive is built, so it links what ships and does
+      # not pay for the cache clean that make testlib ends with.
       - name: Test
         uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
         with:
           args: -race;-failfast
+      # Almost every test is behind this tag, so without it CI covers the
+      # progress sink and the JSON tags and nothing else. The archive is built
+      # here rather than committed, and is never shipped.
+      - name: Build the mock archive
+        run: make testlib SIA_SDK_RS=sia-sdk-rs
+      - name: Test against the mock network
+        run: go test -race -failfast -timeout 20m -tags siastorage_mock ./...
 
   archives:
     name: Archives
@@ -130,3 +121,21 @@ jobs:
           echo "platforms. To use one locally without committing it, run"
           echo "'make fetch-lib'."
           exit 1
+
+  lint-mock:
+    name: Lint (mock tag)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      # Needs no Rust and no archive: cgo type checks without linking. Without
+      # this pass the mock tests and the mock-only example shims are linted
+      # nowhere, which is how two unused parameters survived.
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+        with:
+          args: --build-tags=siastorage_mock ./...
+          skip-cache: true
