@@ -165,23 +165,37 @@ jobs:
         include:
           - platform: linux_amd64
             os: ubuntu-latest
+            goos: linux
             goarch: amd64
           - platform: linux_arm64
             os: ubuntu-24.04-arm
+            goos: linux
             goarch: arm64
           - platform: darwin_arm64
             os: macos-latest
+            goos: darwin
             goarch: arm64
           # No Intel macOS runner, so this one cross compiles. clang needs the
           # architecture spelled out or it produces an arm64 object that will
           # not link against the amd64 archive.
           - platform: darwin_amd64
             os: macos-latest
+            goos: darwin
             goarch: amd64
             cross_cc: clang -arch x86_64
           - platform: windows_amd64
             os: windows-latest
+            goos: windows
             goarch: amd64
+          # No runner ships a C compiler targeting windows on arm64, so this
+          # one cross compiles with the same llvm-mingw the archive was built
+          # with.
+          - platform: windows_arm64
+            os: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            cross_cc: aarch64-w64-mingw32-clang
+            llvm_mingw: "20260908"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -194,9 +208,18 @@ jobs:
       # go build over several packages is documented to discard the result and
       # only check that they compile, so it does not necessarily link at all.
       # go test -c does, which is the whole point here.
+      - name: Install llvm-mingw
+        if: matrix.llvm_mingw != ''
+        run: |
+          v='${{ matrix.llvm_mingw }}'
+          dir="llvm-mingw-$v-ucrt-ubuntu-22.04-x86_64"
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
       - name: Link against the committed archive
         shell: bash
         env:
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CROSS_CC: ${{ matrix.cross_cc }}
         run: |

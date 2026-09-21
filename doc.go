@@ -9,9 +9,9 @@
 //
 // Because the native code is linked from a prebuilt static archive, this
 // package builds only where an archive is committed: darwin/arm64,
-// darwin/amd64, linux/amd64, linux/arm64 and windows/amd64. CGO_ENABLED=0 and
-// GOOS=js do not work at all, and the linux archives are gnu, so a musl based
-// image needs its own.
+// darwin/amd64, linux/amd64, linux/arm64, windows/amd64 and windows/arm64.
+// CGO_ENABLED=0 and GOOS=js do not work at all, and the linux archives are
+// gnu, so a musl based image needs its own.
 //
 // # Getting started
 //

@@ -80,6 +80,12 @@ jobs:
           - platform: windows_amd64
             os: windows-latest
             target: x86_64-pc-windows-gnu
+          # Cross compiled, because no runner ships a C compiler targeting
+          # windows on arm64 and ring builds C for the target.
+          - platform: windows_arm64
+            os: ubuntu-latest
+            target: aarch64-pc-windows-gnullvm
+            llvm_mingw: "20260908"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -90,6 +96,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
+      # ring compiles C and assembly for the target, so a Windows arm64 build
+      # needs a C compiler that targets it. windows-latest ships mingw-w64 for
+      # x86_64 only, and the msvc target is no use here because cgo drives a
+      # gcc compatible compiler. llvm-mingw provides one; the Rust gnullvm
+      # targets expect its ucrt flavour.
+      - name: Install llvm-mingw
+        if: matrix.llvm_mingw != ''
+        run: |
+          v='${{ matrix.llvm_mingw }}'
+          dir="llvm-mingw-$v-ucrt-ubuntu-22.04-x86_64"
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
       # The header is the contract with the cgo declarations. If it has drifted
       # there is no point building an archive the Go side cannot call.
       - name: Check header
