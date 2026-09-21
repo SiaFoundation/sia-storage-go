@@ -196,6 +196,7 @@ jobs:
             goarch: arm64
             cross_cc: aarch64-w64-mingw32-clang
             llvm_mingw: "20260908"
+            llvm_mingw_sha256: "2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -210,11 +211,18 @@ jobs:
       # go test -c does, which is the whole point here.
       - name: Install llvm-mingw
         if: matrix.llvm_mingw != ''
+        env:
+          SHA256: ${{ matrix.llvm_mingw_sha256 }}
         run: |
           v='${{ matrix.llvm_mingw }}'
           dir="llvm-mingw-$v-ucrt-ubuntu-22.04-x86_64"
-          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz" \
-            | tar -xJ -C "$RUNNER_TEMP"
+          tarball="$RUNNER_TEMP/$dir.tar.xz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz"
+          # A release asset can be replaced, and this compiler builds an
+          # archive we commit and ship. Check it before unpacking.
+          echo "$SHA256  $tarball" | sha256sum -c -
+          tar -xJf "$tarball" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
       - name: Link against the committed archive
         shell: bash
