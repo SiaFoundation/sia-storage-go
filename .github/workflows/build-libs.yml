@@ -81,7 +81,7 @@ jobs:
           repository: SiaFoundation/sia-sdk-rs
           ref: ${{ needs.resolve.outputs.sha }}
           path: sia-sdk-rs
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
@@ -109,7 +109,7 @@ jobs:
           n=$(nm -g "$a" 2>/dev/null | grep -c _sia_mock || true)
           if [ "$n" != "0" ]; then echo "FAIL: archive exports $n mock symbols"; exit 1; fi
           echo "ok: no mock symbols"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.platform }}
           path: sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
@@ -124,7 +124,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
       - name: Place archives
