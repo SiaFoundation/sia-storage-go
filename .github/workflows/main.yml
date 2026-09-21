@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
+      # No Rust and no archive: cgo type checks without linking, so lint runs
+      # against a bare checkout.
       - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
           working-directory: ${{ matrix.dir }}
@@ -56,7 +58,69 @@ jobs:
         with:
           path: GeoLite2-City.mmdb
           key: geolite2-city-mmdb-2026-04
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: master
+          path: sia-sdk-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: sia-sdk-rs
+      # The Go tests link the committed archive, which the Build FFI Libraries
+      # workflow produced. Nothing here builds one: an archive compiled in this
+      # job would not be the archive that ships.
+      - name: Check the archive is present
+        run: |
+          a=ffi/lib/linux_amd64/libsia_storage_cabi.a
+          if [ ! -f "$a" ]; then
+            echo "FAIL: $a is missing, so the Go tests cannot link."
+            echo "Run the Build FFI Libraries workflow and merge the PR it opens."
+            exit 1
+          fi
+          make check-no-mock
+      # Covers the C ABI itself, including the streaming roundtrip against
+      # in-process hosts. Go tests cannot reach cgo directly, so the entry
+      # points are exercised here.
+      - name: Test FFI crate
+        run: cargo test --manifest-path sia-sdk-rs/sia_storage_cabi/Cargo.toml --features mock
       - name: Test
         uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
         with:
           args: -race;-failfast
+
+  archives:
+    name: Archives
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      # An archive built on a developer machine cannot be traced back to a
+      # revision and cannot be reproduced by anyone else, so only the Build FFI
+      # Libraries workflow may commit one. It opens its PR as github-actions,
+      # which is the only author this check lets through.
+      - name: Reject hand-committed archives
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- ffi/lib/)
+          if [ -z "$changed" ]; then
+            echo "ok: this PR does not touch ffi/lib/"
+            exit 0
+          fi
+          if [ "$AUTHOR" = "github-actions[bot]" ]; then
+            echo "ok: archives refreshed by the Build FFI Libraries workflow"
+            exit 0
+          fi
+          echo "FAIL: this PR changes files under ffi/lib/:"
+          echo "$changed"
+          echo
+          echo "Archives may only be committed by the Build FFI Libraries workflow."
+          echo "Run it from the Actions tab and it will open a PR with all five"
+          echo "platforms. To use one locally without committing it, run"
+          echo "'make fetch-lib'."
+          exit 1

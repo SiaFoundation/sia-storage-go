@@ -1,0 +1,150 @@
+# Builds the prebuilt FFI static libraries for every supported platform and
+# opens a PR committing them under ffi/lib/.
+#
+# This workflow is the ONLY supported way an archive enters this repository. A
+# locally built archive cannot be traced back to a revision and cannot be
+# reproduced by anyone else, so the Makefile has no target that writes one to
+# the committed path and the Archives check on main.yml rejects a hand-edited
+# ffi/lib/.
+name: Build FFI Libraries
+on:
+  workflow_dispatch:
+
+jobs:
+  # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
+  # job resolves `master` independently, so a merge landing mid-run would ship
+  # a set of archives built from two different revisions.
+  resolve:
+    name: Resolve sia-sdk-rs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: master
+          path: sia-sdk-rs
+      - id: rev
+        run: echo "sha=$(git -C sia-sdk-rs rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - platform: darwin_arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - platform: darwin_amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - platform: linux_amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux_arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: windows_amd64
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: sia-sdk-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: sia-sdk-rs
+      # The header is the contract with the cgo declarations. If it has drifted
+      # there is no point building an archive the Go side cannot call.
+      - name: Check header
+        run: make check-header SIA_SDK_RS=sia-sdk-rs
+      - name: Build
+        working-directory: sia-sdk-rs/sia_storage_cabi
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          # Without this the archive ships with debug information and is
+          # roughly twice the size. These archives live in git history, so the
+          # difference is permanent.
+          RUSTFLAGS: "-C strip=debuginfo"
+        run: cargo build --release --target ${{ matrix.target }}
+      # A mock linked archive shipped as production is what invalidated the
+      # original throughput benchmark. Catch it before it reaches a PR.
+      - name: Reject mock symbols
+        shell: bash
+        run: |
+          a=sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          n=$(nm -g "$a" 2>/dev/null | grep -c _sia_mock || true)
+          if [ "$n" != "0" ]; then echo "FAIL: archive exports $n mock symbols"; exit 1; fi
+          echo "ok: no mock symbols"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          if-no-files-found: error
+
+  commit:
+    name: Open PR
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Place archives
+        run: |
+          for d in artifacts/*/; do
+            p=$(basename "$d")
+            mkdir -p "ffi/lib/$p"
+            mv "$d/libsia_storage_cabi.a" "ffi/lib/$p/"
+          done
+          # Without this there is no way to tell which Rust an archive came
+          # from short of rebuilding it and comparing.
+          cat > ffi/lib/PROVENANCE <<EOF
+          sia-sdk-rs: ${{ needs.resolve.outputs.sha }}
+          workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          cat ffi/lib/PROVENANCE
+      - name: Configure Git
+        run: |
+          git config --global user.name github-actions[bot]
+          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - name: Commit and open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- ffi/lib/; then
+            echo "archives are unchanged from ${{ needs.resolve.outputs.sha }}, nothing to open"
+            exit 0
+          fi
+          # Branched from the ref this workflow was dispatched on, and the PR
+          # targets that same ref, so archives can be bootstrapped onto a
+          # feature branch before it merges.
+          branch="libs/refresh-${{ github.run_id }}"
+          git switch -c "$branch"
+          git add ffi/lib/
+          git commit -m "Refresh the FFI archives from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
+          git push --set-upstream origin "$branch"
+          gh pr create \
+            --base "${{ github.ref_name }}" \
+            --title "Refresh the FFI archives" \
+            --body "Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
+
+          Every archive in this PR came from that workflow run. Nothing here was built on a developer machine."
