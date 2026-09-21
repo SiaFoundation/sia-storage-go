@@ -11,7 +11,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
-	"sync/atomic"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -26,7 +26,12 @@ import (
 type Object struct {
 	ptr     *C.sia_object_t
 	cleanup runtime.Cleanup
-	closed  atomic.Bool
+
+	// mu guards ptr against Close. Every method that hands the handle to C
+	// holds it for the read, so Close cannot free the handle underneath a
+	// call already running on another goroutine.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewObject returns an empty object, ready to be given metadata and uploaded.
@@ -42,11 +47,15 @@ func wrapObject(ptr *C.sia_object_t) *Object {
 	return o
 }
 
-// Close releases the object. It is safe to call more than once.
+// Close releases the object. It is safe to call more than once, and waits for
+// any call already using the handle to return.
 func (o *Object) Close() error {
-	if o.closed.Swap(true) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
 		return nil
 	}
+	o.closed = true
 	o.cleanup.Stop()
 	C.sia_object_free(o.ptr)
 	return nil
@@ -56,6 +65,11 @@ func (o *Object) Close() error {
 // object has a stable ID of its own, so two objects with the same contents
 // share an ID.
 func (o *Object) ID() (id types.Hash256) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return
+	}
 	C.sia_object_id(o.ptr, cBytes32((*[32]byte)(&id)))
 	runtime.KeepAlive(o)
 	return
@@ -63,6 +77,11 @@ func (o *Object) ID() (id types.Hash256) {
 
 // Size returns the length of the data the object holds.
 func (o *Object) Size() uint64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return 0
+	}
 	n := uint64(C.sia_object_size(o.ptr))
 	runtime.KeepAlive(o)
 	return n
@@ -71,6 +90,11 @@ func (o *Object) Size() uint64 {
 // EncodedSize returns how many bytes the object occupies on the network, which
 // is larger than Size by the redundancy the slabs were encoded with.
 func (o *Object) EncodedSize() uint64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return 0
+	}
 	n := uint64(C.sia_object_encoded_size(o.ptr))
 	runtime.KeepAlive(o)
 	return n
@@ -79,6 +103,11 @@ func (o *Object) EncodedSize() uint64 {
 // CreatedAt returns when the indexer first recorded the object. It is the zero
 // time for an object that has not been uploaded.
 func (o *Object) CreatedAt() time.Time {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return time.Time{}
+	}
 	us := int64(C.sia_object_created_at(o.ptr))
 	runtime.KeepAlive(o)
 	return unixMicro(us)
@@ -87,6 +116,11 @@ func (o *Object) CreatedAt() time.Time {
 // UpdatedAt returns when the object last changed, which the indexer also bumps
 // when it repairs a slab onto a different host.
 func (o *Object) UpdatedAt() time.Time {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return time.Time{}
+	}
 	us := int64(C.sia_object_updated_at(o.ptr))
 	runtime.KeepAlive(o)
 	return unixMicro(us)
@@ -95,6 +129,11 @@ func (o *Object) UpdatedAt() time.Time {
 // Metadata returns the object's metadata, which is encrypted at rest and
 // decrypted here. It returns nil when there is none.
 func (o *Object) Metadata() []byte {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return nil
+	}
 	n := C.sia_object_metadata(o.ptr, nil, 0)
 	if n == 0 {
 		runtime.KeepAlive(o)
@@ -111,6 +150,11 @@ func (o *Object) Metadata() []byte {
 // This only changes the local handle. Call SDK.UpdateObjectMetadata to persist
 // it to the indexer.
 func (o *Object) UpdateMetadata(metadata []byte) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return
+	}
 	if len(metadata) == 0 {
 		C.sia_object_set_metadata(o.ptr, nil, 0)
 		runtime.KeepAlive(o)
@@ -133,6 +177,12 @@ func unixMicro(us int64) time.Time {
 // Object fetches the object with the given ID from the indexer, decrypting the
 // keys and metadata it carries.
 func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -153,6 +203,14 @@ func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
 // is called the object exists only as a local handle and no lookup by ID, share
 // URL or delete can find it.
 func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -173,6 +231,14 @@ func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 // nonce and a 16 byte tag, so the usable budget is 984 bytes. Exceeding it
 // fails here rather than at the point the metadata was set.
 func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -186,6 +252,12 @@ func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
 // DeleteObject removes the object from the indexer. The slabs it held survive
 // until they are pruned, so an object sharing slabs with another is unaffected.
 func (s *SDK) DeleteObject(ctx context.Context, id types.Hash256) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -198,6 +270,12 @@ func (s *SDK) DeleteObject(ctx context.Context, id types.Hash256) error {
 // PruneSlabs releases the slabs no remaining object references, which is what
 // actually frees the pinned storage a deleted object was using.
 func (s *SDK) PruneSlabs(ctx context.Context) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -213,6 +291,14 @@ func (s *SDK) PruneSlabs(ctx context.Context) error {
 //
 // validUntil must be a real time; there is no sentinel for an unexpiring URL.
 func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return "", errClosed
+	}
+
 	if validUntil.IsZero() {
 		return "", errors.New("share URL requires an expiration time")
 	}
@@ -230,6 +316,12 @@ func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) 
 // ObjectFromShareURL resolves a URL from [SDK.ObjectShareURL] into an object
 // the holder can download, paid for by the account that shared it.
 func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	cURL := C.CString(shareURL)
 	defer C.free(unsafe.Pointer(cURL))
 
@@ -255,6 +347,14 @@ func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object,
 //
 // It is derived locally and reaches no indexer.
 func (s *SDK) SealObject(obj *Object) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return nil, errClosed
+	}
+
 	var cJSON, cerr *C.char
 	code := C.sia_object_seal_json(s.ptr, obj.ptr, &cJSON, &cerr)
 	runtime.KeepAlive(s)
@@ -271,6 +371,12 @@ func (s *SDK) SealObject(obj *Object) ([]byte, error) {
 // A sealed object produced under a different app key fails here rather than
 // producing a handle that cannot read anything.
 func (s *SDK) ObjectFromSealed(sealed []byte) (*Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	cJSON := C.CString(string(sealed))
 	defer C.free(unsafe.Pointer(cJSON))
 

@@ -14,7 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"sync/atomic"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -93,7 +93,13 @@ type Account struct {
 type Builder struct {
 	ptr     *C.sia_builder_t
 	cleanup runtime.Cleanup
-	closed  atomic.Bool
+
+	// mu guards ptr against Close. Readers hold it for the whole FFI call, so
+	// Close waits for anything in flight rather than freeing underneath it.
+	// A blocking call therefore delays Close, which is the trade this package
+	// makes everywhere: a slow Close beats a use after free.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewBuilder prepares a connection to the indexer at indexerURL.
@@ -146,9 +152,12 @@ func wrapBuilder(ptr *C.sia_builder_t) *Builder {
 
 // Close releases the builder. It is safe to call more than once.
 func (b *Builder) Close() error {
-	if b.closed.Swap(true) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
 		return nil
 	}
+	b.closed = true
 	b.cleanup.Stop()
 	C.sia_builder_free(b.ptr)
 	return nil
@@ -157,6 +166,12 @@ func (b *Builder) Close() error {
 // RequestConnection asks the indexer to open an approval request and returns
 // the URL the user has to visit to approve it.
 func (b *Builder) RequestConnection(ctx context.Context) (string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return "", errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -173,6 +188,12 @@ func (b *Builder) RequestConnection(ctx context.Context) (string, error) {
 // ErrUserRejected if the user declined and ErrRequestExpired if the approval
 // window closed first.
 func (b *Builder) WaitForApproval(ctx context.Context) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -184,6 +205,12 @@ func (b *Builder) WaitForApproval(ctx context.Context) error {
 
 // Register derives an app key from mnemonic and registers it with the indexer.
 func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, errClosed
+	}
+
 	cMnemonic := C.CString(mnemonic)
 	defer C.free(unsafe.Pointer(cMnemonic))
 
@@ -209,6 +236,11 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 	if len(appKey) < 32 {
 		return nil, errors.New("app key must be at least 32 bytes")
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, errClosed
+	}
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -226,7 +258,13 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 type SDK struct {
 	ptr     *C.sia_sdk_t
 	cleanup runtime.Cleanup
-	closed  atomic.Bool
+
+	// mu guards ptr against Close. Readers hold it for the whole FFI call, so
+	// Close waits for anything in flight rather than freeing underneath it.
+	// A blocking call therefore delays Close, which is the trade this package
+	// makes everywhere: a slow Close beats a use after free.
+	mu     sync.RWMutex
+	closed bool
 }
 
 func wrapSDK(ptr *C.sia_sdk_t) *SDK {
@@ -240,9 +278,12 @@ func wrapSDK(ptr *C.sia_sdk_t) *SDK {
 // Close releases the connection and everything the native side holds open for
 // it. It is safe to call more than once.
 func (s *SDK) Close() error {
-	if s.closed.Swap(true) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
 		return nil
 	}
+	s.closed = true
 	s.cleanup.Stop()
 	C.sia_sdk_free(s.ptr)
 	return nil
@@ -251,6 +292,11 @@ func (s *SDK) Close() error {
 // AppKey returns the key this connection is authorized under, rebuilt from the
 // 32 byte seed the native side holds.
 func (s *SDK) AppKey() types.PrivateKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil
+	}
 	var seed [32]byte
 	C.sia_sdk_app_key(s.ptr, cBytes32(&seed))
 	runtime.KeepAlive(s)
@@ -259,6 +305,11 @@ func (s *SDK) AppKey() types.PrivateKey {
 
 // Account fetches the account record from the indexer.
 func (s *SDK) Account(ctx context.Context) (Account, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return Account{}, errClosed
+	}
 	tok, release := cancelToken(ctx)
 	defer release()
 

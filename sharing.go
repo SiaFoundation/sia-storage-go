@@ -10,7 +10,7 @@ import "C"
 import (
 	"context"
 	"runtime"
-	"sync/atomic"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -28,7 +28,10 @@ import (
 type SharingKey struct {
 	ptr     *C.sia_sharing_key_t
 	cleanup runtime.Cleanup
-	closed  atomic.Bool
+
+	// mu guards ptr against Close, as on every other handle in this package.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // ImportSharingKey rebuilds a key from a seed handed out by its owner.
@@ -44,11 +47,15 @@ func wrapSharingKey(ptr *C.sia_sharing_key_t) *SharingKey {
 	return k
 }
 
-// Close releases the key. It is safe to call more than once.
+// Close releases the key. It is safe to call more than once, and waits for any
+// call already using the handle to return.
 func (k *SharingKey) Close() error {
-	if k.closed.Swap(true) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.closed {
 		return nil
 	}
+	k.closed = true
 	k.cleanup.Stop()
 	C.sia_sharing_key_free(k.ptr)
 	return nil
@@ -57,6 +64,11 @@ func (k *SharingKey) Close() error {
 // Export returns the seed, which is the whole credential. Treat it as a secret
 // and hand it out only over a channel you would send a password over.
 func (k *SharingKey) Export() (seed [32]byte) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.closed {
+		return
+	}
 	C.sia_sharing_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
 	return
@@ -64,6 +76,11 @@ func (k *SharingKey) Export() (seed [32]byte) {
 
 // PublicKey returns the half the indexer identifies the key by. Safe to log.
 func (k *SharingKey) PublicKey() (pk types.PublicKey) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.closed {
+		return
+	}
 	C.sia_sharing_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
 	return
@@ -116,6 +133,12 @@ func goKeyStats(s C.sia_key_stats_t) KeyStats {
 // The returned key is the only copy of its seed, so export it before closing
 // it if the point was to hand it out.
 func (s *SDK) CreateSharingKey(ctx context.Context, description string, expiresAt time.Time) (*SharingKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	cDesc := C.CString(description)
 	defer C.free(unsafe.Pointer(cDesc))
 
@@ -136,6 +159,14 @@ func (s *SDK) CreateSharingKey(ctx context.Context, description string, expiresA
 // SharingKey fetches the indexer's record for key. The returned record's Key is
 // nil, since the caller already holds the handle.
 func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key.mu.RLock()
+	defer key.mu.RUnlock()
+	if s.closed || key.closed {
+		return KeyRecord{}, errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -155,6 +186,12 @@ func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error
 //
 // Every returned record carries a handle the caller owns and must Close.
 func (s *SDK) SharingKeys(ctx context.Context, offset, limit uint64) ([]KeyRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -187,6 +224,16 @@ func (s *SDK) SharingKeys(ctx context.Context, offset, limit uint64) ([]KeyRecor
 // ShareObject attaches obj to key, so anyone holding the key's seed can read
 // it. The object must already be pinned.
 func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key.mu.RLock()
+	defer key.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || key.closed || obj.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -203,6 +250,14 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 //
 // Every returned object is a handle the caller owns and must Close.
 func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit uint64) ([]*Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key.mu.RLock()
+	defer key.mu.RUnlock()
+	if s.closed || key.closed {
+		return nil, errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -232,6 +287,14 @@ func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit 
 // UnshareObject detaches one object from key, returning
 // [ErrObjectNotAttached] when it was not attached in the first place.
 func (s *SDK) UnshareObject(ctx context.Context, key *SharingKey, id types.Hash256) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key.mu.RLock()
+	defer key.mu.RUnlock()
+	if s.closed || key.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
@@ -248,6 +311,14 @@ func (s *SDK) UnshareObject(ctx context.Context, key *SharingKey, id types.Hash2
 // Downloads already in flight can keep reading from hosts for up to five more
 // minutes, because the hosts were paid for those reads before the revocation.
 func (s *SDK) RevokeSharingKey(ctx context.Context, key *SharingKey) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key.mu.RLock()
+	defer key.mu.RUnlock()
+	if s.closed || key.closed {
+		return errClosed
+	}
+
 	tok, release := cancelToken(ctx)
 	defer release()
 
