@@ -273,6 +273,13 @@ int32_t sia_mock_sdk(const sia_mock_t* m, const uint8_t app_key[32], sia_cancel_
 // already uploaded fails the way it would if the hosts had lost the data.
 void sia_mock_clear_sectors(const sia_mock_t* m);
 size_t sia_mock_pinned_slabs(const sia_mock_t* m);
+// Makes the first n hosts slow, each delaying every RPC by delay_ms. Hosts
+// are addressed by count because that is how the degraded matrix is driven on
+// both sides; an n above the host count marks every host. Host selection is
+// invisible to a run where every host is fast, so these two are what make
+// that matrix reachable at all.
+void sia_mock_set_slow_hosts(const sia_mock_t* m, size_t n, uint64_t delay_ms);
+void sia_mock_reset_slow_hosts(const sia_mock_t* m);
 
 #endif // SIA_STORAGE_MOCK
 
