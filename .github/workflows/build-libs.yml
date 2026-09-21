@@ -156,7 +156,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet -- ffi/lib/; then
+          # Staged before the comparison because `git diff` ignores untracked
+          # files. On the first run nothing under ffi/lib/ is tracked yet, so
+          # comparing the worktree would report no change and skip the very
+          # commit that bootstraps the archives.
+          git add ffi/lib/
+          if git diff --cached --quiet -- ffi/lib/; then
             echo "archives are unchanged from ${{ needs.resolve.outputs.sha }}, nothing to open"
             exit 0
           fi
@@ -165,7 +170,6 @@ jobs:
           # feature branch before it merges.
           branch="libs/refresh-${{ github.run_id }}"
           git switch -c "$branch"
-          git add ffi/lib/
           git commit -m "Refresh the FFI archives from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
           git push --set-upstream origin "$branch"
           body="Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
