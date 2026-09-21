@@ -19,7 +19,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"syscall"
 	"time"
 
 	"go.sia.tech/core/types"
@@ -185,20 +184,6 @@ func verify(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, wa
 		return false, err
 	}
 	return [32]byte(h.Sum(nil)) == want, nil
-}
-
-// peakRSS is the interesting memory number for this comparison, because the
-// Rust side allocates outside the Go heap and Go's own stats cannot see it.
-func peakRSS() int64 {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return 0
-	}
-	// ru_maxrss is bytes on darwin and kilobytes on linux.
-	if runtime.GOOS == "darwin" {
-		return int64(ru.Maxrss)
-	}
-	return int64(ru.Maxrss) * 1024
 }
 
 func makePayload(n int64) []byte {
