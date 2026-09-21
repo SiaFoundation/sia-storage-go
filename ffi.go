@@ -10,8 +10,6 @@ import "C"
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -241,9 +239,28 @@ func (s *streamCancel) close() {
 	s.release()
 }
 
+// The status codes the C ABI returns, mirrored as Go constants so that the
+// half of the error mapping that needs no cgo can be compiled, and tested,
+// without it. They are initialised from the header rather than written out,
+// so they cannot drift from it.
+const (
+	statusOK                = int32(C.SIA_OK)
+	statusCancelled         = int32(C.SIA_ERR_CANCELLED)
+	statusUnauthorized      = int32(C.SIA_ERR_UNAUTHORIZED)
+	statusUserRejected      = int32(C.SIA_ERR_USER_REJECTED)
+	statusRequestExpired    = int32(C.SIA_ERR_REQUEST_EXPIRED)
+	statusObjectNotAttached = int32(C.SIA_ERR_OBJECT_NOT_ATTACHED)
+	statusKeyMismatch       = int32(C.SIA_ERR_KEY_MISMATCH)
+	statusInvalidState      = int32(C.SIA_ERR_INVALID_STATE)
+	statusInvalidHandle     = int32(C.SIA_ERR_INVALID_HANDLE)
+)
+
 // goError converts an FFI status code and error message into a Go error,
 // freeing the C message. ctx, when non-nil, supplies the cause for
 // SIA_ERR_CANCELLED.
+//
+// Everything that does not need cgo lives in mapError, because a _test.go file
+// cannot use cgo and so cannot reach this function at all.
 func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 	if code == C.SIA_OK {
 		return nil
@@ -253,46 +270,14 @@ func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 		msg = C.GoString(cerr)
 		C.sia_string_free(cerr)
 	}
-	switch code {
-	case C.SIA_ERR_CANCELLED:
-		if ctx != nil {
-			if cause := context.Cause(ctx); cause != nil {
-				return cause
-			}
+	// The cause is the one part that depends on the caller's context rather
+	// than on the status alone.
+	if int32(code) == statusCancelled && ctx != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
 		}
-		return errCancelled
-	case C.SIA_ERR_UNAUTHORIZED:
-		return ErrUnauthorized
-	case C.SIA_ERR_USER_REJECTED:
-		return ErrUserRejected
-	case C.SIA_ERR_REQUEST_EXPIRED:
-		return ErrRequestExpired
-	case C.SIA_ERR_OBJECT_NOT_ATTACHED:
-		return ErrObjectNotAttached
-	case C.SIA_ERR_KEY_MISMATCH:
-		return ErrKeyMismatch
-	case C.SIA_ERR_INVALID_STATE:
-		return &wrappedError{msg: msg, sentinel: ErrInvalidState}
-	case C.SIA_ERR_INVALID_HANDLE:
-		// The header returns this one without setting *err, so there is no
-		// message to fall through to. It means a nil handle reached the
-		// boundary, which is a bug in this package rather than a runtime
-		// failure the caller can act on.
-		return errors.New("invalid handle: a required handle was nil")
 	}
-	// A code with no message would otherwise become errors.New(""), a non-nil
-	// error that prints as nothing.
-	if msg == "" {
-		return fmt.Errorf("sia storage error %d", int32(code))
-	}
-	// preserve errors.Is compatibility for well-known failure modes
-	if strings.Contains(msg, "not enough shards") {
-		return &wrappedError{msg: msg, sentinel: ErrNotEnoughShards}
-	}
-	if strings.Contains(msg, "no more hosts available") {
-		return &wrappedError{msg: msg, sentinel: ErrNoMoreHosts}
-	}
-	return errors.New(msg)
+	return mapError(int32(code), msg)
 }
 
 // wrappedError preserves the Rust error message while matching a sentinel
