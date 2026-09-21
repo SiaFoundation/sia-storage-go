@@ -74,36 +74,31 @@ func TestMapErrorNeverReturnsABlankError(t *testing.T) {
 	}
 }
 
-// TestMessageSentinels covers the two failure modes the C ABI gives no status
-// code of its own, so they are recovered from the message text. Nothing on
-// either side of the boundary pins those strings, which makes this the only
-// thing standing between a rewording in Rust and callers silently losing the
-// ability to branch on the two errors they most need to.
-func TestMessageSentinels(t *testing.T) {
-	for _, tc := range []struct {
-		msg  string
-		want error
-	}{
-		{"not enough shards", ErrNotEnoughShards},
-		{"slab 3: not enough shards to recover", ErrNotEnoughShards},
-		{"no more hosts available", ErrNoMoreHosts},
-		{"upload failed: no more hosts available after 4 attempts", ErrNoMoreHosts},
-	} {
-		err := mapError(1, tc.msg)
-		if !errors.Is(err, tc.want) {
-			t.Errorf("%q did not map to its sentinel, got %v", tc.msg, err)
-		}
-		if err.Error() != tc.msg {
-			t.Errorf("expected the message preserved, got %q", err.Error())
-		}
+// TestMapErrorTransferSentinels covers the two failure modes callers most
+// need to branch on. They used to be recovered by matching Rust prose, which
+// nothing on either side of the boundary pinned; the C ABI now classifies them
+// itself and they arrive as status codes.
+func TestMapErrorTransferSentinels(t *testing.T) {
+	err := mapError(statusNotEnoughShards, "not enough shards: 7/10")
+	if !errors.Is(err, ErrNotEnoughShards) {
+		t.Errorf("shard exhaustion lost its sentinel, got %v", err)
+	}
+	if err.Error() != "not enough shards: 7/10" {
+		t.Errorf("expected the native message preserved, got %q", err.Error())
 	}
 
-	// An unrelated message must stay unrelated rather than being swept into
-	// whichever sentinel happens to share a word.
-	err := mapError(1, "host refused the connection")
+	err = mapError(statusNoMoreHosts, "no more hosts available")
+	if !errors.Is(err, ErrNoMoreHosts) {
+		t.Errorf("host exhaustion lost its sentinel, got %v", err)
+	}
+
+	// A generic failure must stay generic. Previously any message containing
+	// the right words was swept into a sentinel regardless of what actually
+	// failed.
+	err = mapError(1, "host refused the connection: not enough shards nearby")
 	for _, s := range []error{ErrNotEnoughShards, ErrNoMoreHosts} {
 		if errors.Is(err, s) {
-			t.Errorf("an unrelated message matched %v", s)
+			t.Errorf("a generic error matched %v on message text alone", s)
 		}
 	}
 }

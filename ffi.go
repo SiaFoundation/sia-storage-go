@@ -253,6 +253,8 @@ const (
 	statusKeyMismatch       = int32(C.SIA_ERR_KEY_MISMATCH)
 	statusInvalidState      = int32(C.SIA_ERR_INVALID_STATE)
 	statusInvalidHandle     = int32(C.SIA_ERR_INVALID_HANDLE)
+	statusNotEnoughShards   = int32(C.SIA_ERR_NOT_ENOUGH_SHARDS)
+	statusNoMoreHosts       = int32(C.SIA_ERR_NO_MORE_HOSTS)
 )
 
 // goError converts an FFI status code and error message into a Go error,
