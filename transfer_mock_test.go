@@ -9,6 +9,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The default redundancy is 10 data and 20 parity shards, so a slab needs 30
@@ -332,4 +333,61 @@ func TestUploadEmptyWriteIsANoop(t *testing.T) {
 	if n, err := up.Write(nil); n != 0 || err != nil {
 		t.Fatalf("empty write returned %d and %v", n, err)
 	}
+}
+
+// TestSlowHostsAffectTransfers covers the mock's degraded host controls, which
+// are the only way to reach host selection, racing and timeout behaviour from
+// Go. Every benchmark so far ran with uniformly fast hosts, so none of that
+// code path has ever been exercised here.
+//
+// The assertions are deliberately one-sided. A delay applied to every host is
+// a floor the upload cannot beat, which holds on any machine; a ratio against
+// a warm baseline would only hold on an idle one.
+func TestSlowHostsAffectTransfers(t *testing.T) {
+	net, sdk := transferSDK(t)
+
+	// The first upload pays for contracts and connections, which swamps the
+	// delay. Measuring it would say more about warmup than about hosts.
+	uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+
+	timed := func() time.Duration {
+		start := time.Now()
+		uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+		return time.Since(start)
+	}
+
+	warm := timed()
+
+	// Every host, so selection cannot route around the delay. With only some
+	// hosts slow the uploader is free to avoid them, which is the behaviour
+	// working rather than the control failing.
+	const delay = 300 * time.Millisecond
+	net.SetSlowHosts(transferHosts, delay)
+	slow := timed()
+	if slow < delay {
+		t.Errorf("every host delays by %v, so the upload cannot take %v", delay, slow)
+	}
+
+	net.ResetSlowHosts()
+	if after := timed(); after >= slow {
+		t.Errorf("reset left the upload at %v, no better than the %v with slow hosts", after, slow)
+	}
+
+	t.Logf("warm %v, all hosts slow %v", warm, slow)
+}
+
+// TestSlowHostsBoundsAreHarmless proves the count is clamped, so a caller
+// asking for more hosts than exist marks all of them rather than panicking on
+// the Rust side, and that the controls are inert once the network is closed.
+func TestSlowHostsBoundsAreHarmless(t *testing.T) {
+	net, _ := transferSDK(t)
+	net.SetSlowHosts(transferHosts*10, time.Millisecond) // clamped
+	net.SetSlowHosts(0, time.Millisecond)                // marks nothing
+	net.SetSlowHosts(-1, time.Millisecond)               // rejected before crossing
+	net.ResetSlowHosts()
+
+	closed := NewMockNetwork(2)
+	closed.Close()
+	closed.SetSlowHosts(1, time.Millisecond) // must not touch a freed handle
+	closed.ResetSlowHosts()
 }
