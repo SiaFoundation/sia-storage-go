@@ -191,3 +191,60 @@ func TestSDKCloseDuringCall(t *testing.T) {
 		t.Errorf("Account after Close returned %v, want errClosed", err)
 	}
 }
+
+// TestObjectMetadataConcurrentAccess proves the metadata setter and reader are
+// serialised against each other. sia_object_set_metadata takes a non-const
+// handle and mutates it, so running it under a read lock alongside
+// sia_object_metadata was a data race in Rust, and left Metadata able to size
+// a buffer against one value and fill it from another.
+//
+// The race detector is what makes this test meaningful; it passes trivially
+// without -race.
+func TestObjectMetadataConcurrentAccess(t *testing.T) {
+	obj := NewObject()
+	defer obj.Close()
+
+	values := [][]byte{
+		bytes.Repeat([]byte("a"), 16),
+		bytes.Repeat([]byte("b"), 512),
+		bytes.Repeat([]byte("c"), 900),
+	}
+	obj.UpdateMetadata(values[0])
+
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range 50 {
+				obj.UpdateMetadata(values[(i+j)%len(values)])
+			}
+		}()
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				// Whatever it returns must be one of the values in full, never
+				// a buffer sized for one and filled from another.
+				md := obj.Metadata()
+				if md == nil {
+					continue
+				}
+				ok := false
+				for _, v := range values {
+					if bytes.Equal(md, v) {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Errorf("Metadata returned %d bytes matching no value written", len(md))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
