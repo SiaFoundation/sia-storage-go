@@ -3,7 +3,7 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - master
 
 # sia_storage_cabi has not merged to sia-sdk-rs master yet, so every checkout
 # of it has to name the branch that carries the crate. Change this to master
