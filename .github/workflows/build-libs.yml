@@ -25,6 +25,12 @@ on:
     branches:
       - "matt/**"
 
+# sia_storage_cabi has not merged to sia-sdk-rs master yet, so every checkout
+# of it has to name the branch that carries the crate. Change this to master
+# once it lands there; it is the only line that needs to move.
+env:
+  SIA_SDK_RS_REF: matt/cabi
+
 jobs:
   # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
   # job resolves `master` independently, so a merge landing mid-run would ship
@@ -45,7 +51,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: SiaFoundation/sia-sdk-rs
-          ref: master
+          ref: ${{ env.SIA_SDK_RS_REF }}
           path: sia-sdk-rs
       - id: rev
         run: echo "sha=$(git -C sia-sdk-rs rev-parse HEAD)" >> "$GITHUB_OUTPUT"

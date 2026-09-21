@@ -10,6 +10,7 @@ import "C"
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,6 +128,17 @@ func goError(ctx context.Context, code C.int32_t, cerr *C.char) error {
 		return ErrUserRejected
 	case C.SIA_ERR_REQUEST_EXPIRED:
 		return ErrRequestExpired
+	case C.SIA_ERR_INVALID_HANDLE:
+		// The header returns this one without setting *err, so there is no
+		// message to fall through to. It means a nil handle reached the
+		// boundary, which is a bug in this package rather than a runtime
+		// failure the caller can act on.
+		return errors.New("invalid handle: a required handle was nil")
+	}
+	// A code with no message would otherwise become errors.New(""), a non-nil
+	// error that prints as nothing.
+	if msg == "" {
+		return fmt.Errorf("sia storage error %d", int32(code))
 	}
 	// preserve errors.Is compatibility for well-known failure modes
 	if strings.Contains(msg, "not enough shards") {
