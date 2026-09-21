@@ -98,23 +98,35 @@ jobs:
           fetch-depth: 0
       # An archive built on a developer machine cannot be traced back to a
       # revision and cannot be reproduced by anyone else, so only the Build FFI
-      # Libraries workflow may commit one. It opens its PR as github-actions,
-      # which is the only author this check lets through.
+      # Libraries workflow may commit one.
+      #
+      # The question is who authored the commits that touched ffi/lib/, not who
+      # opened the pull request. Checking the author of the PR rejects any
+      # branch that legitimately carries archives the bot committed earlier: a
+      # feature branch proposed against master contains every archive, simply
+      # because master has none.
       - name: Reject hand-committed archives
-        env:
-          AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- ffi/lib/)
-          if [ -z "$changed" ]; then
-            echo "ok: this PR does not touch ffi/lib/"
+          base="origin/${{ github.base_ref }}"
+          commits=$(git log --format='%H' "$base..HEAD" -- ffi/lib/)
+          if [ -z "$commits" ]; then
+            echo "ok: no commit here touches ffi/lib/"
             exit 0
           fi
-          if [ "$AUTHOR" = "github-actions[bot]" ]; then
-            echo "ok: archives refreshed by the Build FFI Libraries workflow"
+          bad=""
+          for c in $commits; do
+            author=$(git log -1 --format='%an' "$c")
+            if [ "$author" != "github-actions[bot]" ]; then
+              bad="$bad$(git log -1 --format='  %h  %an  %s' "$c")\n"
+            fi
+          done
+          if [ -z "$bad" ]; then
+            echo "ok: every archive commit came from the Build FFI Libraries workflow"
+            git log --format='  %h  %s' "$base..HEAD" -- ffi/lib/
             exit 0
           fi
-          echo "FAIL: this PR changes files under ffi/lib/:"
-          echo "$changed"
+          echo "FAIL: these commits change ffi/lib/ but were not made by the workflow:"
+          printf "$bad"
           echo
           echo "Archives may only be committed by the Build FFI Libraries workflow."
           echo "Run it from the Actions tab and it will open a PR with all five"
