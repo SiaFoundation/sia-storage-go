@@ -9,7 +9,7 @@ require (
 
 require (
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	lukechampine.com/frand v1.5.1 // indirect
 )
