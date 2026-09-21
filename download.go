@@ -58,6 +58,14 @@ type Download struct {
 //
 // ctx cancels the whole transfer, not just the call that starts it.
 func (s *SDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (*Download, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return nil, errClosed
+	}
+
 	progressID := registerProgress(opts.OnShard)
 
 	copts := C.sia_download_options_t{

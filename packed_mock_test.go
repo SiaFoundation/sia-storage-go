@@ -234,8 +234,90 @@ func TestPackedUploadAddReaderError(t *testing.T) {
 	for _, o := range objs {
 		o.Close()
 	}
+	// The failed add must contribute nothing. Finishing it instead of
+	// aborting produced a short but structurally valid object here, which a
+	// caller had no way to tell apart from a complete one.
+	if len(objs) != 0 {
+		t.Errorf("a failed Add contributed %d object(s) to Finalize, want 0", len(objs))
+	}
+}
+
+// TestPackedUploadSurvivesAFailedAdd proves a failed add costs only its own
+// object: the adds around it still come back, in order, and still round trip.
+func TestPackedUploadSurvivesAFailedAdd(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	defer pu.Close()
+
+	first := payload(4 << 10)
+	if _, err := pu.Add(bytes.NewReader(first)); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+
+	boom := errors.New("reader blew up")
+	r := io.MultiReader(bytes.NewReader(payload(2<<10)), errReader{boom})
+	if _, err := pu.Add(r); !errors.Is(err, boom) {
+		t.Fatalf("second add returned %v, want the reader error", err)
+	}
+
+	third := payload(8 << 10)
+	if _, err := pu.Add(bytes.NewReader(third)); err != nil {
+		t.Fatalf("third add after a failed one: %v", err)
+	}
+
+	objs, err := pu.Finalize()
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	defer func() {
+		for _, o := range objs {
+			o.Close()
+		}
+	}()
+	if len(objs) != 2 {
+		t.Fatalf("expected the two successful adds, got %d object(s)", len(objs))
+	}
+	if objs[0].Size() != uint64(len(first)) {
+		t.Errorf("first object is %d bytes, want %d", objs[0].Size(), len(first))
+	}
+	if objs[1].Size() != uint64(len(third)) {
+		t.Errorf("second object is %d bytes, want %d", objs[1].Size(), len(third))
+	}
 }
 
 type errReader struct{ err error }
 
 func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestPackedUploadQueriesAfterClose proves the three query methods do not read
+// a handle that Close already freed. They were the only methods on the type
+// that took neither the mutex nor the done flag, so before the guard this test
+// killed the process with SIGBUS rather than failing.
+func TestPackedUploadQueriesAfterClose(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	if pu.OptimalDataSize() == 0 {
+		t.Fatal("a live upload should report a non-zero slab size")
+	}
+	if err := pu.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if n := pu.Remaining(); n != 0 {
+		t.Errorf("Remaining after Close = %d, want 0", n)
+	}
+	if n := pu.Length(); n != 0 {
+		t.Errorf("Length after Close = %d, want 0", n)
+	}
+	if n := pu.OptimalDataSize(); n != 0 {
+		t.Errorf("OptimalDataSize after Close = %d, want 0", n)
+	}
+}
