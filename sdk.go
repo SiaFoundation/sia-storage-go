@@ -129,7 +129,7 @@ func NewBuilder(indexerURL string, metadata AppMetadata) (*Builder, error) {
 	var ptr *C.sia_builder_t
 	var cerr *C.char
 	if code := C.sia_builder_new(cURL, cMeta, &ptr, &cerr); code != C.SIA_OK {
-		return nil, goError(nil, code, cerr)
+		return nil, localError(code, cerr)
 	}
 	return wrapBuilder(ptr), nil
 }

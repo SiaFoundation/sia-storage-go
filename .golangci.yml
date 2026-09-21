@@ -6,13 +6,32 @@ run:
 linters:
   default: none
   enable:
+    - errcheck
     - gocritic
     - govet
     - misspell
     - revive
+    - staticcheck
     - tagliatelle
     - whitespace
   settings:
+    errcheck:
+      # Every Close in this package returns nil unconditionally; the error
+      # exists only so the handles satisfy io.Closer. Requiring each of the
+      # hundred-odd call sites to discard it explicitly would bury the one
+      # unchecked error that does matter.
+      exclude-functions:
+        - (*go.sia.tech/siastorage.Builder).Close
+        - (*go.sia.tech/siastorage.Download).Close
+        - (*go.sia.tech/siastorage.MockNetwork).Close
+        - (*go.sia.tech/siastorage.Object).Close
+        - (*go.sia.tech/siastorage.PackedUpload).Close
+        - (*go.sia.tech/siastorage.SDK).Close
+        - (*go.sia.tech/siastorage.SharingKey).Close
+        - (*go.sia.tech/siastorage.Upload).Close
+        # Sync on a console logger returns an error on some platforms that no
+        # caller can act on, which is why it is conventionally discarded.
+        - (*go.uber.org/zap.Logger).Sync
     gocritic:
       disabled-checks:
         - commentedOutCode

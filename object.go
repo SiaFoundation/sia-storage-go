@@ -318,7 +318,7 @@ func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) 
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {
-		return "", goError(nil, code, cerr)
+		return "", localError(code, cerr)
 	}
 	return goString(cURL), nil
 }
@@ -370,7 +370,7 @@ func (s *SDK) SealObject(obj *Object) ([]byte, error) {
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {
-		return nil, goError(nil, code, cerr)
+		return nil, localError(code, cerr)
 	}
 	return []byte(goString(cJSON)), nil
 }
@@ -395,7 +395,7 @@ func (s *SDK) ObjectFromSealed(sealed []byte) (*Object, error) {
 	code := C.sia_object_from_sealed_json(s.ptr, cJSON, &ptr, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
-		return nil, goError(nil, code, cerr)
+		return nil, localError(code, cerr)
 	}
 	return wrapObject(ptr), nil
 }
