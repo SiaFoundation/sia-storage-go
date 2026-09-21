@@ -17,6 +17,12 @@ linters:
       disabled-checks:
         - commentedOutCode
         - uncheckedInlineErr
+        # dupImport misfires on cgo, which pairs import "C" with unsafe
+        - dupImport
+        # dupSubExpr fires on every call to a C function taking a char** error
+        # out parameter, reporting a comparison that is not on the line and a
+        # column past the end of it. It comes from cgo's generated wrapper.
+        - dupSubExpr
         - emptyStringTest
         - exitAfterDefer
         - ifElseChain
