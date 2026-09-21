@@ -140,8 +140,15 @@ func (o *Object) Metadata() []byte {
 		return nil
 	}
 	buf := make([]byte, int(n))
-	C.sia_object_metadata(o.ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n)
+	got := C.sia_object_metadata(o.ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n)
 	runtime.KeepAlive(o)
+	// The native side copies nothing when the buffer is too small, which would
+	// otherwise hand back a silently zero-filled slice. The write lock on
+	// UpdateMetadata makes this unreachable; it is here so that a future
+	// caller that mutates without it fails loudly instead.
+	if got != n {
+		return nil
+	}
 	return buf
 }
 
@@ -150,8 +157,11 @@ func (o *Object) Metadata() []byte {
 // This only changes the local handle. Call SDK.UpdateObjectMetadata to persist
 // it to the indexer.
 func (o *Object) UpdateMetadata(metadata []byte) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+	// The write lock, not the read lock: sia_object_set_metadata takes a
+	// non-const handle and mutates it, so it must not run alongside another
+	// setter or alongside Metadata reading the same bytes.
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.closed {
 		return
 	}
