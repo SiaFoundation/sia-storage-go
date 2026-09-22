@@ -22,7 +22,7 @@ require (
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
-	github.com/dunglas/httpsfv v1.1.0 // indirect
+	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.2 // indirect
@@ -30,11 +30,11 @@ require (
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.61.0 // indirect
-	github.com/quic-go/webtransport-go v0.12.0 // indirect
+	github.com/quic-go/quic-go v0.62.0 // indirect
+	github.com/quic-go/webtransport-go v0.13.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/vbauerster/cupwriter v0.0.4 // indirect
-	go.sia.tech/coreutils v0.24.0 // indirect
+	go.sia.tech/coreutils v0.24.1 // indirect
 	go.sia.tech/jape v0.14.3 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
