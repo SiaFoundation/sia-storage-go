@@ -18,7 +18,7 @@ func TestObjectEventsReportWrites(t *testing.T) {
 	obj := uploadPinned(t, sdk, payload(1<<20))
 	defer obj.Close()
 
-	events, err := sdk.ObjectEvents(ctx, nil, 0)
+	events, err := sdk.ObjectEvents(ctx, EventCursor{}, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestObjectEventsReportDeletes(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	events, err := sdk.ObjectEvents(ctx, nil, 0)
+	events, err := sdk.ObjectEvents(ctx, EventCursor{}, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestObjectEventsCursor(t *testing.T) {
 		obj.Close()
 	}
 
-	first, err := sdk.ObjectEvents(ctx, nil, 1)
+	first, err := sdk.ObjectEvents(ctx, EventCursor{}, 1)
 	if err != nil {
 		t.Fatalf("first page: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestObjectEventsCursor(t *testing.T) {
 		t.Fatalf("asked for one event, got %d", len(first))
 	}
 
-	rest, err := sdk.ObjectEvents(ctx, ptr(first[0].Cursor()), 0)
+	rest, err := sdk.ObjectEvents(ctx, first[0].Cursor(), 0)
 	if err != nil {
 		t.Fatalf("second page: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestObjectEventsEmptyTail(t *testing.T) {
 	obj := uploadPinned(t, sdk, payload(1<<20))
 	defer obj.Close()
 
-	events, err := sdk.ObjectEvents(ctx, nil, 0)
+	events, err := sdk.ObjectEvents(ctx, EventCursor{}, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestObjectEventsEmptyTail(t *testing.T) {
 		t.Fatal("expected at least one event to page past")
 	}
 
-	tail, err := sdk.ObjectEvents(ctx, ptr(events[len(events)-1].Cursor()), 0)
+	tail, err := sdk.ObjectEvents(ctx, events[len(events)-1].Cursor(), 0)
 	if err != nil {
 		t.Fatalf("tail: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestObjectEventsUnknownCursor(t *testing.T) {
 
 	var id types.Hash256
 	id[0] = 0xEF
-	events, err := sdk.ObjectEvents(context.Background(), &EventCursor{AfterID: id}, 0)
+	events, err := sdk.ObjectEvents(context.Background(), EventCursor{AfterID: id}, 0)
 	if err != nil {
 		t.Fatalf("unknown cursor: %v", err)
 	}

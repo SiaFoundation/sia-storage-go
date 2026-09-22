@@ -66,8 +66,10 @@ type App struct {
 // An Account is the indexer's view of the account behind an app key.
 //
 // This is a type of this package rather than the indexer's own, because the
-// bindings do not depend on the indexer's module. The JSON is the same, so a
-// caller needing the indexer's type can decode into it instead.
+// indexer spells it in its server side API package and in terms of types from
+// two more. The JSON is the same, so a caller needing the indexer's type can
+// decode into it instead. [SealedObject], which a consumer has to persist
+// rather than merely read, is the indexer's type directly.
 type Account struct {
 	AccountKey types.PublicKey `json:"accountKey"`
 
