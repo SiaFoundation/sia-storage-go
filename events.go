@@ -33,17 +33,26 @@ type ObjectEvent struct {
 // An EventCursor resumes a listing directly after the event it names. Both
 // fields come from the last [ObjectEvent] of the previous page, because events
 // sharing a timestamp are ordered by ID.
+//
+// The zero cursor starts from the beginning, which is the same thing it means
+// as a value: nothing precedes the zero time.
 type EventCursor struct {
 	After   time.Time
 	AfterID types.Hash256
 }
 
+// IsZero reports whether the cursor names no event, and so starts a listing
+// from the beginning.
+func (c EventCursor) IsZero() bool {
+	return c.After.IsZero() && c.AfterID == types.Hash256{}
+}
+
 // ObjectEvents lists changes to the account's objects in order, oldest first.
 //
-// A nil after starts from the beginning. A zero limit takes the indexer's
+// A zero after starts from the beginning. A zero limit takes the indexer's
 // default. Reaching the end returns no events rather than an error, so a
 // consumer polls by passing the cursor it built from the last page.
-func (s *SDK) ObjectEvents(ctx context.Context, after *EventCursor, limit uint64) ([]ObjectEvent, error) {
+func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit uint64) ([]ObjectEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -58,7 +67,7 @@ func (s *SDK) ObjectEvents(ctx context.Context, after *EventCursor, limit uint64
 		afterMicro C.int64_t
 		afterID    types.Hash256
 	)
-	if after != nil {
+	if !after.IsZero() {
 		hasCursor = true
 		afterMicro = C.int64_t(after.After.UnixMicro())
 		afterID = after.AfterID

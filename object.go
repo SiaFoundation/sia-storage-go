@@ -9,14 +9,22 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"time"
 	"unsafe"
 
 	"go.sia.tech/core/types"
+	"go.sia.tech/indexd/slabs"
 )
+
+// A SealedObject is an object locked with the account's app key. It is the one
+// thing a caller sees inside rather than holds as a handle, because a consumer
+// persisting objects into its own schema needs the fields.
+type SealedObject = slabs.SealedObject
 
 // An Object is a collection of slabs plus the keys needed to read them.
 //
@@ -348,21 +356,18 @@ func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object,
 	return wrapObject(ptr), nil
 }
 
-// SealObject encodes obj as the sealed JSON the indexer API exchanges, with the
-// data and metadata keys encrypted to the account's app key and signed by it.
-//
-// This is the one type a caller sees inside rather than holds as a handle,
-// because a consumer persisting objects into its own schema needs the fields.
-// Store the result unchanged and hand it back to [SDK.ObjectFromSealed].
+// SealObject seals obj with the data and metadata keys encrypted to the
+// account's app key and signed by it. Store the result and hand it back to
+// [SDK.ObjectFromSealed].
 //
 // It is derived locally and reaches no indexer.
-func (s *SDK) SealObject(obj *Object) ([]byte, error) {
+func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
 	if s.closed || obj.closed {
-		return nil, errClosed
+		return SealedObject{}, errClosed
 	}
 
 	var cJSON, cerr *C.char
@@ -370,24 +375,36 @@ func (s *SDK) SealObject(obj *Object) ([]byte, error) {
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {
-		return nil, localError(code, cerr)
+		return SealedObject{}, localError(code, cerr)
 	}
-	return []byte(goString(cJSON)), nil
+
+	// The native side speaks the API's JSON, which is what SealedObject is
+	// declared to decode; a field either side renamed lands here as a zero.
+	var sealed SealedObject
+	if err := json.Unmarshal([]byte(goString(cJSON)), &sealed); err != nil {
+		return SealedObject{}, fmt.Errorf("failed to decode sealed object: %w", err)
+	}
+	return sealed, nil
 }
 
-// ObjectFromSealed decodes and opens sealed JSON from [SDK.SealObject],
-// verifying its signatures against the account's app key.
+// ObjectFromSealed opens a sealed object from [SDK.SealObject], verifying its
+// signatures against the account's app key.
 //
 // A sealed object produced under a different app key fails here rather than
 // producing a handle that cannot read anything.
-func (s *SDK) ObjectFromSealed(sealed []byte) (*Object, error) {
+func (s *SDK) ObjectFromSealed(sealed SealedObject) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, errClosed
 	}
 
-	cJSON := C.CString(string(sealed))
+	buf, err := json.Marshal(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode sealed object: %w", err)
+	}
+
+	cJSON := C.CString(string(buf))
 	defer C.free(unsafe.Pointer(cJSON))
 
 	var ptr *C.sia_object_t
