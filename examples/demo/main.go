@@ -40,7 +40,32 @@ const (
 	// upload.
 	packedSize  = 32 << 10
 	packedCount = 4
+
+	// The erasure coding this demo asks for explicitly, rather than taking the
+	// SDK default, so the progress bar has a total it can compute rather than
+	// guess. sectorSize is the protocol's, not a default.
+	dataShards   = 10
+	parityShards = 20
+	sectorSize   = 4 << 20
 )
+
+// slabsFor reports how many slabs a payload of n bytes occupies.
+func slabsFor(n uint64) uint64 {
+	slabData := uint64(dataShards * sectorSize)
+	return (n + slabData - 1) / slabData
+}
+
+// uploadBytes is what an upload of n bytes writes to hosts: every shard of
+// every slab, parity included.
+func uploadBytes(n uint64) uint64 {
+	return slabsFor(n) * (dataShards + parityShards) * sectorSize
+}
+
+// downloadBytes is what a full download reads back, which is only the data
+// shards unless one is missing.
+func downloadBytes(n uint64) uint64 {
+	return slabsFor(n) * dataShards * sectorSize
+}
 
 // connectOptions is what the two connect implementations share. The mock build
 // ignores everything but the absence of an indexer URL.
@@ -122,21 +147,34 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	want := payload(payloadSize)
 	var shards int
 	var transferred uint64
+	bar := newProgress(uploadBytes(payloadSize))
 	obj, err := upload(ctx, sdk, want, siastorage.UploadOptions{
+		// Set explicitly so the bar's total is arithmetic rather than a guess,
+		// which also exercises set_redundancy on the options struct.
+		DataShards:   dataShards,
+		ParityShards: parityShards,
 		OnShard: func(p siastorage.ShardProgress) {
 			shards++
 			transferred = p.Transferred
+			bar.update(p.Transferred)
 		},
 	})
+	bar.finish()
 	if err != nil {
 		fail("upload", err)
 	}
 	defer obj.Close()
 	info("%d shards reported, %s transferred", shards, bytes4(transferred))
 	info("object %v", obj.ID())
-	info("%s logical, %s encoded, %.2fx redundancy",
-		bytes4(obj.Size()), bytes4(obj.EncodedSize()),
-		float64(obj.EncodedSize())/float64(obj.Size()))
+	// encoded/logical is not the redundancy. A sector is stored whole, so a
+	// payload that does not fill its slab pays for the padding too, and
+	// dividing the two conflates that with the erasure coding.
+	slabData := slabsFor(obj.Size()) * dataShards * sectorSize
+	info("%s logical, %s encoded", bytes4(obj.Size()), bytes4(obj.EncodedSize()))
+	info("%.2fx from erasure coding, %d data plus %d parity shards",
+		float64(dataShards+parityShards)/dataShards, dataShards, parityShards)
+	info("%s of payload still fills a %s slab, so %s of that slab is padding",
+		bytes4(obj.Size()), bytes4(slabData), bytes4(slabData-obj.Size()))
 	info("created %s, updated %s",
 		obj.CreatedAt().Format(time.RFC3339), obj.UpdatedAt().Format(time.RFC3339))
 
@@ -163,7 +201,11 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 	// -------------------------------------------------------------- download
 	stage("Download the whole object and verify it")
-	got, err := download(ctx, sdk, fetched, siastorage.DownloadOptions{})
+	dlBar := newProgress(downloadBytes(payloadSize))
+	got, err := download(ctx, sdk, fetched, siastorage.DownloadOptions{
+		OnShard: func(p siastorage.ShardProgress) { dlBar.update(p.Transferred) },
+	})
+	dlBar.finish()
 	if err != nil {
 		fail("download", err)
 	}
