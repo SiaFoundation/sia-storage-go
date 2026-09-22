@@ -42,6 +42,12 @@ func connect(ctx context.Context, opts connectOptions) (*siastorage.SDK, func(),
 	return sdk, func() { network.Close() }, nil
 }
 
+// connectShared brings up the recipient side on the same mock network, so the
+// demo exercises SharedSDK rather than the owner's view of a key.
+func connectShared(ctx context.Context, seed [32]byte) (*siastorage.SharedSDK, error) {
+	return network.SharedSDK(ctx, seed)
+}
+
 // report prints what the mock can see that a real indexer cannot.
 func report(*siastorage.SDK) {
 	stage("Mock network")

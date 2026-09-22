@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -184,8 +185,57 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	info("bytes %d to %d match", offset, offset+length)
 
+	// ----------------------------------------------------------------- hosts
+	stage("List the hosts the indexer knows")
+	hosts, err := sdk.Hosts(ctx, siastorage.HostQuery{})
+	if err != nil {
+		fail("Hosts", err)
+	}
+	if len(hosts) == 0 {
+		fail("Hosts", fmt.Errorf("the indexer knows no hosts"))
+	}
+	info("%d host(s); the first is %v in %s, good for upload %t",
+		len(hosts), hosts[0].PublicKey, hosts[0].CountryCode, hosts[0].GoodForUpload)
+	if len(hosts[0].Addresses) > 0 {
+		info("reachable at %s over %s", hosts[0].Addresses[0].Address, hosts[0].Addresses[0].Protocol)
+	}
+	paged, err := sdk.Hosts(ctx, siastorage.HostQuery{Offset: 1, Limit: 3})
+	if err != nil {
+		fail("Hosts paged", err)
+	}
+	info("offset 1 limit 3 returned %d", len(paged))
+	near, err := sdk.Hosts(ctx, siastorage.HostQuery{
+		Location: &siastorage.GeoLocation{Latitude: 52.37, Longitude: 4.90},
+		Limit:    1,
+	})
+	if err != nil {
+		fail("Hosts by location", err)
+	}
+	info("nearest to Amsterdam: %d host(s)", len(near))
+
+	// ----------------------------------------------------------------- slabs
+	stage("Inspect the slabs the object is built from")
+	ids := fetched.SlabIDs()
+	if len(ids) == 0 {
+		fail("SlabIDs", fmt.Errorf("a %s object references no slabs", bytes4(fetched.Size())))
+	}
+	info("%d slab(s); an id is derived from a slab's contents, not stored", len(ids))
+	slab, err := sdk.Slab(ctx, ids[0])
+	if err != nil {
+		fail("Slab", err)
+	}
+	info("slab %v: %d of %d sectors needed, version %d",
+		slab.ID, slab.MinShards, len(slab.Sectors), slab.Version)
+	if len(slab.Sectors) > 0 {
+		info("first sector root %v on host %v", slab.Sectors[0].Root, slab.Sectors[0].HostKey)
+	}
+	if _, ok := fetched.SlabID(len(ids)); ok {
+		fail("SlabID", fmt.Errorf("an index past the end reported success"))
+	}
+	info("an out of range index reports false rather than a zero id")
+
 	// ---------------------------------------------------------------- sealed
-	stage("Seal the object to JSON and open it again")
+	stage("Seal the object and open it again")
 	sealed, err := sdk.SealObject(obj)
 	if err != nil {
 		fail("SealObject", err)
@@ -195,7 +245,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 		fail("ObjectFromSealed", err)
 	}
 	defer opened.Close()
-	info("%d bytes of sealed JSON, reopened to the same ID %t", len(sealed), opened.ID() == obj.ID())
+	info("%d slabs sealed, reopened to the same ID %t", len(sealed.Slabs), opened.ID() == obj.ID())
 
 	// ------------------------------------------------------------- share URL
 	stage("Mint a share URL and resolve it")
@@ -210,6 +260,75 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	defer viaURL.Close()
 	info("resolved to the same object %t", viaURL.ID() == obj.ID())
+
+	// ------------------------------------------------------------- overwrite
+	stage("Overwrite a range in place")
+	const patchAt = 2 << 20
+	patch := bytes.Repeat([]byte{0xAB}, 128<<10)
+	at := uint64(patchAt)
+	overwritten, err := uploadInto(ctx, sdk, obj, patch, siastorage.UploadOptions{StartOffset: &at})
+	if err != nil {
+		fail("overwrite", err)
+	}
+	defer overwritten.Close()
+	if overwritten.Size() != uint64(len(want)) {
+		fail("overwrite", fmt.Errorf("the size changed to %d", overwritten.Size()))
+	}
+	if overwritten.ID() == obj.ID() {
+		fail("overwrite", fmt.Errorf("the id did not change, though the slabs did"))
+	}
+	if err := sdk.PinObject(ctx, overwritten); err != nil {
+		fail("PinObject overwritten", err)
+	}
+	expected := append([]byte(nil), want...)
+	copy(expected[patchAt:], patch)
+	after, err := download(ctx, sdk, overwritten, siastorage.DownloadOptions{})
+	if err != nil {
+		fail("download overwritten", err)
+	}
+	if !bytes.Equal(after, expected) {
+		fail("verify overwrite", fmt.Errorf("the rewritten range or its surroundings differ"))
+	}
+	info("%s rewritten at offset %s, the rest untouched, same size",
+		bytes4(uint64(len(patch))), bytes4(patchAt))
+	info("the id moved to %v, since an id is derived from the slabs", overwritten.ID())
+
+	past := overwritten.Size() + 1
+	if _, err := uploadInto(ctx, sdk, overwritten, []byte("x"), siastorage.UploadOptions{StartOffset: &past}); !errors.Is(err, siastorage.ErrOutOfRange) {
+		fail("overwrite past the end", fmt.Errorf("wanted ErrOutOfRange, got %v", err))
+	}
+	info("starting past the end reports ErrOutOfRange")
+
+	if _, err := sdk.PackedUpload(ctx, siastorage.UploadOptions{StartOffset: &at}); !errors.Is(err, siastorage.ErrInvalidState) {
+		fail("packed with a start offset", fmt.Errorf("wanted ErrInvalidState, got %v", err))
+	}
+	info("a packed upload refuses one, since it always appends")
+
+	// -------------------------------------------------------------- truncate
+	stage("Truncate a copy of the object")
+	const cut = 1 << 20
+	short := overwritten.Truncate(cut)
+	if short == nil {
+		fail("Truncate", fmt.Errorf("truncate returned nothing"))
+	}
+	defer short.Close()
+	if short.Size() != cut {
+		fail("Truncate", fmt.Errorf("size is %d, wanted %d", short.Size(), cut))
+	}
+	if overwritten.Size() != uint64(len(want)) {
+		fail("Truncate", fmt.Errorf("the original was modified"))
+	}
+	if err := sdk.PinObject(ctx, short); err != nil {
+		fail("PinObject truncated", err)
+	}
+	prefix, err := download(ctx, sdk, short, siastorage.DownloadOptions{})
+	if err != nil {
+		fail("download truncated", err)
+	}
+	if !bytes.Equal(prefix, expected[:cut]) {
+		fail("verify truncate", fmt.Errorf("the truncated copy is not the original's prefix"))
+	}
+	info("%s copy verified as the prefix; the original is unchanged", bytes4(cut))
 
 	// ---------------------------------------------------------- sharing keys
 	stage("Create a sharing key and attach the object")
@@ -239,7 +358,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 		r.Key.Close()
 	}
 
-	stage("Read the object as a recipient holding only the seed")
+	stage("List the key's objects as its owner")
 	seed := key.Export()
 	recipient := siastorage.ImportSharingKey(seed)
 	defer recipient.Close()
@@ -258,11 +377,73 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if len(shared) == 0 {
 		fail("SharedObjects", fmt.Errorf("the key lists nothing"))
 	}
-	viaKey, err := download(ctx, sdk, shared[0], siastorage.DownloadOptions{})
+	info("the owner sees %d object(s) on the key", len(shared))
+
+	// --------------------------------------------------------- the recipient
+	// Everything below uses the seed alone. No app key, no account, no
+	// approval: another process handed 32 bytes could do exactly this.
+	stage("Connect as the recipient, holding only the seed")
+	shard, err := connectShared(ctx, seed)
+	if err != nil {
+		fail("ConnectShared", err)
+	}
+	defer shard.Close()
+	info("connected with no account of its own")
+
+	stats, err := shard.Stats(ctx)
+	if err != nil {
+		fail("SharedSDK.Stats", err)
+	}
+	info("the key grants %d object(s), %s pinned", stats.ObjectCount, bytes4(stats.PinnedSize))
+
+	theirs, err := shard.Objects(ctx, 0, 0)
+	if err != nil {
+		fail("SharedSDK.Objects", err)
+	}
+	defer func() {
+		for _, o := range theirs {
+			o.Close()
+		}
+	}()
+	if len(theirs) == 0 {
+		fail("SharedSDK.Objects", fmt.Errorf("the recipient lists nothing"))
+	}
+	info("the recipient lists %d object(s)", len(theirs))
+
+	byID, err := shard.Object(ctx, theirs[0].ID())
+	if err != nil {
+		fail("SharedSDK.Object", err)
+	}
+	defer byID.Close()
+	info("fetched %v by id, %s", byID.ID(), bytes4(byID.Size()))
+
+	theirHosts, err := shard.Hosts(ctx, siastorage.HostQuery{Limit: 5})
+	if err != nil {
+		fail("SharedSDK.Hosts", err)
+	}
+	info("%d host(s) serve the key's objects", len(theirHosts))
+
+	stage("Download as the recipient, then close the SDK mid transfer")
+	dl, err := shard.Download(ctx, byID, siastorage.DownloadOptions{})
+	if err != nil {
+		fail("SharedSDK.Download", err)
+	}
+	// The download keeps its own token refresh alive, so dropping the handle
+	// it came from must not break it.
+	if err := shard.Close(); err != nil {
+		fail("SharedSDK.Close", err)
+	}
+	viaKey, err := io.ReadAll(dl)
+	dl.Close()
 	if err != nil {
 		fail("recipient download", err)
 	}
-	info("the recipient read %s from a 32 byte seed alone", bytes4(uint64(len(viaKey))))
+	// The key holds the object as it was when attached, the original upload
+	// rather than the overwritten copy.
+	if !bytes.Equal(viaKey, want) {
+		fail("verify recipient download", fmt.Errorf("the recipient read %d bytes and they differ", len(viaKey)))
+	}
+	info("%s read and verified after the SharedSDK was closed", bytes4(uint64(len(viaKey))))
 
 	// -------------------------------------------------------- packed uploads
 	stage("Pack %d objects of %s into shared slabs", packedCount, bytes4(packedSize))
@@ -311,7 +492,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 	// ---------------------------------------------------------------- events
 	stage("Page through the object event feed")
-	var cursor *siastorage.EventCursor
+	var cursor siastorage.EventCursor
 	var seen int
 	for page := 0; page < 10; page++ {
 		events, err := sdk.ObjectEvents(ctx, cursor, 50)
@@ -328,8 +509,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 				info("deleted %v at %s", e.ID, e.UpdatedAt.Format(time.RFC3339))
 			}
 		}
-		next := events[len(events)-1].Cursor()
-		cursor = &next
+		cursor = events[len(events)-1].Cursor()
 		siastorage.CloseObjects(events)
 	}
 	info("%d event(s) read, the feed is caught up", seen)
@@ -345,7 +525,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	info("object detached and the key revoked")
 
 	deleted := 0
-	for _, o := range append([]*siastorage.Object{obj}, packedObjs...) {
+	for _, o := range append([]*siastorage.Object{obj, overwritten, short}, packedObjs...) {
 		if err := sdk.DeleteObject(ctx, o.ID()); err != nil {
 			fail("DeleteObject", err)
 		}
@@ -383,6 +563,21 @@ func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastora
 		info("%d progress events were dropped, the handler fell behind", dropped)
 	}
 	return obj, nil
+}
+
+// uploadInto streams data into an existing object, which is what an overwrite
+// needs: the object carries the slabs the range is rewritten against.
+func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
+	up, err := sdk.Upload(ctx, obj, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer up.Close()
+
+	if _, err := io.Copy(up, bytes.NewReader(data)); err != nil {
+		return nil, err
+	}
+	return up.Finish()
 }
 
 // download reads an object out through io.ReadAll.

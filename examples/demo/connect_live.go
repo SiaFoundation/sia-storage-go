@@ -28,6 +28,7 @@ func connect(ctx context.Context, opts connectOptions) (*siastorage.SDK, func(),
 	if opts.IndexerURL == "" {
 		return nil, nil, errors.New("pass -indexer, or rebuild with -tags siastorage_mock to run against the mock")
 	}
+	indexerURL = opts.IndexerURL
 
 	stage("Connect to %s", opts.IndexerURL)
 	builder, err := siastorage.NewBuilder(opts.IndexerURL, demoApp)
@@ -79,6 +80,16 @@ func connect(ctx context.Context, opts connectOptions) (*siastorage.SDK, func(),
 }
 
 // report has nothing indexer side to add that the account did not already say.
+// indexerURL is remembered so connectShared can reach the same indexer with
+// no account of its own.
+var indexerURL string
+
+// connectShared connects as the recipient of a sharing key, which needs only
+// the indexer URL and the seed.
+func connectShared(ctx context.Context, seed [32]byte) (*siastorage.SharedSDK, error) {
+	return siastorage.ConnectShared(ctx, indexerURL, seed)
+}
+
 func report(*siastorage.SDK) {}
 
 func mustAppID(s string) types.Hash256 {
