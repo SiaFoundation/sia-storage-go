@@ -48,6 +48,8 @@ extern "C"
 		// Host selection ran out of candidates. Reported even when it surfaces
 		// wrapped inside an upload or download failure.
 		SIA_ERR_NO_MORE_HOSTS = 11,
+		// An overwrite started past the end of the object it was rewriting.
+		SIA_ERR_OUT_OF_RANGE = 12,
 	};
 
 	typedef struct sia_builder sia_builder_t;
@@ -60,6 +62,7 @@ extern "C"
 	typedef struct sia_cancel sia_cancel_t;
 	typedef struct sia_sharing_key sia_sharing_key_t;
 	typedef struct sia_key_records sia_key_records_t;
+	typedef struct sia_shared_sdk sia_shared_sdk_t;
 	typedef struct sia_mock sia_mock_t;
 
 	// The indexer's snapshot of what a sharing key grants access to.
@@ -99,6 +102,15 @@ extern "C"
 		uint64_t max_buffered_slabs; // 0 = default
 		sia_progress_cb_t on_shard;	 // may be NULL
 		uintptr_t userdata;
+		// When false, start_offset is ignored and the upload appends.
+		bool has_start_offset;
+		// Byte offset the written data overwrites from, instead of appending.
+		// Only the slabs covering the rewritten range are re-uploaded, but the
+		// finished object still gets a new id, because an id is derived from
+		// the slabs. Starting past the end of the object returns
+		// SIA_ERR_OUT_OF_RANGE. sia_packed_upload_start rejects it outright
+		// with SIA_ERR_INVALID_STATE, since a packed add always appends.
+		uint64_t start_offset;
 	} sia_upload_options_t;
 
 	typedef struct
@@ -110,6 +122,25 @@ extern "C"
 		sia_progress_cb_t on_shard;	  // may be NULL
 		uintptr_t userdata;
 	} sia_download_options_t;
+
+	// Filters for a host listing. A zeroed struct with a NULL country applies no
+	// filters. offset and limit follow the usual convention where 0 means the
+	// indexer's default paging.
+	//
+	// There is no protocol filter: listings are always scoped to SiaMux, which
+	// is the only protocol this library's transport can dial.
+	typedef struct
+	{
+		// When false, latitude and longitude are ignored and hosts come back in
+		// the indexer's order rather than sorted by proximity.
+		bool has_location;
+		double latitude;
+		double longitude;
+		uint64_t offset;
+		uint64_t limit;
+		// ISO 3166-1 alpha-2, or NULL for no country filter.
+		const char *country;
+	} sia_host_query_t;
 
 	void sia_string_free(char *s);
 
@@ -149,6 +180,17 @@ extern "C"
 
 	sia_object_t *sia_object_new(void);
 	void sia_object_free(sia_object_t *o);
+	// A copy of o shortened to length bytes, or NULL when o is NULL. The last
+	// retained slab is shortened and any slab past it is dropped; a length at or
+	// above the current size copies it unchanged. o is untouched, so free both.
+	// Pin the result with sia_sdk_pin_object before the indexer knows about it.
+	sia_object_t *sia_object_truncate(const sia_object_t *o, uint64_t length);
+	// The ids of the slabs the object's data is spread across, which is what
+	// sia_sdk_slab takes. A slab id is derived from its contents rather than
+	// stored, so this is the only way to obtain one. sia_object_slab_id_at
+	// returns false when i is out of range, leaving out_id untouched.
+	size_t sia_object_slab_count(const sia_object_t *o);
+	bool sia_object_slab_id_at(const sia_object_t *o, size_t i, uint8_t out_id[32]);
 	void sia_object_id(const sia_object_t *o, uint8_t out[32]);
 	uint64_t sia_object_size(const sia_object_t *o);
 	uint64_t sia_object_encoded_size(const sia_object_t *o);
@@ -238,6 +280,18 @@ extern "C"
 	// Writes the public half, by which the indexer identifies the key. Safe to log.
 	void sia_sharing_key_public_key(const sia_sharing_key_t *key, uint8_t out[32]);
 
+	// *out_json receives a JSON array of hosts, each with publicKey, addresses
+	// (protocol and address), countryCode, latitude, longitude and
+	// goodForUpload. Free it with sia_string_free. It is JSON rather than a
+	// typed collection because a host's address list is variable length.
+	int32_t sia_sdk_hosts(const sia_sdk_t *sdk, const sia_host_query_t *query, sia_cancel_t *cancel, char **out_json, char **err);
+
+	// *out_json receives one pinned slab as a JSON object, with version, id,
+	// encryptionKey, minShards and sectors (each with root and hostKey). Free it
+	// with sia_string_free. encryptionKey is the slab's data key, so treat the
+	// result as secret.
+	int32_t sia_sdk_slab(const sia_sdk_t *sdk, const uint8_t id[32], sia_cancel_t *cancel, char **out_json, char **err);
+
 	int32_t sia_sdk_create_sharing_key(const sia_sdk_t *sdk, const char *description, bool has_expiry, int64_t expires_at_unix_us, sia_cancel_t *cancel, sia_sharing_key_t **out, char **err);
 	// *out_description receives an owned string. Free it with sia_string_free.
 	int32_t sia_sdk_sharing_key(const sia_sdk_t *sdk, const sia_sharing_key_t *key, sia_cancel_t *cancel, char **out_description, sia_key_stats_t *out_stats, char **err);
@@ -261,6 +315,29 @@ extern "C"
 	// from hosts for up to five more minutes.
 	int32_t sia_sdk_revoke_sharing_key(const sia_sdk_t *sdk, const sia_sharing_key_t *key, sia_cancel_t *cancel, char **err);
 
+	// The recipient side of a sharing key. sia_sdk_* above is the owner's half,
+	// authenticated with the app key; these authenticate with the sharing key
+	// itself and need no account. A shared SDK is read only: it cannot upload,
+	// pin or delete.
+	//
+	// seed is the whole credential, the 32 bytes sia_sharing_key_export writes.
+	// There is no registration or approval step.
+	int32_t sia_shared_sdk_connect(const char *indexer_url, const uint8_t seed[32], sia_cancel_t *cancel, sia_shared_sdk_t **out, char **err);
+	// Safe to call while a download started from this handle is still running;
+	// the download keeps its own token refresh alive.
+	void sia_shared_sdk_free(sia_shared_sdk_t *sdk);
+	int32_t sia_shared_sdk_stats(const sia_shared_sdk_t *sdk, sia_cancel_t *cancel, sia_key_stats_t *out_stats, char **err);
+	int32_t sia_shared_sdk_object(const sia_shared_sdk_t *sdk, const uint8_t id[32], sia_cancel_t *cancel, sia_object_t **out, char **err);
+	// *out_objs receives a heap array of owned object handles. Free the array
+	// (not the objects) with sia_object_array_free.
+	int32_t sia_shared_sdk_objects(const sia_shared_sdk_t *sdk, uint64_t offset, uint64_t limit, sia_cancel_t *cancel, sia_object_t ***out_objs, size_t *out_len, char **err);
+	// Reads with sia_download_read and frees with sia_download_free, like a
+	// download started from a sia_sdk_t. It keeps its own token refresh alive,
+	// so it stays usable after sia_shared_sdk_free.
+	int32_t sia_shared_sdk_download_start(const sia_shared_sdk_t *sdk, const sia_object_t *obj, const sia_download_options_t *opts, sia_download_t **out, char **err);
+	// The hosts serving this key's objects, in the same shape as sia_sdk_hosts.
+	int32_t sia_shared_sdk_hosts(const sia_shared_sdk_t *sdk, const sia_host_query_t *query, sia_cancel_t *cancel, char **out_json, char **err);
+
 // The mock backend is compiled only into a library built with the `mock` cargo
 // feature, so these are declared only when the consumer opts in with
 // -DSIA_STORAGE_MOCK. A production archive does not export them and linking
@@ -275,6 +352,9 @@ extern "C"
 	sia_mock_t *sia_mock_new(size_t num_hosts);
 	void sia_mock_free(sia_mock_t *m);
 	int32_t sia_mock_sdk(const sia_mock_t *m, const uint8_t app_key[32], sia_cancel_t *cancel, sia_sdk_t **out, char **err);
+	// The recipient half, served by the same mock network. Release with
+	// sia_shared_sdk_free.
+	int32_t sia_mock_shared_sdk(const sia_mock_t *m, const uint8_t seed[32], sia_cancel_t *cancel, sia_shared_sdk_t **out, char **err);
 	// Drops every sector the mock hosts hold, so downloading an object that was
 	// already uploaded fails the way it would if the hosts had lost the data.
 	void sia_mock_clear_sectors(const sia_mock_t *m);

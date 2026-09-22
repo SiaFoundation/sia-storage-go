@@ -105,6 +105,61 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (
 	return d, nil
 }
 
+// Download streams a shared object's data, paid for with the account tokens the
+// key's owner funds. It behaves exactly like [SDK.Download].
+//
+// The returned Download keeps its own token refresh alive, so it stays usable
+// after the SharedSDK it came from is closed.
+//
+// ctx cancels the whole transfer, not just the call that starts it.
+func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (*Download, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
+		return nil, errClosed
+	}
+
+	progressID := registerProgress(opts.OnShard)
+
+	copts := C.sia_download_options_t{
+		offset:              C.uint64_t(opts.Offset),
+		max_buffered_chunks: C.uint64_t(opts.MaxBufferedChunks),
+		userdata:            C.uintptr_t(progressID),
+	}
+	if opts.Length != nil {
+		copts.has_length = true
+		copts.length = C.uint64_t(*opts.Length)
+	}
+	if opts.OnShard != nil {
+		copts.on_shard = C.sia_go_progress_cb()
+	}
+
+	var ptr *C.sia_download_t
+	var cerr *C.char
+	code := C.sia_shared_sdk_download_start(s.ptr, obj.ptr, &copts, &ptr, &cerr)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(obj)
+	if code != C.SIA_OK {
+		unregisterProgress(progressID)
+		return nil, goError(ctx, code, cerr)
+	}
+
+	tok, tokenOwner := newStreamCancel(ctx)
+	d := &Download{
+		ptr:        ptr,
+		ctx:        ctx,
+		tok:        tok,
+		tokenOwner: tokenOwner,
+		progressID: progressID,
+	}
+	d.cleanup = runtime.AddCleanup(d, func(p *C.sia_download_t) {
+		C.sia_download_free(p)
+	}, ptr)
+	return d, nil
+}
+
 // Read fills p with recovered data, blocking until at least one byte is
 // available and then taking whatever else is ready without blocking again.
 // It returns [io.EOF] once the requested range is exhausted.

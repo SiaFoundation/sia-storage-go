@@ -58,4 +58,8 @@ var (
 	// ErrInvalidState is returned when a handle is used in a way its current
 	// state does not allow, such as finishing an upload twice.
 	ErrInvalidState = errors.New("invalid state for this operation")
+
+	// ErrOutOfRange is returned when an upload's StartOffset lies past the end
+	// of the object it would overwrite.
+	ErrOutOfRange = errors.New("start offset is past the end of the object")
 )

@@ -26,6 +26,19 @@ type UploadOptions struct {
 	// uses the SDK default, which is a share of system memory.
 	MaxBufferedSlabs uint64
 
+	// StartOffset makes the written data overwrite the object from that byte
+	// offset instead of appending to it. Only the slabs covering the rewritten
+	// range are re-uploaded. Nil appends.
+	//
+	// The finished object has a new id, because an id is derived from its
+	// slabs and an overwrite replaces some of them. Pin the result, and delete
+	// the old id if nothing else refers to it.
+	//
+	// Starting past the end of the object fails with [ErrOutOfRange].
+	// [SDK.PackedUpload] rejects a StartOffset outright with [ErrInvalidState],
+	// since a packed add always appends.
+	StartOffset *uint64
+
 	// OnShard is called for every shard that finishes uploading. It runs on a
 	// goroutine the upload owns rather than on the Rust thread that reported
 	// the shard, so it may block without stalling the transfer, though events
@@ -79,6 +92,10 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, opts UploadOptions) (*Upl
 		copts.data_shards = C.uint8_t(opts.DataShards)
 		copts.parity_shards = C.uint8_t(opts.ParityShards)
 		copts.set_redundancy = true
+	}
+	if opts.StartOffset != nil {
+		copts.has_start_offset = true
+		copts.start_offset = C.uint64_t(*opts.StartOffset)
 	}
 	if opts.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
