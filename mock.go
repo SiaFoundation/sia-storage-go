@@ -77,6 +77,28 @@ func (m *MockNetwork) SDK(ctx context.Context, appKeySeed [32]byte) (*SDK, error
 	return wrapSDK(ptr), nil
 }
 
+// SharedSDK returns a recipient side connection to the mock network for the
+// given sharing key seed. The result is an ordinary [SharedSDK].
+func (m *MockNetwork) SharedSDK(ctx context.Context, seed [32]byte) (*SharedSDK, error) {
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, errClosed
+	}
+
+	var ptr *C.sia_shared_sdk_t
+	var cerr *C.char
+	code := C.sia_mock_shared_sdk(m.ptr, cBytes32(&seed), tok, &ptr, &cerr)
+	runtime.KeepAlive(m)
+	if code != C.SIA_OK {
+		return nil, goError(ctx, code, cerr)
+	}
+	return wrapSharedSDK(ptr), nil
+}
+
 // ClearSectors drops every sector the hosts hold, so a download of an object
 // already uploaded fails the way it would if the hosts had lost the data.
 func (m *MockNetwork) ClearSectors() {

@@ -260,6 +260,7 @@ const (
 	statusInvalidHandle     = int32(C.SIA_ERR_INVALID_HANDLE)
 	statusNotEnoughShards   = int32(C.SIA_ERR_NOT_ENOUGH_SHARDS)
 	statusNoMoreHosts       = int32(C.SIA_ERR_NO_MORE_HOSTS)
+	statusOutOfRange        = int32(C.SIA_ERR_OUT_OF_RANGE)
 )
 
 // localError is goError for the calls that reach no indexer and take no
