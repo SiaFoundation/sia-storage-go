@@ -27,6 +27,7 @@ linters:
         - (*go.sia.tech/siastorage.Object).Close
         - (*go.sia.tech/siastorage.PackedUpload).Close
         - (*go.sia.tech/siastorage.SDK).Close
+        - (*go.sia.tech/siastorage.SharedSDK).Close
         - (*go.sia.tech/siastorage.SharingKey).Close
         - (*go.sia.tech/siastorage.Upload).Close
         # Sync on a console logger returns an error on some platforms that no
