@@ -62,6 +62,12 @@ func (s *SDK) PackedUpload(ctx context.Context, opts UploadOptions) (*PackedUplo
 		copts.parity_shards = C.uint8_t(opts.ParityShards)
 		copts.set_redundancy = true
 	}
+	if opts.StartOffset != nil {
+		// Refused by the native side rather than dropped, since a packed add
+		// always appends.
+		copts.has_start_offset = true
+		copts.start_offset = C.uint64_t(*opts.StartOffset)
+	}
 	if opts.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}

@@ -32,6 +32,8 @@ func mapError(code int32, msg string) error {
 		return &wrappedError{msg: msg, sentinel: ErrNotEnoughShards}
 	case statusNoMoreHosts:
 		return &wrappedError{msg: msg, sentinel: ErrNoMoreHosts}
+	case statusOutOfRange:
+		return &wrappedError{msg: msg, sentinel: ErrOutOfRange}
 	case statusInvalidHandle:
 		// The C ABI returns this one without setting *err, so there is no
 		// message to fall through to. It means a nil handle reached the
