@@ -5,7 +5,6 @@ package siastorage
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -226,8 +225,11 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	if !json.Valid(sealed) {
-		t.Fatalf("the sealed form is not valid JSON: %s", sealed)
+	if sealed.ID() != uploaded.ID() {
+		t.Fatalf("the sealed form has ID %v, the object %v", sealed.ID(), uploaded.ID())
+	}
+	if len(sealed.EncryptedDataKey) == 0 || len(sealed.Slabs) == 0 {
+		t.Fatal("the sealed form decoded with empty fields, so a name disagrees")
 	}
 
 	opened, err := sdk.ObjectFromSealed(sealed)
@@ -288,15 +290,34 @@ func TestSealedObjectRejectsForeignKey(t *testing.T) {
 	}
 }
 
-// TestSealedObjectRejectsGarbage proves a malformed document is an error rather
-// than a panic crossing the boundary.
-func TestSealedObjectRejectsGarbage(t *testing.T) {
+// TestSealedObjectRejectsInvalid proves a sealed object that does not verify is
+// an error rather than a handle that reads nothing. The typed API rules out the
+// malformed document, so what is left is one that decodes and then fails.
+func TestSealedObjectRejectsInvalid(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	for _, bad := range [][]byte{nil, []byte(""), []byte("{"), []byte(`{"slabs":[]}`)} {
+	uploaded := uploadPinned(t, sdk, payload(1<<20))
+	defer uploaded.Close()
+	sealed, err := sdk.SealObject(uploaded)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	tampered := sealed
+	tampered.EncryptedDataKey = append([]byte(nil), sealed.EncryptedDataKey...)
+	tampered.EncryptedDataKey[0] ^= 0xff
+
+	noSlabs := sealed
+	noSlabs.Slabs = nil
+
+	for name, bad := range map[string]SealedObject{
+		"the zero value":      {},
+		"an object no slabs":  noSlabs,
+		"a tampered data key": tampered,
+	} {
 		if obj, err := sdk.ObjectFromSealed(bad); err == nil {
 			obj.Close()
-			t.Fatalf("%q opened as a sealed object", bad)
+			t.Fatalf("%s opened as a sealed object", name)
 		}
 	}
 }
