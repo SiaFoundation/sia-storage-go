@@ -8,7 +8,10 @@
 extern void goShardProgress(uintptr_t userdata, sia_shard_progress_t* progress);
 extern void goLogMessage(uintptr_t userdata, int32_t level, char* target, char* message);
 
-static inline sia_progress_cb_t sia_go_progress_cb(void) { return goShardProgress; }
-static inline sia_log_cb_t sia_go_log_cb(void) { return goLogMessage; }
+// The callback typedefs take their pointers as const. cgo writes these
+// prototypes from the Go signatures and cannot const qualify them, so the
+// getters cast. const carries no calling convention, so the call is the same.
+static inline sia_progress_cb_t sia_go_progress_cb(void) { return (sia_progress_cb_t)goShardProgress; }
+static inline sia_log_cb_t sia_go_log_cb(void) { return (sia_log_cb_t)goLogMessage; }
 
 #endif // SIA_STORAGE_GO_H
