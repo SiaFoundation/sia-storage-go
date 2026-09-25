@@ -185,10 +185,12 @@ func parseAppKey(s string) (types.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode app key: %w", err)
 	}
-	if len(raw) < 32 {
-		return nil, fmt.Errorf("an app key is at least 32 bytes, got %d", len(raw))
+	if len(raw) != 32 {
+		return nil, fmt.Errorf("an app key seed is 32 bytes, got %d", len(raw))
 	}
-	return types.PrivateKey(raw), nil
+	// The same seed the cgo demo prints. The native engine wants the derived
+	// ed25519 key, which is twice as long.
+	return types.NewPrivateKeyFromSeed(raw), nil
 }
 
 func mustAppID(s string) types.Hash256 {
