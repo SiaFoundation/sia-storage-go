@@ -15,6 +15,13 @@
 //     success, and passing a null one is undefined.
 //   - Blocking functions accept an optional sia_cancel_t. Cancelling the
 //     token unblocks the call with SIA_ERR_CANCELLED.
+//   - Threading: every handle may be moved between threads freely. Whether it
+//     may be used from two at once is what the pointer's constness says. A
+//     call taking a const handle may run concurrently with other const calls
+//     on the same handle; a call taking a non-const one needs exclusive use of
+//     it, so serialise those yourself. sia_cancel_cancel is const for exactly
+//     this reason: cancelling from another thread is how a blocked call is
+//     meant to be unblocked.
 //   - Timestamps are Unix microseconds (UTC).
 #ifndef SIA_STORAGE_H
 #define SIA_STORAGE_H
@@ -87,12 +94,13 @@ extern "C"
 	} sia_shard_progress_t;
 
 	// Invoked from arbitrary Rust runtime threads. Implementations must be
-	// thread-safe, must not call back into this library, and must not retain or
-	// mutate the pointed-to data past the call.
-	typedef void (*sia_progress_cb_t)(uintptr_t userdata, sia_shard_progress_t *progress);
+	// thread-safe, must not call back into this library, and must not retain
+	// the pointed-to data past the call.
+	typedef void (*sia_progress_cb_t)(uintptr_t userdata, const sia_shard_progress_t *progress);
 
 	// level: 1=error 2=warn 3=info 4=debug 5=trace
-	typedef void (*sia_log_cb_t)(uintptr_t userdata, int32_t level, char *target, char *message);
+	// target and message are borrowed for the call, under the same terms.
+	typedef void (*sia_log_cb_t)(uintptr_t userdata, int32_t level, const char *target, const char *message);
 
 	typedef struct
 	{
@@ -146,13 +154,16 @@ extern "C"
 
 	// Installs a process-wide logger bridging the Rust `log` crate.
 	// May only be called once; subsequent calls are ignored.
+	//
+	// max_level uses the level scale above and admits everything at or below
+	// it. 0 or less logs nothing, and a value past 5 is treated as 5.
 	void sia_set_logger(sia_log_cb_t cb, uintptr_t userdata, int32_t max_level);
 
 	// Returns a new BIP-39 12-word recovery phrase. Free with sia_string_free.
 	char *sia_generate_recovery_phrase(void);
 
 	sia_cancel_t *sia_cancel_new(void);
-	void sia_cancel_cancel(sia_cancel_t *c);
+	void sia_cancel_cancel(const sia_cancel_t *c);
 	void sia_cancel_free(sia_cancel_t *c);
 
 	// app_meta_json: {"appID":"<hex>","name":...,"description":...,"serviceURL":...,
@@ -161,6 +172,9 @@ extern "C"
 	void sia_builder_free(sia_builder_t *b);
 	// Returns SIA_ERR_UNAUTHORIZED when the app key is not authorized.
 	int32_t sia_builder_connect(sia_builder_t *b, const uint8_t app_key[32], sia_cancel_t *cancel, sia_sdk_t **out, char **err);
+	// Cancelling request_connection or register consumes the builder; the flow
+	// starts again from a new one. Cancelling wait_for_approval only stops
+	// waiting, and calling it again reattaches to the same request.
 	int32_t sia_builder_request_connection(sia_builder_t *b, sia_cancel_t *cancel, char **response_url, char **err);
 	int32_t sia_builder_wait_for_approval(sia_builder_t *b, sia_cancel_t *cancel, char **err);
 	int32_t sia_builder_register(sia_builder_t *b, const char *mnemonic, sia_cancel_t *cancel, sia_sdk_t **out, char **err);
@@ -203,14 +217,19 @@ extern "C"
 
 	size_t sia_events_len(const sia_events_t *evs);
 	// Transfers ownership of the event's object (NULL for deletions) to the
-	// caller. Call at most once per index. Returns false when i is out of range,
+	// caller. Returns false when i is out of range or has already been read,
 	// leaving every out param untouched.
 	bool sia_events_at(sia_events_t *evs, size_t i, uint8_t id_out[32], bool *deleted, int64_t *updated_at_unix_us, sia_object_t **obj);
 	void sia_events_free(sia_events_t *evs);
 
 	// The upload streams data pushed via sia_upload_write. Call sia_upload_finish
-	// to signal EOF and wait for completion; it returns the updated object.
-	// sia_upload_free aborts the upload if it is still running.
+	// to signal EOF and wait for completion; it returns the finished object.
+	//
+	// Pass a NULL obj to upload into a fresh object, which is the common case.
+	// Pass an existing one with start_offset to overwrite part of it, or
+	// without one to append the data to its slabs.
+	// An object passed here is borrowed rather than consumed: it is still the
+	// caller's to free, and the object finish returns is a different one.
 	//
 	// *written always reports how many bytes of data reached the upload, on every
 	// status including SIA_ERR_CANCELLED. A cancelled write is not an error the
@@ -218,7 +237,11 @@ extern "C"
 	// be NULL if the caller does not want the count, but then a cancelled write
 	// cannot be resumed safely.
 	//
-	// sia_upload_finish consumes the upload whatever it returns. On
+	// A len of 0 is a no-op returning SIA_OK, whatever data is, and the same
+	// holds for sia_packed_upload_add_write.
+	//
+	// sia_upload_finish leaves the upload unusable whatever it returns, but does
+	// not release it: call sia_upload_free afterwards either way. On
 	// SIA_ERR_CANCELLED it aborts the transfer rather than leaving it running, so
 	// a cancelled finish yields no object and uploads nothing further.
 	int32_t sia_upload_start(const sia_sdk_t *sdk, const sia_object_t *obj, const sia_upload_options_t *opts, sia_upload_t **out, char **err);
@@ -228,8 +251,9 @@ extern "C"
 
 	// sia_download_read blocks until at least one byte is available and then
 	// opportunistically fills as much of buf as is ready without blocking again.
-	// *n == 0 signals EOF. sia_download_free cancels any in-flight recovery; it
-	// must not race a blocked sia_download_read — cancel first.
+	// *n == 0 signals EOF, so a cap of 0 is rejected with SIA_ERR rather than
+	// read as one. sia_download_free cancels any in-flight recovery; it must not
+	// race a blocked sia_download_read — cancel first.
 	int32_t sia_download_start(const sia_sdk_t *sdk, const sia_object_t *obj, const sia_download_options_t *opts, sia_download_t **out, char **err);
 	int32_t sia_download_read(sia_download_t *dl, uint8_t *buf, size_t cap, sia_cancel_t *cancel, size_t *n, char **err);
 	void sia_download_free(sia_download_t *dl);
@@ -238,6 +262,10 @@ extern "C"
 	// object's data is exhausted, then add_finish (which reports the number of
 	// bytes packed). finalize returns the packed objects.
 	int32_t sia_packed_upload_start(const sia_sdk_t *sdk, const sia_upload_options_t *opts, sia_packed_upload_t **out, char **err);
+	// Both return immediately, including while an add is in progress. During an
+	// add they report the figures from before it began, since the bytes it will
+	// contribute are not settled until add_finish. Call them between adds for
+	// an exact answer.
 	uint64_t sia_packed_upload_remaining(const sia_packed_upload_t *up);
 	uint64_t sia_packed_upload_length(const sia_packed_upload_t *up);
 	uint64_t sia_packed_upload_optimal_data_size(const sia_packed_upload_t *up);
@@ -252,6 +280,15 @@ extern "C"
 	int32_t sia_packed_upload_add_abort(sia_packed_upload_t *up, sia_cancel_t *cancel, char **err);
 	// *out_objs receives a heap array of owned object handles. Free the array
 	// (not the objects) with sia_object_array_free.
+	//
+	// finalize refuses with SIA_ERR_INVALID_STATE while an add is attached,
+	// which a cancelled add_finish or add_abort leaves it, so retry that call
+	// first. Refusing costs nothing: the upload is untouched.
+	//
+	// finalize consumes the upload whatever it returns, as sia_upload_finish
+	// does. On SIA_ERR_CANCELLED it abandons the slabs still in flight and
+	// yields no objects. Release the handle with sia_packed_upload_free either
+	// way.
 	int32_t sia_packed_upload_finalize(sia_packed_upload_t *up, sia_cancel_t *cancel, sia_object_t ***out_objs, size_t *out_len, char **err);
 	void sia_object_array_free(sia_object_t **objs, size_t len);
 	void sia_packed_upload_free(sia_packed_upload_t *up);
