@@ -53,6 +53,7 @@ jobs:
           repository: SiaFoundation/sia-sdk-rs
           ref: ${{ env.SIA_SDK_RS_REF }}
           path: sia-sdk-rs
+          persist-credentials: false
       - id: rev
         run: echo "sha=$(git -C sia-sdk-rs rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -88,12 +89,18 @@ jobs:
             llvm_mingw: "20260908"
             llvm_mingw_sha256: "2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092"
     steps:
+      # cargo runs build scripts from the sia-sdk-rs checkout, and the ref it
+      # came from is a branch anyone with write access can move. Neither
+      # checkout leaves a token on disk for them to find.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: SiaFoundation/sia-sdk-rs
           ref: ${{ needs.resolve.outputs.sha }}
           path: sia-sdk-rs
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
