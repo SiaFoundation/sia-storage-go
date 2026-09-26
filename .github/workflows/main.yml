@@ -3,7 +3,13 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - master
+
+# sia_storage_cabi has not merged to sia-sdk-rs master yet, so every checkout
+# of it has to name the branch that carries the crate. Change this to master
+# once it lands there; it is the only line that needs to move.
+env:
+  SIA_SDK_RS_REF: matt/cabi
 
 jobs:
   lint:
@@ -19,6 +25,8 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
+      # No Rust and no archive: cgo type checks without linking, so lint runs
+      # against a bare checkout.
       - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
           working-directory: ${{ matrix.dir }}
@@ -28,35 +36,210 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      POSTGRES_USER: indexd_test
-      POSTGRES_PASSWORD: indexd_test
-      POSTGRES_DB: indexd_test
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_USER: indexd_test
-          POSTGRES_PASSWORD: indexd_test
-          POSTGRES_DB: indexd_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
-      - name: Cache GeoLite2 database
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          path: GeoLite2-City.mmdb
-          key: geolite2-city-mmdb-2026-04
+          repository: SiaFoundation/sia-sdk-rs
+          ref: ${{ env.SIA_SDK_RS_REF }}
+          path: sia-sdk-rs
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: sia-sdk-rs
+      # The Go tests link the committed archive, which the Build FFI Libraries
+      # workflow produced. Nothing here builds one: an archive compiled in this
+      # job would not be the archive that ships.
+      - name: Check the archive is present
+        run: |
+          a=ffi/lib/linux_amd64/libsia_storage_cabi.a
+          if [ ! -f "$a" ]; then
+            echo "FAIL: $a is missing, so the Go tests cannot link."
+            echo "Run the Build FFI Libraries workflow and merge the PR it opens."
+            exit 1
+          fi
+          make check-no-mock
+      # The vendored header is the contract between the cgo declarations and
+      # the Rust. Checked before make testlib, which would otherwise re-sync
+      # it and hide the drift.
+      - name: Check header
+        run: make check-header SIA_SDK_RS=sia-sdk-rs
+      # Covers the C ABI itself, including the streaming roundtrip against
+      # in-process hosts. Go tests cannot reach cgo directly, so the entry
+      # points are exercised here.
+      - name: Test FFI crate
+        run: cargo test --manifest-path sia-sdk-rs/sia_storage_cabi/Cargo.toml --features mock
+      # Runs before the mock archive is built, so it links what ships and does
+      # not pay for the cache clean that make testlib ends with.
       - name: Test
         uses: n8maninger/action-golang-test@aa292dc81b16d34406a9551e629e0cdca00d9418 # v2.2.1
         with:
           args: -race;-failfast
+      # Almost every test is behind this tag, so without it CI covers the
+      # progress sink and the JSON tags and nothing else. The archive is built
+      # here rather than committed, and is never shipped.
+      - name: Build the mock archive
+        run: make testlib SIA_SDK_RS=sia-sdk-rs
+      - name: Test against the mock network
+        run: go test -race -failfast -timeout 20m -tags siastorage_mock ./...
+
+  archives:
+    name: Archives
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      # An archive built on a developer machine cannot be traced back to a
+      # revision and cannot be reproduced by anyone else, so only the Build FFI
+      # Libraries workflow may commit one.
+      #
+      # The question is who authored the commits that touched ffi/lib/, not who
+      # opened the pull request. Checking the author of the PR rejects any
+      # branch that legitimately carries archives the bot committed earlier: a
+      # feature branch proposed against master contains every archive, simply
+      # because master has none.
+      - name: Reject hand-committed archives
+        run: |
+          base="origin/${{ github.base_ref }}"
+          commits=$(git log --format='%H' "$base..HEAD" -- ffi/lib/)
+          if [ -z "$commits" ]; then
+            echo "ok: no commit here touches ffi/lib/"
+            exit 0
+          fi
+          bad=""
+          for c in $commits; do
+            author=$(git log -1 --format='%an' "$c")
+            if [ "$author" != "github-actions[bot]" ]; then
+              bad="$bad$(git log -1 --format='  %h  %an  %s' "$c")\n"
+            fi
+          done
+          if [ -z "$bad" ]; then
+            echo "ok: every archive commit came from the Build FFI Libraries workflow"
+            git log --format='  %h  %s' "$base..HEAD" -- ffi/lib/
+            exit 0
+          fi
+          echo "FAIL: these commits change ffi/lib/ but were not made by the workflow:"
+          printf "$bad"
+          echo
+          echo "Archives may only be committed by the Build FFI Libraries workflow."
+          echo "Run it from the Actions tab and it will open a PR with all five"
+          echo "platforms. To use one locally without committing it, run"
+          echo "'make fetch-lib'."
+          exit 1
+
+  lint-mock:
+    name: Lint (mock tag)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      # Needs no Rust and no archive: cgo type checks without linking. Without
+      # this pass the mock tests and the mock-only example shims are linted
+      # nowhere, which is how two unused parameters survived.
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+        with:
+          args: --build-tags=siastorage_mock ./...
+          skip-cache: true
+
+  link:
+    name: Link (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      # Every platform is reported, rather than the first failure hiding the
+      # rest. A bad archive is usually bad on one platform only.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - platform: linux_arm64
+            os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - platform: darwin_arm64
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+          # No Intel macOS runner, so this one cross compiles. clang needs the
+          # architecture spelled out or it produces an arm64 object that will
+          # not link against the amd64 archive.
+          - platform: darwin_amd64
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            cross_cc: clang -arch x86_64
+          - platform: windows_amd64
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+          # No runner ships a C compiler targeting windows on arm64, so this
+          # one cross compiles with the same llvm-mingw the archive was built
+          # with.
+          - platform: windows_arm64
+            os: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            cross_cc: aarch64-w64-mingw32-clang
+            llvm_mingw: "20260908"
+            llvm_mingw_sha256: "2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26"
+      # Proves the committed archive for this platform actually links. Four of
+      # the five were never exercised, so a truncated or wrong-arch .a could
+      # ship and only fail for whoever imported the module.
+      #
+      # go build over several packages is documented to discard the result and
+      # only check that they compile, so it does not necessarily link at all.
+      # go test -c does, which is the whole point here.
+      - name: Install llvm-mingw
+        if: matrix.llvm_mingw != ''
+        env:
+          SHA256: ${{ matrix.llvm_mingw_sha256 }}
+        run: |
+          v='${{ matrix.llvm_mingw }}'
+          dir="llvm-mingw-$v-ucrt-ubuntu-22.04-x86_64"
+          tarball="$RUNNER_TEMP/$dir.tar.xz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz"
+          # A release asset can be replaced, and this compiler builds an
+          # archive we commit and ship. Check it before unpacking.
+          echo "$SHA256  $tarball" | sha256sum -c -
+          tar -xJf "$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
+      - name: Link against the committed archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CROSS_CC: ${{ matrix.cross_cc }}
+        run: |
+          a="ffi/lib/${{ matrix.platform }}/libsia_storage_cabi.a"
+          if [ ! -f "$a" ]; then
+            echo "FAIL: $a is missing. Run the Build FFI Libraries workflow."
+            exit 1
+          fi
+          if [ -n "$CROSS_CC" ]; then
+            export CC="$CROSS_CC"
+          fi
+          export CGO_ENABLED=1
+          go build ./...
+          go test -c -o "${RUNNER_TEMP}/linkcheck" .
+          echo "ok: $a links on ${{ matrix.platform }}"

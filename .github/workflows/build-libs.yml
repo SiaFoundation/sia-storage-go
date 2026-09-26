@@ -1,0 +1,217 @@
+# Builds the prebuilt FFI static libraries for every supported platform and
+# opens a PR committing them under ffi/lib/.
+#
+# This workflow is the ONLY supported way an archive enters this repository. A
+# locally built archive cannot be traced back to a revision and cannot be
+# reproduced by anyone else, so the Makefile has no target that writes one to
+# the committed path and the Archives check on main.yml rejects a hand-edited
+# ffi/lib/.
+#
+# GitHub only offers the Run workflow button for workflow_dispatch workflows
+# that exist on the default branch, so until this file reaches master the only
+# way to start it is a push. Pushing all five platform builds on every commit
+# would be wasteful, so the push path is gated on a marker in the commit
+# message:
+#
+#     git commit --allow-empty -m "refresh the FFI archives [build-libs]"
+#     git push
+#
+# Once this file is on the default branch, drop the push trigger and the
+# `if` on the resolve job and use the button instead.
+name: Build FFI Libraries
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "matt/**"
+
+# sia_storage_cabi has not merged to sia-sdk-rs master yet, so every checkout
+# of it has to name the branch that carries the crate. Change this to master
+# once it lands there; it is the only line that needs to move.
+env:
+  SIA_SDK_RS_REF: matt/cabi
+
+jobs:
+  # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
+  # job resolves `master` independently, so a merge landing mid-run would ship
+  # a set of archives built from two different revisions.
+  #
+  # Skipping this job skips build and commit with it, since both depend on it.
+  resolve:
+    name: Resolve sia-sdk-rs
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[build-libs]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: ${{ env.SIA_SDK_RS_REF }}
+          path: sia-sdk-rs
+          persist-credentials: false
+      - id: rev
+        run: echo "sha=$(git -C sia-sdk-rs rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - platform: darwin_arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - platform: darwin_amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - platform: linux_amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux_arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: windows_amd64
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+          # Cross compiled, because no runner ships a C compiler targeting
+          # windows on arm64 and ring builds C for the target.
+          - platform: windows_arm64
+            os: ubuntu-latest
+            target: aarch64-pc-windows-gnullvm
+            llvm_mingw: "20260908"
+            llvm_mingw_sha256: "2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092"
+    steps:
+      # cargo runs build scripts from the sia-sdk-rs checkout, and the ref it
+      # came from is a branch anyone with write access can move. Neither
+      # checkout leaves a token on disk for them to find.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: SiaFoundation/sia-sdk-rs
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: sia-sdk-rs
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      # ring compiles C and assembly for the target, so a Windows arm64 build
+      # needs a C compiler that targets it. windows-latest ships mingw-w64 for
+      # x86_64 only, and the msvc target is no use here because cgo drives a
+      # gcc compatible compiler. llvm-mingw provides one; the Rust gnullvm
+      # targets expect its ucrt flavour.
+      - name: Install llvm-mingw
+        if: matrix.llvm_mingw != ''
+        env:
+          SHA256: ${{ matrix.llvm_mingw_sha256 }}
+        run: |
+          v='${{ matrix.llvm_mingw }}'
+          dir="llvm-mingw-$v-ucrt-ubuntu-22.04-x86_64"
+          tarball="$RUNNER_TEMP/$dir.tar.xz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/$dir.tar.xz"
+          # A release asset can be replaced, and this compiler builds an
+          # archive we commit and ship. Check it before unpacking.
+          echo "$SHA256  $tarball" | sha256sum -c -
+          tar -xJf "$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
+      # The header is the contract with the cgo declarations. If it has drifted
+      # there is no point building an archive the Go side cannot call.
+      - name: Check header
+        run: make check-header SIA_SDK_RS=sia-sdk-rs
+      - name: Build
+        working-directory: sia-sdk-rs/sia_storage_cabi
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          # Without this the archive ships with debug information and is
+          # roughly twice the size. These archives live in git history, so the
+          # difference is permanent.
+          RUSTFLAGS: "-C strip=debuginfo"
+        run: cargo build --release --target ${{ matrix.target }}
+      # A mock linked archive shipped as production is what invalidated the
+      # original throughput benchmark. Catch it before it reaches a PR.
+      - name: Reject mock symbols
+        shell: bash
+        run: |
+          a=sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          n=$(nm -g "$a" 2>/dev/null | grep -c _sia_mock || true)
+          if [ "$n" != "0" ]; then echo "FAIL: archive exports $n mock symbols"; exit 1; fi
+          echo "ok: no mock symbols"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.platform }}
+          path: sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          if-no-files-found: error
+
+  commit:
+    name: Open PR
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+      - name: Place archives
+        run: |
+          for d in artifacts/*/; do
+            p=$(basename "$d")
+            mkdir -p "ffi/lib/$p"
+            mv "$d/libsia_storage_cabi.a" "ffi/lib/$p/"
+          done
+          # Without this there is no way to tell which Rust an archive came
+          # from short of rebuilding it and comparing.
+          cat > ffi/lib/PROVENANCE <<EOF
+          sia-sdk-rs: ${{ needs.resolve.outputs.sha }}
+          workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          cat ffi/lib/PROVENANCE
+      - name: Configure Git
+        run: |
+          git config --global user.name github-actions[bot]
+          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - name: Commit and open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Staged before the comparison because `git diff` ignores untracked
+          # files. On the first run nothing under ffi/lib/ is tracked yet, so
+          # comparing the worktree would report no change and skip the very
+          # commit that bootstraps the archives.
+          git add ffi/lib/
+          if git diff --cached --quiet -- ffi/lib/; then
+            echo "archives are unchanged from ${{ needs.resolve.outputs.sha }}, nothing to open"
+            exit 0
+          fi
+          # Branched from the ref this workflow was dispatched on, and the PR
+          # targets that same ref, so archives can be bootstrapped onto a
+          # feature branch before it merges.
+          branch="libs/refresh-${{ github.run_id }}"
+          git switch -c "$branch"
+          git commit -m "Refresh the FFI archives from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
+          git push --set-upstream origin "$branch"
+          body="Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
+
+          Every archive in this PR came from that workflow run. Nothing here was built on a developer machine."
+
+          if ! gh pr create --base "${{ github.ref_name }}" \
+               --title "Refresh the FFI archives" --body "$body"; then
+            echo "::warning::could not open the PR automatically. This usually"
+            echo "::warning::means 'Allow GitHub Actions to create and approve"
+            echo "::warning::pull requests' is off for the repo or org."
+            echo "The archives are pushed to $branch; open the PR by hand:"
+            echo "  ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.ref_name }}...$branch"
+          fi
