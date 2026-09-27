@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"io"
 	"os"
 	"runtime"
@@ -27,6 +29,11 @@ import (
 
 // A Sample is one upload and download of the same payload. The native harness
 // emits the same shape, so the two runs merge into one table.
+// betweenReps runs after each rep when the build provides one. The mock
+// network keeps every sector it is ever written, so without a hook to drop
+// them the harness outgrows what it is measuring.
+var betweenReps func()
+
 type Sample struct {
 	Engine       string `json:"engine"`
 	Rep          int    `json:"rep"`
@@ -53,10 +60,17 @@ func main() {
 		hosts   = flag.Int("hosts", 90, "mock host pool size; ignored against a real indexer")
 		slabs   = flag.Uint64("buffered-slabs", 0, "max buffered slabs; 0 uses the SDK default")
 		chunks  = flag.Uint64("buffered-chunks", 0, "max buffered download chunks; 0 uses the SDK default")
+		verbose = flag.Bool("v", false, "log the engine's own decisions, including the inflight limit")
 	)
 	flag.Parse()
 
 	ctx := context.Background()
+	if *verbose {
+		// Debug records from the Rust side, stderr so stdout stays samples.
+		cfg := zap.NewDevelopmentEncoderConfig()
+		siastorage.SetLogger(zap.New(zapcore.NewCore(
+			zapcore.NewConsoleEncoder(cfg), zapcore.Lock(os.Stderr), zap.DebugLevel)))
+	}
 	sdk, cleanup, err := connect(ctx, *indexer, *appKey, *hosts)
 	if err != nil {
 		die("connect: %v", err)
@@ -77,6 +91,9 @@ func main() {
 		}
 		if err := enc.Encode(s); err != nil {
 			die("encode: %v", err)
+		}
+		if betweenReps != nil {
+			betweenReps()
 		}
 	}
 }
