@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"io"
 	"os"
 	"runtime"
@@ -61,6 +63,7 @@ func main() {
 		size    = flag.Int64("size", 120<<20, "payload size in bytes")
 		reps    = flag.Int("reps", 3, "how many upload and download cycles to run")
 		keep    = flag.Bool("keep", false, "leave the uploaded objects on the network")
+		verbose = flag.Bool("v", false, "log the engine's own decisions, including the inflight limit")
 	)
 	flag.Parse()
 
@@ -73,7 +76,11 @@ func main() {
 	}
 
 	ctx := context.Background()
-	sdk, err := siastorage.NewBuilder(*indexer, benchApp).SDK(key)
+	var opts []siastorage.Option
+	if *verbose {
+		opts = append(opts, siastorage.WithLogger(benchLogger()))
+	}
+	sdk, err := siastorage.NewBuilder(*indexer, benchApp).SDK(key, opts...)
 	if err != nil {
 		die("connect: %v", err)
 	}
@@ -206,4 +213,14 @@ func mustAppID(s string) types.Hash256 {
 func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// benchLogger writes debug records to stderr, leaving stdout for the samples.
+func benchLogger() *zap.Logger {
+	cfg := zap.NewDevelopmentEncoderConfig()
+	return zap.New(zapcore.NewCore(
+		zapcore.NewConsoleEncoder(cfg),
+		zapcore.Lock(os.Stderr),
+		zap.DebugLevel,
+	))
 }

@@ -28,5 +28,6 @@ func connect(ctx context.Context, indexer, _ string, hosts int) (*siastorage.SDK
 		net.Close()
 		return nil, nil, err
 	}
+	betweenReps = net.ClearSectors
 	return sdk, func() { net.Close() }, nil
 }
