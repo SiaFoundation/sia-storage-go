@@ -33,6 +33,40 @@ type DownloadOptions struct {
 	OnShard func(ShardProgress)
 }
 
+// A DownloadOption sets a field on [DownloadOptions]. Pass options, or pass a
+// filled struct through [WithDownloadOptions], whichever reads better.
+type DownloadOption func(*DownloadOptions)
+
+// WithDownloadOptions supplies a whole [DownloadOptions] at once, for callers
+// that build one rather than composing options. Later options still override it.
+func WithDownloadOptions(o DownloadOptions) DownloadOption {
+	return func(dst *DownloadOptions) { *dst = o }
+}
+
+// WithDownloadRange bounds the read to length bytes starting at offset.
+func WithDownloadRange(offset, length uint64) DownloadOption {
+	return func(o *DownloadOptions) { o.Offset, o.Length = offset, &length }
+}
+
+// WithDownloadMaxBufferedChunks bounds how many recovered chunks are held in
+// memory. Zero uses the SDK default.
+func WithDownloadMaxBufferedChunks(n int) DownloadOption {
+	return func(o *DownloadOptions) { o.MaxBufferedChunks = uint64(n) }
+}
+
+// WithDownloadProgress registers a handler for every shard that finishes
+// downloading. See [DownloadOptions.OnShard] for the terms it runs under.
+func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
+	return func(o *DownloadOptions) { o.OnShard = fn }
+}
+
+func (o DownloadOptions) with(opts []DownloadOption) DownloadOptions {
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // A Download streams an object's data. It implements [io.ReadCloser], so
 // [io.Copy] drives it and the usual buffering wrappers apply.
 //
@@ -57,7 +91,8 @@ type Download struct {
 // Download begins streaming obj's data.
 //
 // ctx cancels the whole transfer, not just the call that starts it.
-func (s *SDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (*Download, error) {
+func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption) (*Download, error) {
+	o := DownloadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
@@ -66,18 +101,18 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(opts.OnShard)
+	progressID := registerProgress(o.OnShard)
 
 	copts := C.sia_download_options_t{
-		offset:              C.uint64_t(opts.Offset),
-		max_buffered_chunks: C.uint64_t(opts.MaxBufferedChunks),
+		offset:              C.uint64_t(o.Offset),
+		max_buffered_chunks: C.uint64_t(o.MaxBufferedChunks),
 		userdata:            C.uintptr_t(progressID),
 	}
-	if opts.Length != nil {
+	if o.Length != nil {
 		copts.has_length = true
-		copts.length = C.uint64_t(*opts.Length)
+		copts.length = C.uint64_t(*o.Length)
 	}
-	if opts.OnShard != nil {
+	if o.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 
@@ -112,7 +147,8 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (
 // after the SharedSDK it came from is closed.
 //
 // ctx cancels the whole transfer, not just the call that starts it.
-func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts DownloadOptions) (*Download, error) {
+func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption) (*Download, error) {
+	o := DownloadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
@@ -121,18 +157,18 @@ func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts DownloadOpti
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(opts.OnShard)
+	progressID := registerProgress(o.OnShard)
 
 	copts := C.sia_download_options_t{
-		offset:              C.uint64_t(opts.Offset),
-		max_buffered_chunks: C.uint64_t(opts.MaxBufferedChunks),
+		offset:              C.uint64_t(o.Offset),
+		max_buffered_chunks: C.uint64_t(o.MaxBufferedChunks),
 		userdata:            C.uintptr_t(progressID),
 	}
-	if opts.Length != nil {
+	if o.Length != nil {
 		copts.has_length = true
-		copts.length = C.uint64_t(*opts.Length)
+		copts.length = C.uint64_t(*o.Length)
 	}
-	if opts.OnShard != nil {
+	if o.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 

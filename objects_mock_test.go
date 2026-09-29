@@ -17,7 +17,7 @@ import (
 // the indexer. The upload itself only pins the slabs.
 func uploadPinned(t *testing.T, sdk *SDK, data []byte) *Object {
 	t.Helper()
-	obj := uploadPayload(t, sdk, data, UploadOptions{})
+	obj := uploadPayload(t, sdk, data)
 	if err := sdk.PinObject(context.Background(), obj); err != nil {
 		t.Fatalf("pin: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestObjectFetchByID(t *testing.T) {
 
 	// The fetched handle has to carry usable keys, not just the right numbers,
 	// so read it back through the download path.
-	dl, err := sdk.Download(context.Background(), fetched, DownloadOptions{})
+	dl, err := sdk.Download(context.Background(), fetched)
 	if err != nil {
 		t.Fatalf("download the fetched object: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestObjectShareURLRoundTrip(t *testing.T) {
 		t.Fatal("the shared URL resolved to a different object")
 	}
 
-	dl, err := sdk.Download(ctx, shared, DownloadOptions{})
+	dl, err := sdk.Download(ctx, shared)
 	if err != nil {
 		t.Fatalf("download the shared object: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestObjectShareURLRoundTrip(t *testing.T) {
 func TestObjectShareURLRequiresExpiry(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	uploaded := uploadPayload(t, sdk, payload(1<<20), UploadOptions{})
+	uploaded := uploadPayload(t, sdk, payload(1<<20))
 	defer uploaded.Close()
 
 	if _, err := sdk.ObjectShareURL(uploaded, time.Time{}); err == nil {
@@ -249,7 +249,7 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 	}
 
 	// The keys have to come back usable, not just the numbers.
-	dl, err := sdk.Download(ctx, opened, DownloadOptions{})
+	dl, err := sdk.Download(ctx, opened)
 	if err != nil {
 		t.Fatalf("download the opened object: %v", err)
 	}
