@@ -326,8 +326,8 @@ func goString(s *C.char) string {
 	return C.GoString(s)
 }
 
-// GenerateRecoveryPhrase returns a new 12 word BIP-39 recovery phrase, from
-// which [Builder.Register] derives an app key.
-func GenerateRecoveryPhrase() string {
+// NewSeedPhrase returns a new 12 word BIP-39 recovery phrase, from which
+// [Builder.Register] derives an app key.
+func NewSeedPhrase() string {
 	return goString(C.sia_generate_recovery_phrase())
 }

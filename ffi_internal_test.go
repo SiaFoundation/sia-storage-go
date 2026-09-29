@@ -11,13 +11,13 @@ import (
 // C ABI only through the wrappers in ffi.go. Anything the Go package does not
 // wrap is unreachable from a test, which is why the wrappers come first.
 
-// TestGenerateRecoveryPhrase proves the static library is linked into the test
-// binary, that the Rust side runs, and that a heap-allocated string crosses the
+// TestNewSeedPhrase proves the static library is linked into the test binary,
+// that the Rust side runs, and that a heap-allocated string crosses the
 // boundary and is freed by Go without tripping the allocator.
-func TestGenerateRecoveryPhrase(t *testing.T) {
+func TestNewSeedPhrase(t *testing.T) {
 	seen := make(map[string]struct{})
 	for range 32 {
-		phrase := GenerateRecoveryPhrase()
+		phrase := NewSeedPhrase()
 		words := strings.Fields(phrase)
 		if len(words) != 12 {
 			t.Fatalf("expected a 12 word recovery phrase, got %d words (%q)", len(words), phrase)

@@ -588,7 +588,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 // upload streams data in through io.Copy and returns the finished object.
 func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.WithUploadOptions(opts))
+	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadOptions(opts))
 	if err != nil {
 		return nil, err
 	}
