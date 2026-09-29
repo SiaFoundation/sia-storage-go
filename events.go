@@ -47,11 +47,6 @@ func (c EventCursor) IsZero() bool {
 	return c.After.IsZero() && c.AfterID == types.Hash256{}
 }
 
-// ObjectEvents lists changes to the account's objects in order, oldest first.
-//
-// A zero after starts from the beginning. A zero limit takes the indexer's
-// default. Reaching the end returns no events rather than an error, so a
-// consumer polls by passing the cursor it built from the last page.
 // pageArg converts a paging count for the C boundary. A negative value would
 // wrap to an enormous number there, so it means the same as zero: the
 // indexer's default.
@@ -62,6 +57,11 @@ func pageArg(n int) C.uint64_t {
 	return C.uint64_t(n)
 }
 
+// ObjectEvents lists changes to the account's objects in order, oldest first.
+//
+// A zero after starts from the beginning. A zero limit takes the indexer's
+// default. Reaching the end returns no events rather than an error, so a
+// consumer polls by passing the cursor it built from the last page.
 func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([]ObjectEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
