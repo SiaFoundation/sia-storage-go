@@ -85,7 +85,7 @@ if errors.Is(err, siastorage.ErrUnauthorized) {
 `io.Copy` drives both.
 
 ```go
-up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.UploadOptions{})
+up, err := sdk.Upload(ctx, siastorage.NewObject())
 if err != nil {
 	log.Fatal("failed to start upload:", err)
 }
@@ -112,7 +112,7 @@ if err := sdk.PinObject(ctx, obj); err != nil {
 Downloading takes the object back, optionally a byte range of it:
 
 ```go
-dl, err := sdk.Download(ctx, obj, siastorage.DownloadOptions{})
+dl, err := sdk.Download(ctx, obj)
 if err != nil {
 	log.Fatal("failed to start download:", err)
 }
@@ -138,7 +138,7 @@ Objects smaller than a slab waste the remainder of it. A packed upload fills
 one slab with several objects:
 
 ```go
-packed, err := sdk.PackedUpload(ctx, siastorage.UploadOptions{})
+packed, err := sdk.UploadPacked(ctx)
 if err != nil {
 	log.Fatal("failed to start packed upload:", err)
 }
@@ -195,6 +195,35 @@ account that shared them. `RevokeSharingKey` detaches every object at once,
 which is the only way to withdraw a seed already handed out. Downloads already
 in flight can keep reading for up to five more minutes, because the hosts were
 paid for those reads before the revocation.
+
+The recipient needs the indexer URL and the seed, and nothing else. No app key,
+no registration, no approval:
+
+```go
+shared, err := siastorage.ConnectShared(ctx, "https://sia.storage", seed)
+if err != nil {
+	log.Fatal("failed to connect with the seed:", err)
+}
+defer shared.Close()
+
+objects, err := shared.Objects(ctx, 0, 0) // zero offset and limit take the default page
+if err != nil {
+	log.Fatal("failed to list shared objects:", err)
+}
+for _, obj := range objects {
+	defer obj.Close()
+}
+
+dl, err := shared.Download(ctx, objects[0])
+if err != nil {
+	log.Fatal("failed to start download:", err)
+}
+defer dl.Close()
+```
+
+A `SharedSDK` is read only. `Stats` reports what the key grants, and `Object`
+fetches one by id. A download started from it keeps its own token refresh alive,
+so closing the `SharedSDK` while one is still reading does not break it.
 
 ## Development
 
