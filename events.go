@@ -52,7 +52,17 @@ func (c EventCursor) IsZero() bool {
 // A zero after starts from the beginning. A zero limit takes the indexer's
 // default. Reaching the end returns no events rather than an error, so a
 // consumer polls by passing the cursor it built from the last page.
-func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit uint64) ([]ObjectEvent, error) {
+// pageArg converts a paging count for the C boundary. A negative value would
+// wrap to an enormous number there, so it means the same as zero: the
+// indexer's default.
+func pageArg(n int) C.uint64_t {
+	if n < 0 {
+		return 0
+	}
+	return C.uint64_t(n)
+}
+
+func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([]ObjectEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -76,7 +86,7 @@ func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit uint64)
 	var evs *C.sia_events_t
 	var cerr *C.char
 	code := C.sia_sdk_object_events(s.ptr, hasCursor, afterMicro,
-		cBytes32((*[32]byte)(&afterID)), C.uint64_t(limit), tok, &evs, &cerr)
+		cBytes32((*[32]byte)(&afterID)), pageArg(limit), tok, &evs, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)

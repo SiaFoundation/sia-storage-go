@@ -185,7 +185,7 @@ func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error
 // the indexer's defaults.
 //
 // Every returned record carries a handle the caller owns and must Close.
-func (s *SDK) SharingKeys(ctx context.Context, offset, limit uint64) ([]KeyRecord, error) {
+func (s *SDK) SharingKeys(ctx context.Context, offset, limit int) ([]KeyRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -197,7 +197,7 @@ func (s *SDK) SharingKeys(ctx context.Context, offset, limit uint64) ([]KeyRecor
 
 	var recs *C.sia_key_records_t
 	var cerr *C.char
-	code := C.sia_sdk_sharing_keys(s.ptr, C.uint64_t(offset), C.uint64_t(limit), tok, &recs, &cerr)
+	code := C.sia_sdk_sharing_keys(s.ptr, pageArg(offset), pageArg(limit), tok, &recs, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
@@ -249,7 +249,7 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 // the indexer's defaults.
 //
 // Every returned object is a handle the caller owns and must Close.
-func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit uint64) ([]*Object, error) {
+func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit int) ([]*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key.mu.RLock()
@@ -265,7 +265,7 @@ func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit 
 	var n C.size_t
 	var cerr *C.char
 	code := C.sia_sdk_shared_objects(s.ptr, key.ptr,
-		C.uint64_t(offset), C.uint64_t(limit), tok, &objs, &n, &cerr)
+		pageArg(offset), pageArg(limit), tok, &objs, &n, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(key)
 	if code != C.SIA_OK {
