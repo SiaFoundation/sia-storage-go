@@ -55,7 +55,7 @@ func connect(ctx context.Context, opts connectOptions) (*siastorage.SDK, func(),
 
 	phrase := opts.RecoveryPhrase
 	if phrase == "" {
-		phrase = siastorage.GenerateRecoveryPhrase()
+		phrase = siastorage.NewSeedPhrase()
 		info("generated a recovery phrase, write it down or the account is unreachable:")
 		info("%s", phrase)
 	}

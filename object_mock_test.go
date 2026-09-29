@@ -16,7 +16,7 @@ import (
 // TestObjectEmpty covers the accessors on a fresh handle, before an upload has
 // given it slabs or timestamps.
 func TestObjectEmpty(t *testing.T) {
-	obj := NewObject()
+	obj := NewEmptyObject()
 	defer obj.Close()
 
 	if obj.Size() != 0 {
@@ -41,7 +41,7 @@ func TestObjectEmpty(t *testing.T) {
 // TestObjectMetadataRoundTrip proves metadata survives the boundary at sizes
 // either side of a single copy, and that clearing works.
 func TestObjectMetadataRoundTrip(t *testing.T) {
-	obj := NewObject()
+	obj := NewEmptyObject()
 	defer obj.Close()
 
 	for _, size := range []int{1, 31, 32, 33, 4096} {
@@ -62,7 +62,7 @@ func TestObjectMetadataRoundTrip(t *testing.T) {
 // TestObjectCloseIsIdempotent proves the cleanup and an explicit Close cannot
 // both free the same pointer.
 func TestObjectCloseIsIdempotent(t *testing.T) {
-	obj := NewObject()
+	obj := NewEmptyObject()
 	if err := obj.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestObjectCloseIsIdempotent(t *testing.T) {
 // being random, which is what lets a caller detect that two uploads produced
 // the same object.
 func TestObjectIDIsContentAddressed(t *testing.T) {
-	a, b := NewObject(), NewObject()
+	a, b := NewEmptyObject(), NewEmptyObject()
 	defer a.Close()
 	defer b.Close()
 
@@ -101,7 +101,7 @@ func TestHandleUseAfterClose(t *testing.T) {
 	_, sdk := testSDK(t)
 	ctx := context.Background()
 
-	obj := NewObject()
+	obj := NewEmptyObject()
 	obj.UpdateMetadata([]byte("something"))
 	if err := obj.Close(); err != nil {
 		t.Fatalf("close object: %v", err)
@@ -201,7 +201,7 @@ func TestSDKCloseDuringCall(t *testing.T) {
 // The race detector is what makes this test meaningful; it passes trivially
 // without -race.
 func TestObjectMetadataConcurrentAccess(t *testing.T) {
-	obj := NewObject()
+	obj := NewEmptyObject()
 	defer obj.Close()
 
 	values := [][]byte{

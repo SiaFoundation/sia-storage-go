@@ -103,7 +103,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 
 	// ---- upload, measured from the first byte offered to the object returned
 	start := time.Now()
-	up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
+	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
 	if err != nil {
 		return s, fmt.Errorf("upload start: %w", err)
 	}

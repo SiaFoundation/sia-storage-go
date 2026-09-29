@@ -42,8 +42,9 @@ type Object struct {
 	closed bool
 }
 
-// NewObject returns an empty object, ready to be given metadata and uploaded.
-func NewObject() *Object {
+// NewEmptyObject returns an empty object, ready to be given metadata and
+// uploaded.
+func NewEmptyObject() *Object {
 	return wrapObject(C.sia_object_new())
 }
 

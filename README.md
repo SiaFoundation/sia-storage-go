@@ -57,7 +57,7 @@ if err := builder.WaitForApproval(ctx); errors.Is(err, siastorage.ErrUserRejecte
 }
 
 // derive an app key from a BIP-39 recovery phrase and register it
-phrase := siastorage.GenerateRecoveryPhrase() // generate once — store securely
+phrase := siastorage.NewSeedPhrase() // generate once — store securely
 sdk, err := builder.Register(ctx, phrase)
 if err != nil {
 	log.Fatal("failed to register:", err)
@@ -85,7 +85,7 @@ if errors.Is(err, siastorage.ErrUnauthorized) {
 `io.Copy` drives both.
 
 ```go
-up, err := sdk.Upload(ctx, siastorage.NewObject())
+up, err := sdk.Upload(ctx, siastorage.NewEmptyObject())
 if err != nil {
 	log.Fatal("failed to start upload:", err)
 }
