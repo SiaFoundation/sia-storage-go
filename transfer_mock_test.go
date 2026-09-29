@@ -45,9 +45,9 @@ func payload(n int) []byte {
 }
 
 // uploadPayload runs a whole upload through io.Copy and returns the object.
-func uploadPayload(t *testing.T, sdk *SDK, data []byte, opts UploadOptions) *Object {
+func uploadPayload(t *testing.T, sdk *SDK, data []byte, opts ...UploadOption) *Object {
 	t.Helper()
-	up, err := sdk.Upload(context.Background(), NewObject(), opts)
+	up, err := sdk.Upload(context.Background(), NewObject(), opts...)
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestTransferRoundTrip(t *testing.T) {
 	net, sdk := transferSDK(t)
 	want := payload(payloadSize)
 
-	obj := uploadPayload(t, sdk, want, UploadOptions{})
+	obj := uploadPayload(t, sdk, want)
 	defer obj.Close()
 
 	if obj.Size() != uint64(len(want)) {
@@ -85,7 +85,7 @@ func TestTransferRoundTrip(t *testing.T) {
 		t.Fatal("the upload pinned no slabs")
 	}
 
-	dl, err := sdk.Download(context.Background(), obj, DownloadOptions{})
+	dl, err := sdk.Download(context.Background(), obj)
 	if err != nil {
 		t.Fatalf("download start: %v", err)
 	}
@@ -106,15 +106,12 @@ func TestTransferRange(t *testing.T) {
 	_, sdk := transferSDK(t)
 	want := payload(payloadSize)
 
-	obj := uploadPayload(t, sdk, want, UploadOptions{})
+	obj := uploadPayload(t, sdk, want)
 	defer obj.Close()
 
 	const offset, length = 1 << 20, 64 << 10
 	n := uint64(length)
-	dl, err := sdk.Download(context.Background(), obj, DownloadOptions{
-		Offset: offset,
-		Length: &n,
-	})
+	dl, err := sdk.Download(context.Background(), obj, WithDownloadRange(offset, n))
 	if err != nil {
 		t.Fatalf("download start: %v", err)
 	}
@@ -139,9 +136,9 @@ func TestTransferRedundancyOption(t *testing.T) {
 
 	// The default is 10 of 30. 5 of 20 is a valid alternative that clears the
 	// SDK's recovery probability floor and uses ten fewer shards.
-	fewer := uploadPayload(t, sdk, want, UploadOptions{DataShards: 5, ParityShards: 15})
+	fewer := uploadPayload(t, sdk, want, WithRedundancy(5, 15))
 	defer fewer.Close()
-	def := uploadPayload(t, sdk, want, UploadOptions{})
+	def := uploadPayload(t, sdk, want)
 	defer def.Close()
 
 	if fewer.Size() != def.Size() {
@@ -162,16 +159,14 @@ func TestTransferProgress(t *testing.T) {
 	var mu sync.Mutex
 	var events int
 	var transferred uint64
-	obj := uploadPayload(t, sdk, want, UploadOptions{
-		OnShard: func(p ShardProgress) {
-			mu.Lock()
-			defer mu.Unlock()
-			events++
-			if p.Transferred > transferred {
-				transferred = p.Transferred
-			}
-		},
-	})
+	obj := uploadPayload(t, sdk, want, WithUploadProgress(func(p ShardProgress) {
+		mu.Lock()
+		defer mu.Unlock()
+		events++
+		if p.Transferred > transferred {
+			transferred = p.Transferred
+		}
+	}))
 	defer obj.Close()
 
 	mu.Lock()
@@ -189,12 +184,12 @@ func TestTransferProgress(t *testing.T) {
 func TestTransferMissingSectors(t *testing.T) {
 	net, sdk := transferSDK(t)
 
-	obj := uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+	obj := uploadPayload(t, sdk, payload(payloadSize))
 	defer obj.Close()
 
 	net.ClearSectors()
 
-	dl, err := sdk.Download(context.Background(), obj, DownloadOptions{})
+	dl, err := sdk.Download(context.Background(), obj)
 	if err != nil {
 		// Failing at start is an acceptable shape for the same condition.
 		if !errors.Is(err, ErrNotEnoughShards) {
@@ -215,7 +210,7 @@ func TestTransferMissingSectors(t *testing.T) {
 func TestUploadCloseWithoutFinish(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewObject(), UploadOptions{})
+	up, err := sdk.Upload(context.Background(), NewObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -241,7 +236,7 @@ func TestUploadCloseWithoutFinish(t *testing.T) {
 func TestUploadCloseAfterFinish(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewObject(), UploadOptions{})
+	up, err := sdk.Upload(context.Background(), NewObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -269,10 +264,10 @@ func TestUploadCloseAfterFinish(t *testing.T) {
 func TestDownloadCloseUnblocksRead(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	obj := uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+	obj := uploadPayload(t, sdk, payload(payloadSize))
 	defer obj.Close()
 
-	dl, err := sdk.Download(context.Background(), obj, DownloadOptions{})
+	dl, err := sdk.Download(context.Background(), obj)
 	if err != nil {
 		t.Fatalf("download start: %v", err)
 	}
@@ -302,7 +297,7 @@ func TestUploadCancelledContext(t *testing.T) {
 	_, sdk := transferSDK(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	up, err := sdk.Upload(ctx, NewObject(), UploadOptions{})
+	up, err := sdk.Upload(ctx, NewObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -324,7 +319,7 @@ func TestUploadCancelledContext(t *testing.T) {
 func TestUploadEmptyWriteIsANoop(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewObject(), UploadOptions{})
+	up, err := sdk.Upload(context.Background(), NewObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -348,11 +343,11 @@ func TestSlowHostsAffectTransfers(t *testing.T) {
 
 	// The first upload pays for contracts and connections, which swamps the
 	// delay. Measuring it would say more about warmup than about hosts.
-	uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+	uploadPayload(t, sdk, payload(payloadSize))
 
 	timed := func() time.Duration {
 		start := time.Now()
-		uploadPayload(t, sdk, payload(payloadSize), UploadOptions{})
+		uploadPayload(t, sdk, payload(payloadSize))
 		return time.Since(start)
 	}
 

@@ -103,7 +103,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 
 	// ---- upload, measured from the first byte offered to the object returned
 	start := time.Now()
-	up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.UploadOptions{MaxBufferedSlabs: bufferedSlabs})
+	up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
 	if err != nil {
 		return s, fmt.Errorf("upload start: %w", err)
 	}
@@ -135,7 +135,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	// ---- download, with time to first byte split out, since a decentralised
 	// read pays a recovery cost before any data moves
 	start = time.Now()
-	dl, err := sdk.Download(ctx, obj, siastorage.DownloadOptions{MaxBufferedChunks: bufferedChunks})
+	dl, err := sdk.Download(ctx, obj, siastorage.WithDownloadMaxBufferedChunks(int(bufferedChunks)))
 	if err != nil {
 		return s, fmt.Errorf("download start: %w", err)
 	}
@@ -191,7 +191,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 // verify re-reads the object and checks it against the payload hash. It runs
 // outside the timed region, so correctness costs nothing in the numbers.
 func verify(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, want [32]byte) (bool, error) {
-	dl, err := sdk.Download(ctx, obj, siastorage.DownloadOptions{})
+	dl, err := sdk.Download(ctx, obj)
 	if err != nil {
 		return false, err
 	}

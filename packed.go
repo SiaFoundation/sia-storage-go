@@ -44,31 +44,32 @@ type PackedUpload struct {
 // progress options apply to the slabs the whole set lands in.
 //
 // ctx cancels the whole upload, not just the call that starts it.
-func (s *SDK) PackedUpload(ctx context.Context, opts UploadOptions) (*PackedUpload, error) {
+func (s *SDK) PackedUpload(ctx context.Context, opts ...UploadOption) (*PackedUpload, error) {
+	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(opts.OnShard)
+	progressID := registerProgress(o.OnShard)
 
 	copts := C.sia_upload_options_t{
-		max_buffered_slabs: C.uint64_t(opts.MaxBufferedSlabs),
+		max_buffered_slabs: C.uint64_t(o.MaxBufferedSlabs),
 		userdata:           C.uintptr_t(progressID),
 	}
-	if opts.DataShards > 0 && opts.ParityShards > 0 {
-		copts.data_shards = C.uint8_t(opts.DataShards)
-		copts.parity_shards = C.uint8_t(opts.ParityShards)
+	if o.DataShards > 0 && o.ParityShards > 0 {
+		copts.data_shards = C.uint8_t(o.DataShards)
+		copts.parity_shards = C.uint8_t(o.ParityShards)
 		copts.set_redundancy = true
 	}
-	if opts.StartOffset != nil {
+	if o.StartOffset != nil {
 		// Refused by the native side rather than dropped, since a packed add
 		// always appends.
 		copts.has_start_offset = true
-		copts.start_offset = C.uint64_t(*opts.StartOffset)
+		copts.start_offset = C.uint64_t(*o.StartOffset)
 	}
-	if opts.OnShard != nil {
+	if o.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 

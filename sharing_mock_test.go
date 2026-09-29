@@ -154,7 +154,7 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 	}
 	defer shared[0].Close()
 
-	dl, err := sdk.Download(ctx, shared[0], DownloadOptions{})
+	dl, err := sdk.Download(ctx, shared[0])
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}

@@ -341,7 +341,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	info("starting past the end reports ErrOutOfRange")
 
-	if _, err := sdk.PackedUpload(ctx, siastorage.UploadOptions{StartOffset: &at}); !errors.Is(err, siastorage.ErrInvalidState) {
+	if _, err := sdk.PackedUpload(ctx, siastorage.WithUploadStartOffset(at)); !errors.Is(err, siastorage.ErrInvalidState) {
 		fail("packed with a start offset", fmt.Errorf("wanted ErrInvalidState, got %v", err))
 	}
 	info("a packed upload refuses one, since it always appends")
@@ -466,7 +466,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	info("%d host(s) serve the key's objects", len(theirHosts))
 
 	stage("Download as the recipient, then close the SDK mid transfer")
-	dl, err := shard.Download(ctx, byID, siastorage.DownloadOptions{})
+	dl, err := shard.Download(ctx, byID)
 	if err != nil {
 		fail("SharedSDK.Download", err)
 	}
@@ -489,7 +489,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 	// -------------------------------------------------------- packed uploads
 	stage("Pack %d objects of %s into shared slabs", packedCount, bytes4(packedSize))
-	packed, err := sdk.PackedUpload(ctx, siastorage.UploadOptions{})
+	packed, err := sdk.PackedUpload(ctx)
 	if err != nil {
 		fail("PackedUpload", err)
 	}
@@ -588,7 +588,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 // upload streams data in through io.Copy and returns the finished object.
 func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.Upload(ctx, siastorage.NewObject(), opts)
+	up, err := sdk.Upload(ctx, siastorage.NewObject(), siastorage.WithUploadOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +610,7 @@ func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastora
 // uploadInto streams data into an existing object, which is what an overwrite
 // needs: the object carries the slabs the range is rewritten against.
 func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.Upload(ctx, obj, opts)
+	up, err := sdk.Upload(ctx, obj, siastorage.WithUploadOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +624,7 @@ func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object
 
 // download reads an object out through io.ReadAll.
 func download(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, opts siastorage.DownloadOptions) ([]byte, error) {
-	dl, err := sdk.Download(ctx, obj, opts)
+	dl, err := sdk.Download(ctx, obj, siastorage.WithDownloadOptions(opts))
 	if err != nil {
 		return nil, err
 	}
