@@ -47,6 +47,47 @@ type UploadOptions struct {
 	OnShard func(ShardProgress)
 }
 
+// An UploadOption sets a field on [UploadOptions]. Pass options, or pass a
+// filled struct through [WithUploadOptions], whichever reads better.
+type UploadOption func(*UploadOptions)
+
+// WithUploadOptions supplies a whole [UploadOptions] at once, for callers that
+// build one rather than composing options. Later options still override it.
+func WithUploadOptions(o UploadOptions) UploadOption {
+	return func(dst *UploadOptions) { *dst = o }
+}
+
+// WithRedundancy sets the slab's erasure coding. Both must be non zero to take
+// effect; leaving either at zero keeps the SDK default.
+func WithRedundancy(dataShards, parityShards uint8) UploadOption {
+	return func(o *UploadOptions) { o.DataShards, o.ParityShards = dataShards, parityShards }
+}
+
+// WithUploadMaxBufferedSlabs bounds how many encoded slabs are held in memory.
+// Zero uses the SDK default, which is a share of system memory.
+func WithUploadMaxBufferedSlabs(n int) UploadOption {
+	return func(o *UploadOptions) { o.MaxBufferedSlabs = uint64(n) }
+}
+
+// WithUploadProgress registers a handler for every shard that finishes
+// uploading. See [UploadOptions.OnShard] for the terms it runs under.
+func WithUploadProgress(fn func(ShardProgress)) UploadOption {
+	return func(o *UploadOptions) { o.OnShard = fn }
+}
+
+// WithUploadStartOffset overwrites the object from that byte offset instead of
+// appending. See [UploadOptions.StartOffset] for what that costs.
+func WithUploadStartOffset(offset uint64) UploadOption {
+	return func(o *UploadOptions) { o.StartOffset = &offset }
+}
+
+func (o UploadOptions) with(opts []UploadOption) UploadOptions {
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // An Upload streams data into an object. It implements [io.Writer], so
 // [io.Copy] drives it.
 //
@@ -73,7 +114,8 @@ type Upload struct {
 // finished object carries. Write the data, then call [Upload.Finish].
 //
 // ctx cancels the whole transfer, not just the call that starts it.
-func (s *SDK) Upload(ctx context.Context, obj *Object, opts UploadOptions) (*Upload, error) {
+func (s *SDK) Upload(ctx context.Context, obj *Object, opts ...UploadOption) (*Upload, error) {
+	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
@@ -82,22 +124,22 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, opts UploadOptions) (*Upl
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(opts.OnShard)
+	progressID := registerProgress(o.OnShard)
 
 	copts := C.sia_upload_options_t{
-		max_buffered_slabs: C.uint64_t(opts.MaxBufferedSlabs),
+		max_buffered_slabs: C.uint64_t(o.MaxBufferedSlabs),
 		userdata:           C.uintptr_t(progressID),
 	}
-	if opts.DataShards > 0 && opts.ParityShards > 0 {
-		copts.data_shards = C.uint8_t(opts.DataShards)
-		copts.parity_shards = C.uint8_t(opts.ParityShards)
+	if o.DataShards > 0 && o.ParityShards > 0 {
+		copts.data_shards = C.uint8_t(o.DataShards)
+		copts.parity_shards = C.uint8_t(o.ParityShards)
 		copts.set_redundancy = true
 	}
-	if opts.StartOffset != nil {
+	if o.StartOffset != nil {
 		copts.has_start_offset = true
-		copts.start_offset = C.uint64_t(*opts.StartOffset)
+		copts.start_offset = C.uint64_t(*o.StartOffset)
 	}
-	if opts.OnShard != nil {
+	if o.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 

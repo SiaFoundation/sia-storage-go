@@ -22,7 +22,7 @@ func TestPackedUploadRoundTrip(t *testing.T) {
 		payload(1 << 20),
 	}
 
-	pu, err := sdk.PackedUpload(ctx, UploadOptions{})
+	pu, err := sdk.PackedUpload(ctx)
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestPackedUploadRoundTrip(t *testing.T) {
 		if obj.Size() != uint64(len(want[i])) {
 			t.Fatalf("object %d is %d bytes, added %d", i, obj.Size(), len(want[i]))
 		}
-		dl, err := sdk.Download(ctx, obj, DownloadOptions{})
+		dl, err := sdk.Download(ctx, obj)
 		if err != nil {
 			t.Fatalf("download %d: %v", i, err)
 		}
@@ -76,7 +76,7 @@ func TestPackedUploadSharesSlabs(t *testing.T) {
 	net, sdk := transferSDK(t)
 	ctx := context.Background()
 
-	pu, err := sdk.PackedUpload(ctx, UploadOptions{})
+	pu, err := sdk.PackedUpload(ctx)
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestPackedUploadSharesSlabs(t *testing.T) {
 func TestPackedUploadAccounting(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	pu, err := sdk.PackedUpload(context.Background())
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestPackedUploadAccounting(t *testing.T) {
 func TestPackedUploadEmptyFinalize(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	pu, err := sdk.PackedUpload(context.Background())
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestPackedUploadCloseSemantics(t *testing.T) {
 	_, sdk := transferSDK(t)
 	ctx := context.Background()
 
-	pu, err := sdk.PackedUpload(ctx, UploadOptions{})
+	pu, err := sdk.PackedUpload(ctx)
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestPackedUploadCloseSemantics(t *testing.T) {
 	}
 
 	// The same again, retired by Finalize rather than Close.
-	other, err := sdk.PackedUpload(ctx, UploadOptions{})
+	other, err := sdk.PackedUpload(ctx)
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestPackedUploadCloseSemantics(t *testing.T) {
 func TestPackedUploadAddReaderError(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	pu, err := sdk.PackedUpload(context.Background())
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestPackedUploadAddReaderError(t *testing.T) {
 func TestPackedUploadSurvivesAFailedAdd(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	pu, err := sdk.PackedUpload(context.Background())
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
@@ -300,7 +300,7 @@ func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 func TestPackedUploadQueriesAfterClose(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	pu, err := sdk.PackedUpload(context.Background(), UploadOptions{})
+	pu, err := sdk.PackedUpload(context.Background())
 	if err != nil {
 		t.Fatalf("packed start: %v", err)
 	}
