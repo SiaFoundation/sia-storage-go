@@ -44,7 +44,7 @@ type PackedUpload struct {
 // progress options apply to the slabs the whole set lands in.
 //
 // ctx cancels the whole upload, not just the call that starts it.
-func (s *SDK) PackedUpload(ctx context.Context, opts ...UploadOption) (*PackedUpload, error) {
+func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUpload, error) {
 	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -105,7 +105,7 @@ func (s *SDK) PackedUpload(ctx context.Context, opts ...UploadOption) (*PackedUp
 // the failure stay in the slab and are paid for, but nothing references them,
 // so [PackedUpload.Finalize] still returns exactly one object per successful
 // Add, in order.
-func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
+func (p *PackedUpload) Add(r io.Reader) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done {
@@ -150,7 +150,7 @@ func (p *PackedUpload) Add(r io.Reader) (uint64, error) {
 	if code != C.SIA_OK {
 		return 0, goError(p.ctx, code, ferr)
 	}
-	return uint64(written), nil
+	return int64(written), nil
 }
 
 // abortAdd abandons an add that failed part way, so the pack is left with no
@@ -169,13 +169,13 @@ func (p *PackedUpload) abortAdd() {
 // zero once the upload has been finalized or closed.
 //
 // It blocks while an Add is running, because both take the same lock.
-func (p *PackedUpload) Remaining() uint64 {
+func (p *PackedUpload) Remaining() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done {
 		return 0
 	}
-	n := uint64(C.sia_packed_upload_remaining(p.ptr))
+	n := int64(C.sia_packed_upload_remaining(p.ptr))
 	runtime.KeepAlive(p)
 	return n
 }
@@ -183,13 +183,13 @@ func (p *PackedUpload) Remaining() uint64 {
 // Length reports how many bytes have been packed so far, and zero once the
 // upload has been finalized or closed. It blocks while an Add is running, as
 // Remaining does.
-func (p *PackedUpload) Length() uint64 {
+func (p *PackedUpload) Length() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done {
 		return 0
 	}
-	n := uint64(C.sia_packed_upload_length(p.ptr))
+	n := int64(C.sia_packed_upload_length(p.ptr))
 	runtime.KeepAlive(p)
 	return n
 }
@@ -197,13 +197,13 @@ func (p *PackedUpload) Length() uint64 {
 // OptimalDataSize reports the payload size that fills a slab exactly, which is
 // the size to aim a batch at, and zero once the upload has been finalized or
 // closed. It blocks while an Add is running, as Remaining does.
-func (p *PackedUpload) OptimalDataSize() uint64 {
+func (p *PackedUpload) OptimalDataSize() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done {
 		return 0
 	}
-	n := uint64(C.sia_packed_upload_optimal_data_size(p.ptr))
+	n := int64(C.sia_packed_upload_optimal_data_size(p.ptr))
 	runtime.KeepAlive(p)
 	return n
 }
