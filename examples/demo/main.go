@@ -341,7 +341,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	info("starting past the end reports ErrOutOfRange")
 
-	if _, err := sdk.PackedUpload(ctx, siastorage.WithUploadStartOffset(at)); !errors.Is(err, siastorage.ErrInvalidState) {
+	if _, err := sdk.UploadPacked(ctx, siastorage.WithUploadStartOffset(at)); !errors.Is(err, siastorage.ErrInvalidState) {
 		fail("packed with a start offset", fmt.Errorf("wanted ErrInvalidState, got %v", err))
 	}
 	info("a packed upload refuses one, since it always appends")
@@ -489,12 +489,12 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 	// -------------------------------------------------------- packed uploads
 	stage("Pack %d objects of %s into shared slabs", packedCount, bytes4(packedSize))
-	packed, err := sdk.PackedUpload(ctx)
+	packed, err := sdk.UploadPacked(ctx)
 	if err != nil {
 		fail("PackedUpload", err)
 	}
 	defer packed.Close()
-	info("a full slab holds %s", bytes4(packed.OptimalDataSize()))
+	info("a full slab holds %s", bytes4(uint64(packed.OptimalDataSize())))
 	small := make([][]byte, packedCount)
 	for i := range small {
 		small[i] = payload(packedSize)
@@ -502,7 +502,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 			fail("PackedUpload.Add", err)
 		}
 	}
-	info("%s packed, %s still free in the slab", bytes4(packed.Length()), bytes4(packed.Remaining()))
+	info("%s packed, %s still free in the slab", bytes4(uint64(packed.Length())), bytes4(uint64(packed.Remaining())))
 	packedObjs, err := packed.Finalize()
 	if err != nil {
 		fail("PackedUpload.Finalize", err)
