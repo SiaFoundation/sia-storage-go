@@ -19,9 +19,8 @@
 // receives. [NewBuilder] starts that flow; [Builder.Register] walks a new user
 // through approval, and [Builder.Connect] reuses a key already authorized.
 //
-// The app key is derived from a BIP-39 recovery phrase, which
-// [GenerateRecoveryPhrase] produces. Store it: the account cannot be reached
-// without it.
+// The app key is derived from a BIP-39 recovery phrase, which [NewSeedPhrase]
+// produces. Store it: the account cannot be reached without it.
 //
 // # Handles
 //
