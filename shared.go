@@ -127,7 +127,7 @@ func (s *SharedSDK) Object(ctx context.Context, id types.Hash256) (*Object, erro
 // zero offset and limit take the indexer's defaults.
 //
 // Every returned object is a handle the caller owns and must Close.
-func (s *SharedSDK) Objects(ctx context.Context, offset, limit uint64) ([]*Object, error) {
+func (s *SharedSDK) Objects(ctx context.Context, offset, limit int) ([]*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -140,7 +140,7 @@ func (s *SharedSDK) Objects(ctx context.Context, offset, limit uint64) ([]*Objec
 	var n C.size_t
 	var cerr *C.char
 	code := C.sia_shared_sdk_objects(s.ptr,
-		C.uint64_t(offset), C.uint64_t(limit), tok, &objs, &n, &cerr)
+		pageArg(offset), pageArg(limit), tok, &objs, &n, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
