@@ -104,6 +104,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
+          components: llvm-tools
       # ring compiles C and assembly for the target, so a Windows arm64 build
       # needs a C compiler that targets it. windows-latest ships mingw-w64 for
       # x86_64 only, and the msvc target is no use here because cgo drives a
@@ -128,11 +129,25 @@ jobs:
         working-directory: sia-sdk-rs/sia_storage_cabi
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
-          # Without this the archive ships with debug information and is
-          # roughly twice the size. These archives live in git history, so the
-          # difference is permanent.
-          RUSTFLAGS: "-C strip=debuginfo"
         run: cargo build --release --target ${{ matrix.target }}
+      # The debug information belongs to std and the dependencies, which ship
+      # prebuilt with it; this crate is built without any. Removing it shrinks
+      # each archive by about a quarter, and these live in git history, so the
+      # saving is permanent. `-C strip` does not do this: it acts at link time
+      # and a staticlib is never linked.
+      #
+      # Windows arm64 is skipped because llvm-strip rejects its archive as an
+      # unsupported format, though both windows targets are COFF and it handles
+      # the amd64 one.
+      - name: Strip debug information
+        if: matrix.target != 'aarch64-pc-windows-gnullvm'
+        shell: bash
+        run: |
+          export PATH="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin:$PATH"
+          a=sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          before=$(wc -c < "$a")
+          llvm-strip --strip-debug "$a"
+          echo "$a: $before -> $(wc -c < "$a") bytes"
       # A mock linked archive shipped as production is what invalidated the
       # original throughput benchmark. Catch it before it reaches a PR.
       - name: Reject mock symbols
