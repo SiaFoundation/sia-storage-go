@@ -124,10 +124,6 @@ jobs:
           echo "$SHA256  $tarball" | sha256sum -c -
           tar -xJf "$tarball" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/$dir/bin" >> "$GITHUB_PATH"
-      # The header is the contract with the cgo declarations. If it has drifted
-      # there is no point building an archive the Go side cannot call.
-      - name: Check header
-        run: make check-header SIA_SDK_RS=sia-sdk-rs
       - name: Build
         working-directory: sia-sdk-rs/sia_storage_cabi
         env:
@@ -161,11 +157,22 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Pinned to the same revision the archives were built from, so the header
+      # this commits is the one those archives actually implement. Checking the
+      # vendored copy against a branch instead would compare it to whatever
+      # sia-sdk-rs happens to be at, which is not what the archive exports.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ env.SDK_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: sia-sdk-rs
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
-      - name: Place archives
+      - name: Place archives and header
         run: |
+          cp sia-sdk-rs/sia_storage_cabi/include/sia_storage.h ffi/include/sia_storage.h
           for d in artifacts/*/; do
             p=$(basename "$d")
             mkdir -p "ffi/lib/$p"
@@ -191,9 +198,9 @@ jobs:
           # files. On the first run nothing under ffi/lib/ is tracked yet, so
           # comparing the worktree would report no change and skip the very
           # commit that bootstraps the archives.
-          git add ffi/lib/
-          if git diff --cached --quiet -- ffi/lib/; then
-            echo "archives are unchanged from ${{ needs.resolve.outputs.sha }}, nothing to open"
+          git add ffi/lib/ ffi/include/
+          if git diff --cached --quiet -- ffi/lib/ ffi/include/; then
+            echo "archives and header are unchanged from ${{ needs.resolve.outputs.sha }}, nothing to open"
             exit 0
           fi
           # Branched from the ref this workflow was dispatched on, and the PR
@@ -201,7 +208,7 @@ jobs:
           # feature branch before it merges.
           branch="libs/refresh-${{ github.run_id }}"
           git switch -c "$branch"
-          git commit -m "Refresh the FFI archives from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
+          git commit -m "Refresh the FFI archives and header from sia-sdk-rs ${{ needs.resolve.outputs.sha }}"
           git push --set-upstream origin "$branch"
           body="Built by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) from sia-sdk-rs \`${{ needs.resolve.outputs.sha }}\`.
 
