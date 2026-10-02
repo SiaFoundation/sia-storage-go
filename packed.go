@@ -40,7 +40,7 @@ type PackedUpload struct {
 	done bool
 }
 
-// PackedUpload starts packing objects into shared slabs. The redundancy and
+// UploadPacked starts packing objects into shared slabs. The redundancy and
 // progress options apply to the slabs the whole set lands in.
 //
 // ctx cancels the whole upload, not just the call that starts it.
