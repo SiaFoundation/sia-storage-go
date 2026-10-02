@@ -36,8 +36,8 @@ type PinnedSlab struct {
 
 // Slab retrieves one pinned slab from the indexer by its id.
 //
-// Get an id from [Object.SlabID]. A slab id is derived from the slab's contents
-// rather than stored, so there is no other way to name one.
+// A slab id is derived from the slab's contents rather than stored. Get one
+// from a [SealedObject]: types.Hash256(sealed.Slabs[i].Digest()).
 func (s *SDK) Slab(ctx context.Context, id types.Hash256) (PinnedSlab, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -81,47 +81,4 @@ func (o *Object) Truncate(length uint64) *Object {
 		return nil
 	}
 	return wrapObject(ptr)
-}
-
-// SlabCount reports how many slabs the object's data is spread across.
-func (o *Object) SlabCount() int {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return 0
-	}
-	n := int(C.sia_object_slab_count(o.ptr))
-	runtime.KeepAlive(o)
-	return n
-}
-
-// SlabID returns the id of the object's ith slab, which is what [SDK.Slab]
-// takes. It reports false when i is out of range.
-func (o *Object) SlabID(i int) (id types.Hash256, ok bool) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return types.Hash256{}, false
-	}
-	ok = bool(C.sia_object_slab_id_at(o.ptr, C.size_t(i), cBytes32((*[32]byte)(&id))))
-	runtime.KeepAlive(o)
-	if !ok {
-		return types.Hash256{}, false
-	}
-	return id, true
-}
-
-// SlabIDs returns the ids of every slab the object references.
-func (o *Object) SlabIDs() []types.Hash256 {
-	n := o.SlabCount()
-	if n == 0 {
-		return nil
-	}
-	ids := make([]types.Hash256, 0, n)
-	for i := range n {
-		if id, ok := o.SlabID(i); ok {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }

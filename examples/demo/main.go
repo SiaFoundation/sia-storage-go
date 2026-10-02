@@ -255,27 +255,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	info("nearest to Amsterdam: %d host(s)", len(near))
 
-	// ----------------------------------------------------------------- slabs
-	stage("Inspect the slabs the object is built from")
-	ids := fetched.SlabIDs()
-	if len(ids) == 0 {
-		fail("SlabIDs", fmt.Errorf("a %s object references no slabs", bytes4(fetched.Size())))
-	}
-	info("%d slab(s); an id is derived from a slab's contents, not stored", len(ids))
-	slab, err := sdk.Slab(ctx, ids[0])
-	if err != nil {
-		fail("Slab", err)
-	}
-	info("slab %v: %d of %d sectors needed, version %d",
-		slab.ID, slab.MinShards, len(slab.Sectors), slab.Version)
-	if len(slab.Sectors) > 0 {
-		info("first sector root %v on host %v", slab.Sectors[0].Root, slab.Sectors[0].HostKey)
-	}
-	if _, ok := fetched.SlabID(len(ids)); ok {
-		fail("SlabID", fmt.Errorf("an index past the end reported success"))
-	}
-	info("an out of range index reports false rather than a zero id")
-
 	// ---------------------------------------------------------------- sealed
 	stage("Seal the object and open it again")
 	sealed, err := sdk.SealObject(obj)
