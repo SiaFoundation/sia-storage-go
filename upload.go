@@ -35,7 +35,7 @@ type UploadOptions struct {
 	// the old id if nothing else refers to it.
 	//
 	// Starting past the end of the object fails with [ErrOutOfRange].
-	// [SDK.PackedUpload] rejects a StartOffset outright with [ErrInvalidState],
+	// [SDK.UploadPacked] rejects a StartOffset outright with [ErrInvalidState],
 	// since a packed add always appends.
 	StartOffset *uint64
 

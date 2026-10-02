@@ -16,16 +16,20 @@
 // # Getting started
 //
 // An application authorizes once against an indexer and reuses the app key it
-// receives. [NewBuilder] starts that flow; [Builder.Register] walks a new user
-// through approval, and [Builder.Connect] reuses a key already authorized.
+// receives. [NewBuilder] starts that flow. A new user is walked through
+// approval by [Builder.RequestConnection], which returns a URL for them to
+// visit, and [Builder.WaitForApproval], which blocks until they answer;
+// [Builder.Register] then derives the key and registers it. An application
+// holding a key already authorized skips all three and calls
+// [Builder.Connect].
 //
 // The app key is derived from a BIP-39 recovery phrase, which [NewSeedPhrase]
 // produces. Store it: the account cannot be reached without it.
 //
 // # Handles
 //
-// [SDK], [Object], [SharingKey], [Upload], [Download] and [PackedUpload] are
-// handles onto memory the native side owns. Each has a Close that releases it,
+// [Builder], [SDK], [Object], [SharingKey], [Upload], [Download] and
+// [PackedUpload] are handles onto memory the native side owns. Each has a Close that releases it,
 // and every one is safe to call more than once. Close waits for any call still
 // using the handle to return, so closing an SDK while a request is in flight
 // blocks until that request finishes rather than freeing underneath it.
@@ -39,5 +43,6 @@
 // network, so real erasure coding, encryption and the whole transfer pipeline
 // run with only the network itself faked. It needs an archive built with the
 // mock cargo feature, which `make testlib` produces and which is never
-// committed or shipped. See [MockNetwork].
+// committed or shipped. See the MockNetwork type, which that tag makes
+// available.
 package siastorage
