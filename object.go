@@ -333,9 +333,12 @@ func (s *SDK) PruneSlabs(ctx context.Context, before time.Time) error {
 	return goError(ctx, code, cerr)
 }
 
-// ObjectShareURL returns a URL granting read access to obj until validUntil,
-// without the recipient needing an account. It is derived locally, so it
-// reaches no indexer and cannot be revoked once handed out.
+// ObjectShareURL returns a URL granting read access to obj until validUntil.
+// It is derived locally, so it reaches no indexer and cannot be revoked once
+// handed out.
+//
+// The recipient resolves it with [SDK.ObjectFromShareURL], so they need an
+// account of their own.
 //
 // validUntil must be a real time; there is no sentinel for an unexpiring URL.
 func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) {
@@ -362,7 +365,7 @@ func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) 
 }
 
 // ObjectFromShareURL resolves a URL from [SDK.ObjectShareURL] into an object
-// the holder can download, paid for by the account that shared it.
+// this SDK can download. The reads are paid for by this account.
 func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
