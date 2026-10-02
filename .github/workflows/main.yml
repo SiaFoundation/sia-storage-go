@@ -41,10 +41,17 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
+      # The archives were built from one revision, and the vendored header has
+      # to be that revision's. Checking against a branch would compare it to
+      # whatever sia-sdk-rs has moved on to, which is not what these archives
+      # export.
+      - name: Resolve the revision the archives were built from
+        id: provenance
+        run: echo "sha=$(awk '/^sia-sdk-rs:/ {print $2}' ffi/lib/PROVENANCE)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: SiaFoundation/sia-sdk-rs
-          ref: ${{ env.SIA_SDK_RS_REF }}
+          ref: ${{ steps.provenance.outputs.sha }}
           path: sia-sdk-rs
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
@@ -62,9 +69,10 @@ jobs:
             exit 1
           fi
           make check-no-mock
-      # The vendored header is the contract between the cgo declarations and
-      # the Rust. Checked before make testlib, which would otherwise re-sync
-      # it and hide the drift.
+      # Build FFI Libraries vendors the header from the same revision as the
+      # archives, so this should never fail on a workflow produced commit. It
+      # catches a hand edited header. Checked before make testlib, which would
+      # otherwise re-sync it and hide the drift.
       - name: Check header
         run: make check-header SIA_SDK_RS=sia-sdk-rs
       # Covers the C ABI itself, including the streaming roundtrip against
