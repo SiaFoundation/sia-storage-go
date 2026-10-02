@@ -134,8 +134,11 @@ func TestPruneSlabs(t *testing.T) {
 	if err := sdk.DeleteObject(ctx, id); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if err := sdk.PruneSlabs(ctx); err != nil {
+	if err := sdk.PruneSlabs(ctx, time.Now()); err != nil {
 		t.Fatalf("prune: %v", err)
+	}
+	if n := net.PinnedSlabs(); n != 0 {
+		t.Fatalf("expected the pruned slabs to be released, %d still pinned", n)
 	}
 }
 

@@ -573,7 +573,10 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 		}
 		deleted++
 	}
-	if err := sdk.PruneSlabs(ctx); err != nil {
+	// A demo account has nothing else uploading, so it can prune right up to
+	// the present. An application should pass a zero time and let the indexer
+	// hold back slabs recent enough to belong to an upload in flight.
+	if err := sdk.PruneSlabs(ctx, time.Now()); err != nil {
 		fail("PruneSlabs", err)
 	}
 	info("%d object(s) deleted and their slabs pruned", deleted)
