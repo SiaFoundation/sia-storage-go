@@ -184,6 +184,28 @@ func (o *Object) UpdateMetadata(metadata []byte) {
 	runtime.KeepAlive(o)
 }
 
+// Truncate returns a copy of the object shortened to length bytes.
+//
+// The last retained slab is shortened and any slab past it is dropped. A length
+// at or above the current size copies it unchanged. The receiver is untouched,
+// so the caller owns and must Close both.
+//
+// This only rewrites the slab list. Pin the result with [SDK.PinObject] before
+// the indexer knows about it.
+func (o *Object) Truncate(length uint64) *Object {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return nil
+	}
+	ptr := C.sia_object_truncate(o.ptr, C.uint64_t(length))
+	runtime.KeepAlive(o)
+	if ptr == nil {
+		return nil
+	}
+	return wrapObject(ptr)
+}
+
 // unixMicro converts the microsecond timestamps the C ABI uses, mapping zero to
 // the zero time rather than to the epoch.
 func unixMicro(us int64) time.Time {
