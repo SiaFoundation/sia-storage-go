@@ -46,9 +46,9 @@ func wrapSharedSDK(ptr *C.sia_shared_sdk_t) *SharedSDK {
 // ConnectShared connects to indexerURL as the recipient of the sharing key
 // derived from seed.
 //
-// Unlike [Connect] there is no registration or approval step, because the seed
-// is the entire credential and how it reached the recipient is the caller's
-// business.
+// Unlike [Builder.Connect] there is no registration or approval step, because
+// the seed is the entire credential and how it reached the recipient is the
+// caller's business.
 func ConnectShared(ctx context.Context, indexerURL string, seed [32]byte) (*SharedSDK, error) {
 	tok, release := cancelToken(ctx)
 	defer release()
