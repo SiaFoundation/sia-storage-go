@@ -142,6 +142,37 @@ func TestPruneSlabs(t *testing.T) {
 	}
 }
 
+// TestSlabByIDFromSealedObject proves a caller can name a slab. An id is
+// derived from the slab's contents rather than stored, and a sealed object is
+// where one comes from.
+func TestSlabByIDFromSealedObject(t *testing.T) {
+	_, sdk := transferSDK(t)
+	ctx := context.Background()
+
+	uploaded := uploadPinned(t, sdk, payload(payloadSize))
+	defer uploaded.Close()
+
+	sealed, err := sdk.SealObject(uploaded)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if len(sealed.Slabs) == 0 {
+		t.Fatal("the sealed object references no slabs")
+	}
+
+	id := types.Hash256(sealed.Slabs[0].Digest())
+	slab, err := sdk.Slab(ctx, id)
+	if err != nil {
+		t.Fatalf("slab: %v", err)
+	}
+	if slab.ID != id {
+		t.Fatalf("asked for slab %v and got %v", id, slab.ID)
+	}
+	if len(slab.Sectors) == 0 {
+		t.Fatal("a pinned slab must report sectors")
+	}
+}
+
 // TestObjectShareURLRoundTrip proves a share URL resolves back to an object a
 // holder can download, which is the whole point of handing one out.
 func TestObjectShareURLRoundTrip(t *testing.T) {
