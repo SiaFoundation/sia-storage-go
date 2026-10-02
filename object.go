@@ -153,7 +153,7 @@ func (o *Object) Metadata() []byte {
 	runtime.KeepAlive(o)
 	// The native side copies nothing when the buffer is too small, which would
 	// otherwise hand back a silently zero-filled slice. The write lock on
-	// UpdateMetadata makes this unreachable; it is here so that a future
+	// SetMetadata makes this unreachable; it is here so that a future
 	// caller that mutates without it fails loudly instead.
 	if got != n {
 		return nil
@@ -161,11 +161,12 @@ func (o *Object) Metadata() []byte {
 	return buf
 }
 
-// UpdateMetadata replaces the object's metadata. Passing nil clears it.
+// SetMetadata replaces the object's metadata. Passing nil clears it.
 //
-// This only changes the local handle. Call SDK.UpdateObjectMetadata to persist
-// it to the indexer.
-func (o *Object) UpdateMetadata(metadata []byte) {
+// This only changes the local handle. Whichever call next sends the object to
+// the indexer stores it: [SDK.PinObject] for an object that is not pinned yet,
+// or [SDK.UpdateObjectMetadata] for one that is.
+func (o *Object) SetMetadata(metadata []byte) {
 	// The write lock, not the read lock: sia_object_set_metadata takes a
 	// non-const handle and mutates it, so it must not run alongside another
 	// setter or alongside Metadata reading the same bytes.
@@ -263,7 +264,7 @@ func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 }
 
 // UpdateObjectMetadata persists the metadata currently on obj, which
-// [Object.UpdateMetadata] only changes locally.
+// [Object.SetMetadata] only changes locally.
 //
 // It pins the object as a side effect, so it also serves to persist an object
 // whose metadata is the only thing that changed.

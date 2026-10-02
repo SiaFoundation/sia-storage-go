@@ -73,7 +73,7 @@ func TestObjectMetadataPersists(t *testing.T) {
 	defer uploaded.Close()
 
 	want := []byte(`{"filename":"holiday.jpg"}`)
-	uploaded.UpdateMetadata(want)
+	uploaded.SetMetadata(want)
 	if err := sdk.UpdateObjectMetadata(ctx, uploaded); err != nil {
 		t.Fatalf("update metadata: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 
 	uploaded := uploadPinned(t, sdk, want)
 	defer uploaded.Close()
-	uploaded.UpdateMetadata([]byte(`{"filename":"sealed.bin"}`))
+	uploaded.SetMetadata([]byte(`{"filename":"sealed.bin"}`))
 
 	sealed, err := sdk.SealObject(uploaded)
 	if err != nil {

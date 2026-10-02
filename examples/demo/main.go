@@ -181,7 +181,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	// -------------------------------------------------------------- metadata
 	stage("Attach metadata and persist it")
 	meta := []byte(`{"filename":"demo.bin","kind":"synthetic"}`)
-	obj.UpdateMetadata(meta)
+	obj.SetMetadata(meta)
 	if err := sdk.UpdateObjectMetadata(ctx, obj); err != nil {
 		fail("UpdateObjectMetadata", err)
 	}
