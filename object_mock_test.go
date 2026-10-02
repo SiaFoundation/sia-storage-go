@@ -46,14 +46,14 @@ func TestObjectMetadataRoundTrip(t *testing.T) {
 
 	for _, size := range []int{1, 31, 32, 33, 4096} {
 		want := bytes.Repeat([]byte{byte(size)}, size)
-		obj.UpdateMetadata(want)
+		obj.SetMetadata(want)
 		got := obj.Metadata()
 		if !bytes.Equal(got, want) {
 			t.Fatalf("metadata of %d bytes came back as %d bytes", size, len(got))
 		}
 	}
 
-	obj.UpdateMetadata(nil)
+	obj.SetMetadata(nil)
 	if md := obj.Metadata(); md != nil {
 		t.Fatalf("expected clearing metadata to leave none, got %d bytes", len(md))
 	}
@@ -83,7 +83,7 @@ func TestObjectIDIsContentAddressed(t *testing.T) {
 		t.Fatal("two empty objects should share an ID, so the ID is not derived from the slabs")
 	}
 	// Metadata is not part of the ID, only the slabs are.
-	a.UpdateMetadata([]byte(`{"name":"a"}`))
+	a.SetMetadata([]byte(`{"name":"a"}`))
 	if a.ID() != b.ID() {
 		t.Fatal("metadata must not change the object ID")
 	}
@@ -102,7 +102,7 @@ func TestHandleUseAfterClose(t *testing.T) {
 	ctx := context.Background()
 
 	obj := NewEmptyObject()
-	obj.UpdateMetadata([]byte("something"))
+	obj.SetMetadata([]byte("something"))
 	if err := obj.Close(); err != nil {
 		t.Fatalf("close object: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestHandleUseAfterClose(t *testing.T) {
 	if md := obj.Metadata(); md != nil {
 		t.Errorf("Metadata after Close = %q, want nil", md)
 	}
-	obj.UpdateMetadata([]byte("ignored")) // must not touch the freed handle
+	obj.SetMetadata([]byte("ignored")) // must not touch the freed handle
 
 	// A closed object handed to the SDK is the same dangling read, so the
 	// call has to refuse it rather than pass the pointer across.
@@ -209,7 +209,7 @@ func TestObjectMetadataConcurrentAccess(t *testing.T) {
 		bytes.Repeat([]byte("b"), 512),
 		bytes.Repeat([]byte("c"), 900),
 	}
-	obj.UpdateMetadata(values[0])
+	obj.SetMetadata(values[0])
 
 	var wg sync.WaitGroup
 	for i := range 4 {
@@ -217,7 +217,7 @@ func TestObjectMetadataConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := range 50 {
-				obj.UpdateMetadata(values[(i+j)%len(values)])
+				obj.SetMetadata(values[(i+j)%len(values)])
 			}
 		}()
 	}
