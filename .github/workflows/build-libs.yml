@@ -163,7 +163,7 @@ jobs:
       # sia-sdk-rs happens to be at, which is not what the archive exports.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          repository: ${{ env.SDK_REPO }}
+          repository: SiaFoundation/sia-sdk-rs
           ref: ${{ needs.resolve.outputs.sha }}
           path: sia-sdk-rs
           persist-credentials: false
