@@ -287,8 +287,13 @@ func (s *SDK) DeleteObject(ctx context.Context, id types.Hash256) error {
 }
 
 // PruneSlabs releases the slabs no remaining object references, which is what
-// actually frees the pinned storage a deleted object was using.
-func (s *SDK) PruneSlabs(ctx context.Context) error {
+// actually frees the pinned storage a deleted object was using. Only slabs
+// pinned before the given time are released.
+//
+// A zero before leaves the cutoff to the indexer, which holds back anything
+// pinned recently so an upload still in flight is not swept up. A caller that
+// knows nothing else is uploading can pass the present to release everything.
+func (s *SDK) PruneSlabs(ctx context.Context, before time.Time) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -299,7 +304,8 @@ func (s *SDK) PruneSlabs(ctx context.Context) error {
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_prune_slabs(s.ptr, tok, &cerr)
+	code := C.sia_sdk_prune_slabs(s.ptr,
+		C.bool(!before.IsZero()), C.int64_t(before.UnixMicro()), tok, &cerr)
 	runtime.KeepAlive(s)
 	return goError(ctx, code, cerr)
 }

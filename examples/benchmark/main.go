@@ -180,8 +180,9 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 		}
 		// Deleting the object only removes the record. Pruning is what releases
 		// the slabs, and without it a long run accumulates every object it ever
-		// wrote, which reads as a leak.
-		if err := sdk.PruneSlabs(ctx); err != nil {
+		// wrote, which reads as a leak. The cutoff has to be the present, since
+		// the slabs being released were pinned moments ago.
+		if err := sdk.PruneSlabs(ctx, time.Now()); err != nil {
 			return s, fmt.Errorf("prune: %w", err)
 		}
 	}
