@@ -123,13 +123,3 @@ func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([
 func (e ObjectEvent) Cursor() EventCursor {
 	return EventCursor{After: e.UpdatedAt, AfterID: e.ID}
 }
-
-// CloseObjects releases the handles in a page of events, for a caller that only
-// wanted the IDs.
-func CloseObjects(events []ObjectEvent) {
-	for _, e := range events {
-		if e.Object != nil {
-			e.Object.Close()
-		}
-	}
-}

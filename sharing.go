@@ -228,17 +228,20 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || key.closed || obj.closed {
+	if s.closed || key.closed {
 		return errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return err
+	}
+	defer C.sia_object_free(objPtr)
 
 	tok, release := cancelToken(ctx)
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_share_object(s.ptr, key.ptr, obj.ptr, tok, &cerr)
+	code := C.sia_sdk_share_object(s.ptr, key.ptr, objPtr, tok, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(key)
 	runtime.KeepAlive(obj)

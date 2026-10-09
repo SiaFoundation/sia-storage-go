@@ -16,13 +16,11 @@ func TestObjectEventsReportWrites(t *testing.T) {
 	ctx := context.Background()
 
 	obj := uploadPinned(t, sdk, payload(1<<20))
-	defer obj.Close()
 
 	events, err := sdk.ObjectEvents(ctx, EventCursor{}, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	defer CloseObjects(events)
 
 	var found *ObjectEvent
 	for i := range events {
@@ -55,7 +53,6 @@ func TestObjectEventsReportDeletes(t *testing.T) {
 
 	obj := uploadPinned(t, sdk, payload(1<<20))
 	id := obj.ID()
-	obj.Close()
 
 	if err := sdk.DeleteObject(ctx, id); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -65,7 +62,6 @@ func TestObjectEventsReportDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	defer CloseObjects(events)
 
 	var deletion *ObjectEvent
 	for i := range events {
@@ -88,15 +84,13 @@ func TestObjectEventsCursor(t *testing.T) {
 	ctx := context.Background()
 
 	for i := range 3 {
-		obj := uploadPinned(t, sdk, payload((i+1)<<20))
-		obj.Close()
+		uploadPinned(t, sdk, payload((i+1)<<20))
 	}
 
 	first, err := sdk.ObjectEvents(ctx, EventCursor{}, 1)
 	if err != nil {
 		t.Fatalf("first page: %v", err)
 	}
-	defer CloseObjects(first)
 	if len(first) != 1 {
 		t.Fatalf("asked for one event, got %d", len(first))
 	}
@@ -105,7 +99,6 @@ func TestObjectEventsCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second page: %v", err)
 	}
-	defer CloseObjects(rest)
 	if len(rest) == 0 {
 		t.Fatal("resuming from the cursor returned nothing")
 	}
@@ -122,14 +115,12 @@ func TestObjectEventsEmptyTail(t *testing.T) {
 	_, sdk := transferSDK(t)
 	ctx := context.Background()
 
-	obj := uploadPinned(t, sdk, payload(1<<20))
-	defer obj.Close()
+	uploadPinned(t, sdk, payload(1<<20))
 
 	events, err := sdk.ObjectEvents(ctx, EventCursor{}, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	defer CloseObjects(events)
 	if len(events) == 0 {
 		t.Fatal("expected at least one event to page past")
 	}
@@ -138,7 +129,6 @@ func TestObjectEventsEmptyTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tail: %v", err)
 	}
-	defer CloseObjects(tail)
 	if len(tail) != 0 {
 		t.Fatalf("paging past the last event returned %d more", len(tail))
 	}
@@ -151,11 +141,9 @@ func TestObjectEventsUnknownCursor(t *testing.T) {
 
 	var id types.Hash256
 	id[0] = 0xEF
-	events, err := sdk.ObjectEvents(context.Background(), EventCursor{AfterID: id}, 0)
-	if err != nil {
+	if _, err := sdk.ObjectEvents(context.Background(), EventCursor{AfterID: id}, 0); err != nil {
 		t.Fatalf("unknown cursor: %v", err)
 	}
-	CloseObjects(events)
 }
 
 func ptr[T any](v T) *T { return &v }

@@ -8,12 +8,12 @@ package siastorage
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -28,18 +28,24 @@ type SealedObject = slabs.SealedObject
 
 // An Object is a collection of slabs plus the keys needed to read them.
 //
-// It has no exported fields, because the data key it carries must not leak. Use
-// the accessors, and Close when finished, since the bytes behind the handle are
-// owned by the native side rather than by Go.
+// It has no exported fields, because the data key it carries must not leak.
+// Use the accessors.
 type Object struct {
-	ptr     *C.sia_object_t
-	cleanup runtime.Cleanup
+	// encoded is the whole object as the native side wrote it. The calls that
+	// need one rebuild it, use it and release it before returning, so an
+	// Object is an ordinary Go value: copy it, store it, share it between
+	// goroutines, and let the collector have it when you are done.
+	encoded []byte
 
-	// mu guards ptr against Close. Every method that hands the handle to C
-	// holds it for the read, so Close cannot free the handle underneath a
-	// call already running on another goroutine.
-	mu     sync.RWMutex
-	closed bool
+	// Read once, when the object was built. Nothing can change an object, so
+	// these never go stale: WithMetadata and Truncate return a new one rather
+	// than altering this.
+	id          types.Hash256
+	size        uint64
+	encodedSize uint64
+	createdAt   time.Time
+	updatedAt   time.Time
+	metadata    []byte
 }
 
 // NewEmptyObject returns an empty object, ready to be given metadata and
@@ -48,163 +54,141 @@ func NewEmptyObject() *Object {
 	return wrapObject(C.sia_object_new())
 }
 
+// wrapObject reads everything out of a native object and releases it. The
+// result owns no native memory.
 func wrapObject(ptr *C.sia_object_t) *Object {
-	o := &Object{ptr: ptr}
-	o.cleanup = runtime.AddCleanup(o, func(p *C.sia_object_t) {
-		C.sia_object_free(p)
-	}, ptr)
-	return o
-}
-
-// Close releases the object. It is safe to call more than once, and waits for
-// any call already using the handle to return.
-func (o *Object) Close() error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.closed {
+	if ptr == nil {
 		return nil
 	}
-	o.closed = true
-	o.cleanup.Stop()
-	C.sia_object_free(o.ptr)
-	return nil
+	defer C.sia_object_free(ptr)
+	return readObject(ptr)
 }
 
-// ID returns the object's identifier, which is a hash of its slabs. An empty
-// object has a stable ID of its own, so two objects with the same contents
-// share an ID.
-func (o *Object) ID() (id types.Hash256) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return
-	}
-	C.sia_object_id(o.ptr, cBytes32((*[32]byte)(&id)))
-	runtime.KeepAlive(o)
-	return
-}
-
-// Size returns the length of the data the object holds.
-func (o *Object) Size() uint64 {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return 0
-	}
-	n := uint64(C.sia_object_size(o.ptr))
-	runtime.KeepAlive(o)
-	return n
-}
-
-// EncodedSize returns how many bytes the object occupies on the network, which
-// is larger than Size by the redundancy the slabs were encoded with.
-func (o *Object) EncodedSize() uint64 {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return 0
-	}
-	n := uint64(C.sia_object_encoded_size(o.ptr))
-	runtime.KeepAlive(o)
-	return n
-}
-
-// CreatedAt returns when the indexer first recorded the object. It is the zero
-// time for an object that has not been uploaded.
-func (o *Object) CreatedAt() time.Time {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return time.Time{}
-	}
-	us := int64(C.sia_object_created_at(o.ptr))
-	runtime.KeepAlive(o)
-	return unixMicro(us)
-}
-
-// UpdatedAt returns when the object last changed, which the indexer also bumps
-// when it repairs a slab onto a different host.
-func (o *Object) UpdatedAt() time.Time {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return time.Time{}
-	}
-	us := int64(C.sia_object_updated_at(o.ptr))
-	runtime.KeepAlive(o)
-	return unixMicro(us)
-}
-
-// Metadata returns the object's metadata, which is encrypted at rest and
-// decrypted here. It returns nil when there is none.
-func (o *Object) Metadata() []byte {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
-		return nil
-	}
-	n := C.sia_object_metadata(o.ptr, nil, 0)
+// readObject reads everything out of a native object, leaving it to the
+// caller to release.
+func readObject(ptr *C.sia_object_t) *Object {
+	n := C.sia_object_encode(ptr, nil, 0)
 	if n == 0 {
-		runtime.KeepAlive(o)
 		return nil
 	}
 	buf := make([]byte, int(n))
-	got := C.sia_object_metadata(o.ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n)
-	runtime.KeepAlive(o)
-	// The native side copies nothing when the buffer is too small, which would
-	// otherwise hand back a silently zero-filled slice. The write lock on
-	// SetMetadata makes this unreachable; it is here so that a future
-	// caller that mutates without it fails loudly instead.
-	if got != n {
+	if C.sia_object_encode(ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n) != n {
+		return nil
+	}
+
+	o := &Object{
+		encoded:     buf,
+		size:        uint64(C.sia_object_size(ptr)),
+		encodedSize: uint64(C.sia_object_encoded_size(ptr)),
+		createdAt:   unixMicro(int64(C.sia_object_created_at(ptr))),
+		updatedAt:   unixMicro(int64(C.sia_object_updated_at(ptr))),
+		metadata:    nativeMetadata(ptr),
+	}
+	C.sia_object_id(ptr, cBytes32((*[32]byte)(&o.id)))
+	return o
+}
+
+// nativeMetadata copies an object's metadata out of a native handle.
+func nativeMetadata(ptr *C.sia_object_t) []byte {
+	n := C.sia_object_metadata(ptr, nil, 0)
+	if n == 0 {
+		return nil
+	}
+	buf := make([]byte, int(n))
+	// Nothing is copied when the buffer is too small, which would otherwise
+	// hand back a silently zero filled slice.
+	if C.sia_object_metadata(ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n) != n {
 		return nil
 	}
 	return buf
 }
 
-// SetMetadata replaces the object's metadata. Passing nil clears it.
+// native rebuilds the object on the native side for the duration of one call.
+// The caller must release the result with C.sia_object_free.
+func (o *Object) native() (*C.sia_object_t, error) {
+	if o == nil || len(o.encoded) == 0 {
+		return nil, errors.New("object is not usable")
+	}
+	var ptr *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_object_decode((*C.uint8_t)(unsafe.Pointer(&o.encoded[0])),
+		C.size_t(len(o.encoded)), &ptr, &cerr)
+	if code != C.SIA_OK {
+		return nil, goError(context.Background(), code, cerr)
+	}
+	return ptr, nil
+}
+
+// ID returns the object's identifier, which is a hash of its slabs. An empty
+// object has a stable ID of its own, so two objects with the same contents
+// share an ID.
+func (o *Object) ID() types.Hash256 { return o.id }
+
+// Size returns the length of the data the object holds.
+func (o *Object) Size() uint64 { return o.size }
+
+// EncodedSize returns the storage the object occupies once erasure coded,
+// which is what the account is billed for.
+func (o *Object) EncodedSize() uint64 { return o.encodedSize }
+
+// CreatedAt returns when the indexer first saw the object, or the zero time
+// for one that has never been pinned.
+func (o *Object) CreatedAt() time.Time { return o.createdAt }
+
+// UpdatedAt returns when the indexer last saw the object change, or the zero
+// time for one that has never been pinned.
+func (o *Object) UpdatedAt() time.Time { return o.updatedAt }
+
+// Metadata returns the object's metadata, which is encrypted at rest and
+// decrypted here. It returns nil when there is none.
 //
-// This only changes the local handle. Whichever call next sends the object to
-// the indexer stores it: [SDK.PinObject] for an object that is not pinned yet,
-// or [SDK.UpdateObjectMetadata] for one that is.
-func (o *Object) SetMetadata(metadata []byte) {
-	// The write lock, not the read lock: sia_object_set_metadata takes a
-	// non-const handle and mutates it, so it must not run alongside another
-	// setter or alongside Metadata reading the same bytes.
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.closed {
-		return
+// The result is a copy, so writing through it cannot change the object.
+func (o *Object) Metadata() []byte {
+	if len(o.metadata) == 0 {
+		return nil
 	}
+	return bytes.Clone(o.metadata)
+}
+
+// WithMetadata returns a copy of the object carrying metadata in place of
+// whatever it held. Passing nil clears it. The receiver is untouched, so an
+// object never changes under a reader and is safe to share between goroutines.
+//
+// This only produces a local object. Whichever call next sends it to the
+// indexer stores the metadata: [SDK.PinObject] for an object that is not
+// pinned yet, or [SDK.UpdateObjectMetadata] for one that is.
+func (o *Object) WithMetadata(metadata []byte) *Object {
+	ptr, err := o.native()
+	if err != nil {
+		return nil
+	}
+	defer C.sia_object_free(ptr)
+
 	if len(metadata) == 0 {
-		C.sia_object_set_metadata(o.ptr, nil, 0)
-		runtime.KeepAlive(o)
-		return
+		C.sia_object_set_metadata(ptr, nil, 0)
+	} else {
+		C.sia_object_set_metadata(ptr,
+			(*C.uint8_t)(unsafe.Pointer(&metadata[0])), C.size_t(len(metadata)))
 	}
-	C.sia_object_set_metadata(o.ptr,
-		(*C.uint8_t)(unsafe.Pointer(&metadata[0])), C.size_t(len(metadata)))
-	runtime.KeepAlive(o)
+	// set_metadata mutated the handle we already hold, so read it back rather
+	// than building another.
+	return readObject(ptr)
 }
 
 // Truncate returns a copy of the object shortened to length bytes.
 //
 // The last retained slab is shortened and any slab past it is dropped. A length
-// at or above the current size copies it unchanged. The receiver is untouched,
-// so the caller owns and must Close both.
+// at or above the current size copies it unchanged. The receiver is untouched.
 //
 // This only rewrites the slab list. Pin the result with [SDK.PinObject] before
 // the indexer knows about it.
 func (o *Object) Truncate(length uint64) *Object {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.closed {
+	ptr, err := o.native()
+	if err != nil {
 		return nil
 	}
-	ptr := C.sia_object_truncate(o.ptr, C.uint64_t(length))
-	runtime.KeepAlive(o)
-	if ptr == nil {
-		return nil
-	}
-	return wrapObject(ptr)
+	defer C.sia_object_free(ptr)
+	return wrapObject(C.sia_object_truncate(ptr, C.uint64_t(length)))
 }
 
 // unixMicro converts the microsecond timestamps the C ABI uses, mapping zero to
@@ -247,24 +231,27 @@ func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
 func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return err
+	}
+	defer C.sia_object_free(objPtr)
 
 	tok, release := cancelToken(ctx)
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_pin_object(s.ptr, obj.ptr, tok, &cerr)
+	code := C.sia_sdk_pin_object(s.ptr, objPtr, tok, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	return goError(ctx, code, cerr)
 }
 
 // UpdateObjectMetadata persists the metadata currently on obj, which
-// [Object.SetMetadata] only changes locally.
+// [Object.WithMetadata] only produces locally.
 //
 // It pins the object as a side effect, so it also serves to persist an object
 // whose metadata is the only thing that changed.
@@ -275,17 +262,20 @@ func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return err
+	}
+	defer C.sia_object_free(objPtr)
 
 	tok, release := cancelToken(ctx)
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_update_object_metadata(s.ptr, obj.ptr, tok, &cerr)
+	code := C.sia_sdk_update_object_metadata(s.ptr, objPtr, tok, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	return goError(ctx, code, cerr)
@@ -344,17 +334,20 @@ func (s *SDK) PruneSlabs(ctx context.Context, before time.Time) error {
 func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return "", errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return "", err
+	}
+	defer C.sia_object_free(objPtr)
 
 	if validUntil.IsZero() {
 		return "", errors.New("share URL requires an expiration time")
 	}
 	var cURL, cerr *C.char
-	code := C.sia_sdk_object_share_url(s.ptr, obj.ptr,
+	code := C.sia_sdk_object_share_url(s.ptr, objPtr,
 		C.int64_t(validUntil.UnixMicro()), &cURL, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
@@ -397,14 +390,17 @@ func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object,
 func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return SealedObject{}, errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return SealedObject{}, err
+	}
+	defer C.sia_object_free(objPtr)
 
 	var cJSON, cerr *C.char
-	code := C.sia_object_seal_json(s.ptr, obj.ptr, &cJSON, &cerr)
+	code := C.sia_object_seal_json(s.ptr, objPtr, &cJSON, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {

@@ -42,11 +42,6 @@ func TestPackedUploadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
-	defer func() {
-		for _, o := range objs {
-			o.Close()
-		}
-	}()
 	if len(objs) != len(want) {
 		t.Fatalf("finalize returned %d objects for %d adds", len(objs), len(want))
 	}
@@ -88,12 +83,8 @@ func TestPackedUploadSharesSlabs(t *testing.T) {
 			t.Fatalf("add: %v", err)
 		}
 	}
-	objs, err := pu.Finalize()
-	if err != nil {
+	if _, err := pu.Finalize(); err != nil {
 		t.Fatalf("finalize: %v", err)
-	}
-	for _, o := range objs {
-		o.Close()
 	}
 
 	if slabs := net.PinnedSlabs(); slabs >= objects {
@@ -151,9 +142,6 @@ func TestPackedUploadEmptyFinalize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finalize with no adds: %v", err)
 	}
-	for _, o := range objs {
-		o.Close()
-	}
 	if len(objs) != 0 {
 		t.Fatalf("finalizing an empty upload produced %d objects", len(objs))
 	}
@@ -194,12 +182,8 @@ func TestPackedUploadCloseSemantics(t *testing.T) {
 	if _, err := other.Add(bytes.NewReader(payload(4 << 10))); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	objs, err := other.Finalize()
-	if err != nil {
+	if _, err := other.Finalize(); err != nil {
 		t.Fatalf("finalize: %v", err)
-	}
-	for _, o := range objs {
-		o.Close()
 	}
 	if _, err := other.Finalize(); !errors.Is(err, errClosed) {
 		t.Fatalf("second finalize returned %v, want errClosed", err)
@@ -230,9 +214,6 @@ func TestPackedUploadAddReaderError(t *testing.T) {
 	objs, err := pu.Finalize()
 	if err != nil {
 		t.Fatalf("finalize after a failed add: %v", err)
-	}
-	for _, o := range objs {
-		o.Close()
 	}
 	// The failed add must contribute nothing. Finishing it instead of
 	// aborting produced a short but structurally valid object here, which a
@@ -274,9 +255,6 @@ func TestPackedUploadSurvivesAFailedAdd(t *testing.T) {
 		t.Fatalf("finalize: %v", err)
 	}
 	defer func() {
-		for _, o := range objs {
-			o.Close()
-		}
 	}()
 	if len(objs) != 2 {
 		t.Fatalf("expected the two successful adds, got %d object(s)", len(objs))
