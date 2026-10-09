@@ -73,7 +73,6 @@ func TestTransferRoundTrip(t *testing.T) {
 	want := payload(payloadSize)
 
 	obj := uploadPayload(t, sdk, want)
-	defer obj.Close()
 
 	if obj.Size() != uint64(len(want)) {
 		t.Fatalf("object size is %d, want %d", obj.Size(), len(want))
@@ -107,7 +106,6 @@ func TestTransferRange(t *testing.T) {
 	want := payload(payloadSize)
 
 	obj := uploadPayload(t, sdk, want)
-	defer obj.Close()
 
 	const offset, length = 1 << 20, 64 << 10
 	n := uint64(length)
@@ -137,9 +135,7 @@ func TestTransferRedundancyOption(t *testing.T) {
 	// The default is 10 of 30. 5 of 20 is a valid alternative that clears the
 	// SDK's recovery probability floor and uses ten fewer shards.
 	fewer := uploadPayload(t, sdk, want, WithRedundancy(5, 15))
-	defer fewer.Close()
 	def := uploadPayload(t, sdk, want)
-	defer def.Close()
 
 	if fewer.Size() != def.Size() {
 		t.Fatalf("the same payload produced sizes %d and %d", fewer.Size(), def.Size())
@@ -159,7 +155,7 @@ func TestTransferProgress(t *testing.T) {
 	var mu sync.Mutex
 	var events int
 	var transferred uint64
-	obj := uploadPayload(t, sdk, want, WithUploadProgress(func(p ShardProgress) {
+	uploadPayload(t, sdk, want, WithUploadProgress(func(p ShardProgress) {
 		mu.Lock()
 		defer mu.Unlock()
 		events++
@@ -167,7 +163,6 @@ func TestTransferProgress(t *testing.T) {
 			transferred = p.Transferred
 		}
 	}))
-	defer obj.Close()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -185,7 +180,6 @@ func TestTransferMissingSectors(t *testing.T) {
 	net, sdk := transferSDK(t)
 
 	obj := uploadPayload(t, sdk, payload(payloadSize))
-	defer obj.Close()
 
 	net.ClearSectors()
 
@@ -243,11 +237,9 @@ func TestUploadCloseAfterFinish(t *testing.T) {
 	if _, err := up.Write(payload(1 << 20)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	obj, err := up.Finish()
-	if err != nil {
+	if _, err := up.Finish(); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
-	defer obj.Close()
 
 	if err := up.Close(); err != nil {
 		t.Fatalf("close after finish: %v", err)
@@ -265,7 +257,6 @@ func TestDownloadCloseUnblocksRead(t *testing.T) {
 	_, sdk := transferSDK(t)
 
 	obj := uploadPayload(t, sdk, payload(payloadSize))
-	defer obj.Close()
 
 	dl, err := sdk.Download(context.Background(), obj)
 	if err != nil {

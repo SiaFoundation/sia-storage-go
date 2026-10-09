@@ -17,7 +17,6 @@ import (
 // given it slabs or timestamps.
 func TestObjectEmpty(t *testing.T) {
 	obj := NewEmptyObject()
-	defer obj.Close()
 
 	if obj.Size() != 0 {
 		t.Fatalf("expected an empty object to have size 0, got %d", obj.Size())
@@ -42,32 +41,19 @@ func TestObjectEmpty(t *testing.T) {
 // either side of a single copy, and that clearing works.
 func TestObjectMetadataRoundTrip(t *testing.T) {
 	obj := NewEmptyObject()
-	defer obj.Close()
 
 	for _, size := range []int{1, 31, 32, 33, 4096} {
 		want := bytes.Repeat([]byte{byte(size)}, size)
-		obj.SetMetadata(want)
+		obj = obj.WithMetadata(want)
 		got := obj.Metadata()
 		if !bytes.Equal(got, want) {
 			t.Fatalf("metadata of %d bytes came back as %d bytes", size, len(got))
 		}
 	}
 
-	obj.SetMetadata(nil)
+	obj = obj.WithMetadata(nil)
 	if md := obj.Metadata(); md != nil {
 		t.Fatalf("expected clearing metadata to leave none, got %d bytes", len(md))
-	}
-}
-
-// TestObjectCloseIsIdempotent proves the cleanup and an explicit Close cannot
-// both free the same pointer.
-func TestObjectCloseIsIdempotent(t *testing.T) {
-	obj := NewEmptyObject()
-	if err := obj.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if err := obj.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
 	}
 }
 
@@ -76,14 +62,12 @@ func TestObjectCloseIsIdempotent(t *testing.T) {
 // the same object.
 func TestObjectIDIsContentAddressed(t *testing.T) {
 	a, b := NewEmptyObject(), NewEmptyObject()
-	defer a.Close()
-	defer b.Close()
 
 	if a.ID() != b.ID() {
 		t.Fatal("two empty objects should share an ID, so the ID is not derived from the slabs")
 	}
 	// Metadata is not part of the ID, only the slabs are.
-	a.SetMetadata([]byte(`{"name":"a"}`))
+	a = a.WithMetadata([]byte(`{"name":"a"}`))
 	if a.ID() != b.ID() {
 		t.Fatal("metadata must not change the object ID")
 	}
@@ -93,41 +77,12 @@ func TestObjectIDIsContentAddressed(t *testing.T) {
 	}
 }
 
-// TestHandleUseAfterClose proves every handle reports a zero value rather than
-// reading memory Close already freed. Before the guard these went straight to
-// the native side: Object.Size returned whatever the freed allocation happened
-// to hold, which is harder to notice than a crash.
-func TestHandleUseAfterClose(t *testing.T) {
+// TestSharingKeyUseAfterClose proves a closed key reports a zero value rather
+// than reading memory Close already freed. Before the guard these went straight
+// to the native side, which is harder to notice than a crash.
+func TestSharingKeyUseAfterClose(t *testing.T) {
 	_, sdk := testSDK(t)
 	ctx := context.Background()
-
-	obj := NewEmptyObject()
-	obj.SetMetadata([]byte("something"))
-	if err := obj.Close(); err != nil {
-		t.Fatalf("close object: %v", err)
-	}
-	if n := obj.Size(); n != 0 {
-		t.Errorf("Size after Close = %d, want 0", n)
-	}
-	if n := obj.EncodedSize(); n != 0 {
-		t.Errorf("EncodedSize after Close = %d, want 0", n)
-	}
-	if id := obj.ID(); id != (types.Hash256{}) {
-		t.Errorf("ID after Close = %v, want the zero hash", id)
-	}
-	if !obj.CreatedAt().IsZero() {
-		t.Error("CreatedAt after Close should be the zero time")
-	}
-	if md := obj.Metadata(); md != nil {
-		t.Errorf("Metadata after Close = %q, want nil", md)
-	}
-	obj.SetMetadata([]byte("ignored")) // must not touch the freed handle
-
-	// A closed object handed to the SDK is the same dangling read, so the
-	// call has to refuse it rather than pass the pointer across.
-	if err := sdk.PinObject(ctx, obj); !errors.Is(err, errClosed) {
-		t.Errorf("PinObject with a closed object returned %v, want errClosed", err)
-	}
 
 	key, err := sdk.CreateSharingKey(ctx, "closed key", time.Time{})
 	if err != nil {
@@ -192,32 +147,36 @@ func TestSDKCloseDuringCall(t *testing.T) {
 	}
 }
 
-// TestObjectMetadataConcurrentAccess proves the metadata setter and reader are
-// serialised against each other. sia_object_set_metadata takes a non-const
-// handle and mutates it, so running it under a read lock alongside
-// sia_object_metadata was a data race in Rust, and left Metadata able to size
-// a buffer against one value and fill it from another.
+// TestObjectConcurrentUse proves an object is safe to share between goroutines
+// without a lock. Nothing can change one once it exists: WithMetadata returns a
+// new object and leaves the receiver alone, and Metadata hands back a copy. The
+// old handle needed a mutex because sia_object_set_metadata mutated it in
+// place, which left Metadata able to size a buffer against one value and fill
+// it from another.
 //
 // The race detector is what makes this test meaningful; it passes trivially
 // without -race.
-func TestObjectMetadataConcurrentAccess(t *testing.T) {
-	obj := NewEmptyObject()
-	defer obj.Close()
-
+func TestObjectConcurrentUse(t *testing.T) {
 	values := [][]byte{
 		bytes.Repeat([]byte("a"), 16),
 		bytes.Repeat([]byte("b"), 512),
 		bytes.Repeat([]byte("c"), 900),
 	}
-	obj.SetMetadata(values[0])
+	shared := NewEmptyObject().WithMetadata(values[0])
 
 	var wg sync.WaitGroup
+	// Derive new objects from the shared one while others read it.
 	for i := range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := range 50 {
-				obj.SetMetadata(values[(i+j)%len(values)])
+				want := values[(i+j)%len(values)]
+				derived := shared.WithMetadata(want)
+				if !bytes.Equal(derived.Metadata(), want) {
+					t.Errorf("WithMetadata produced %d bytes, want %d", len(derived.Metadata()), len(want))
+					return
+				}
 			}
 		}()
 	}
@@ -226,25 +185,20 @@ func TestObjectMetadataConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 50 {
-				// Whatever it returns must be one of the values in full, never
-				// a buffer sized for one and filled from another.
-				md := obj.Metadata()
-				if md == nil {
-					continue
-				}
-				ok := false
-				for _, v := range values {
-					if bytes.Equal(md, v) {
-						ok = true
-						break
-					}
-				}
-				if !ok {
-					t.Errorf("Metadata returned %d bytes matching no value written", len(md))
+				// Deriving cannot disturb the object it was derived from.
+				if md := shared.Metadata(); !bytes.Equal(md, values[0]) {
+					t.Errorf("the shared object changed under a reader: %d bytes", len(md))
 					return
 				}
 			}
 		}()
 	}
 	wg.Wait()
+
+	// Writing through a returned copy cannot reach the object either.
+	md := shared.Metadata()
+	md[0] ^= 0xff
+	if bytes.Equal(shared.Metadata(), md) {
+		t.Fatal("Metadata handed out the object's own buffer")
+	}
 }

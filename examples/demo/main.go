@@ -163,7 +163,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("upload", err)
 	}
-	defer obj.Close()
 	info("%d shards reported, %s transferred", shards, bytes4(transferred))
 	info("object %v", obj.ID())
 	// encoded/logical is not the redundancy. A sector is stored whole, so a
@@ -181,7 +180,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	// -------------------------------------------------------------- metadata
 	stage("Attach metadata and persist it")
 	meta := []byte(`{"filename":"demo.bin","kind":"synthetic"}`)
-	obj.SetMetadata(meta)
+	obj = obj.WithMetadata(meta)
 	if err := sdk.UpdateObjectMetadata(ctx, obj); err != nil {
 		fail("UpdateObjectMetadata", err)
 	}
@@ -196,7 +195,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("Object", err)
 	}
-	defer fetched.Close()
 	info("fetched by ID alone, %s, metadata %s", bytes4(fetched.Size()), fetched.Metadata())
 
 	// -------------------------------------------------------------- download
@@ -265,7 +263,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("ObjectFromSealed", err)
 	}
-	defer opened.Close()
 	info("%d slabs sealed, reopened to the same ID %t", len(sealed.Slabs), opened.ID() == obj.ID())
 
 	// ------------------------------------------------------------- share URL
@@ -279,7 +276,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("ObjectFromShareURL", err)
 	}
-	defer viaURL.Close()
 	info("resolved to the same object %t", viaURL.ID() == obj.ID())
 
 	// ------------------------------------------------------------- overwrite
@@ -291,7 +287,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("overwrite", err)
 	}
-	defer overwritten.Close()
 	if overwritten.Size() != uint64(len(want)) {
 		fail("overwrite", fmt.Errorf("the size changed to %d", overwritten.Size()))
 	}
@@ -332,7 +327,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if short == nil {
 		fail("Truncate", fmt.Errorf("truncate returned nothing"))
 	}
-	defer short.Close()
 	if short.Size() != cut {
 		fail("Truncate", fmt.Errorf("size is %d, wanted %d", short.Size(), cut))
 	}
@@ -390,11 +384,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("SharedObjects", err)
 	}
-	defer func() {
-		for _, o := range shared {
-			o.Close()
-		}
-	}()
 	if len(shared) == 0 {
 		fail("SharedObjects", fmt.Errorf("the key lists nothing"))
 	}
@@ -421,11 +410,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("SharedSDK.Objects", err)
 	}
-	defer func() {
-		for _, o := range theirs {
-			o.Close()
-		}
-	}()
 	if len(theirs) == 0 {
 		fail("SharedSDK.Objects", fmt.Errorf("the recipient lists nothing"))
 	}
@@ -435,7 +419,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("SharedSDK.Object", err)
 	}
-	defer byID.Close()
 	info("fetched %v by id, %s", byID.ID(), bytes4(byID.Size()))
 
 	theirHosts, err := shard.Hosts(ctx, siastorage.HostQuery{Limit: 5})
@@ -486,11 +469,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("PackedUpload.Finalize", err)
 	}
-	defer func() {
-		for _, o := range packedObjs {
-			o.Close()
-		}
-	}()
 	info("%d objects came back", len(packedObjs))
 	// As with a plain upload, finalizing pins the slabs but not the object
 	// records, so each still has to be pinned to exist at the indexer.
@@ -521,7 +499,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 			fail("ObjectEvents", err)
 		}
 		if len(events) == 0 {
-			siastorage.CloseObjects(events)
 			break
 		}
 		for _, e := range events {
@@ -531,7 +508,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 			}
 		}
 		cursor = events[len(events)-1].Cursor()
-		siastorage.CloseObjects(events)
 	}
 	info("%d event(s) read, the feed is caught up", seen)
 

@@ -132,7 +132,6 @@ func ExampleSDK_Upload() {
 	if err != nil {
 		log.Fatal("failed to finish upload:", err)
 	}
-	defer obj.Close()
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
 		log.Fatal("failed to pin object:", err)
@@ -271,7 +270,6 @@ func ExampleSDK_UploadPacked() {
 		if err := sdk.PinObject(ctx, obj); err != nil {
 			log.Fatal("failed to pin object:", err)
 		}
-		obj.Close()
 	}
 }
 
@@ -330,7 +328,6 @@ func ExampleConnectShared() {
 
 	for _, obj := range objects {
 		fmt.Printf("%v, %d bytes\n", obj.ID(), obj.Size())
-		obj.Close()
 	}
 }
 
@@ -351,7 +348,6 @@ func ExampleSDK_Object() {
 	if err != nil {
 		log.Fatal("failed to fetch the object:", err)
 	}
-	defer obj.Close()
 
 	fmt.Printf("%v is %d bytes, uploaded %v\n", obj.ID(), obj.Size(), obj.CreatedAt())
 	fmt.Printf("it occupies %d bytes on the network after redundancy\n", obj.EncodedSize())
@@ -416,7 +412,6 @@ func ExampleSDK_SealObject() {
 	if err != nil {
 		log.Fatal("failed to open the sealed object:", err)
 	}
-	defer reopened.Close()
 
 	fmt.Printf("reopened %v, %d bytes\n", reopened.ID(), reopened.Size())
 }
@@ -435,7 +430,6 @@ func ExampleSDK_ObjectFromShareURL() {
 	if err != nil {
 		log.Fatal("failed to resolve the share URL:", err)
 	}
-	defer obj.Close()
 
 	dl, err := sdk.Download(ctx, obj)
 	if err != nil {
@@ -476,7 +470,6 @@ func ExampleSDK_ObjectEvents() {
 			}
 			fmt.Printf("%v changed at %v, now %d bytes\n",
 				event.ID, event.UpdatedAt, event.Object.Size())
-			event.Object.Close()
 		}
 
 		// Take the cursor from the last event of the page rather than
@@ -491,7 +484,7 @@ func ExampleSDK_ObjectEvents() {
 // Metadata is held on the object handle, and whichever call next sends the
 // handle to the indexer persists it. For an object that has not been pinned
 // yet, that call is SDK.PinObject, so no separate metadata call is needed.
-func ExampleObject_SetMetadata() {
+func ExampleObject_WithMetadata() {
 	ctx := context.Background()
 	var sdk *siastorage.SDK
 	var src io.Reader
@@ -510,10 +503,9 @@ func ExampleObject_SetMetadata() {
 	if err != nil {
 		log.Fatal("failed to finish upload:", err)
 	}
-	defer obj.Close()
 
 	// Sets it on the handle only.
-	obj.SetMetadata([]byte(`{"filename":"holiday.jpg","tags":["2026"]}`))
+	obj = obj.WithMetadata([]byte(`{"filename":"holiday.jpg","tags":["2026"]}`))
 
 	// Pinning seals the object, and the sealed form carries the metadata, so
 	// this is what stores it.
@@ -523,7 +515,7 @@ func ExampleObject_SetMetadata() {
 }
 
 // Changing the metadata of an object that is already pinned takes two steps,
-// because Object.SetMetadata only touches the local handle. This is the
+// because Object.WithMetadata only produces a new object locally. This is the
 // call that sends the change to the indexer.
 func ExampleSDK_UpdateObjectMetadata() {
 	ctx := context.Background()
@@ -532,7 +524,7 @@ func ExampleSDK_UpdateObjectMetadata() {
 
 	fmt.Printf("metadata before: %s\n", obj.Metadata())
 
-	obj.SetMetadata([]byte(`{"filename":"holiday.jpg","tags":["2026","edited"]}`))
+	obj = obj.WithMetadata([]byte(`{"filename":"holiday.jpg","tags":["2026","edited"]}`))
 
 	if err := sdk.UpdateObjectMetadata(ctx, obj); err != nil {
 		log.Fatal("failed to update the object metadata:", err)
@@ -582,7 +574,6 @@ func ExampleObject_Truncate() {
 	if prefix == nil {
 		log.Fatal("the object handle was already closed")
 	}
-	defer prefix.Close()
 
 	// This only rewrote the slab list. Nothing is stored until it is pinned.
 	if err := sdk.PinObject(ctx, prefix); err != nil {
@@ -617,7 +608,6 @@ func ExampleSDK_Upload_redundancy() {
 	if err != nil {
 		log.Fatal("failed to finish upload:", err)
 	}
-	defer obj.Close()
 
 	fmt.Printf("%d bytes stored as %d bytes on the network\n",
 		obj.Size(), obj.EncodedSize())
@@ -645,7 +635,6 @@ func ExampleSDK_Upload_startOffset() {
 	if err != nil {
 		log.Fatal("failed to finish upload:", err)
 	}
-	defer patched.Close()
 
 	// The rewritten object is a new record until it is pinned.
 	if err := sdk.PinObject(ctx, patched); err != nil {
@@ -677,7 +666,6 @@ func ExampleSDK_Upload_buffering() {
 	if err != nil {
 		log.Fatal("failed to finish upload:", err)
 	}
-	defer obj.Close()
 
 	// The download side has the same knob, counted in chunks rather than
 	// slabs.
@@ -749,7 +737,6 @@ func ExampleSDK_SharedObjects() {
 
 	for _, obj := range objects {
 		fmt.Printf("%v, %d bytes\n", obj.ID(), obj.Size())
-		obj.Close()
 	}
 }
 

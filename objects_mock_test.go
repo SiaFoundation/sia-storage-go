@@ -31,13 +31,11 @@ func TestObjectFetchByID(t *testing.T) {
 	want := payload(payloadSize)
 
 	uploaded := uploadPinned(t, sdk, want)
-	defer uploaded.Close()
 
 	fetched, err := sdk.Object(context.Background(), uploaded.ID())
 	if err != nil {
 		t.Fatalf("fetch by id: %v", err)
 	}
-	defer fetched.Close()
 
 	if fetched.ID() != uploaded.ID() {
 		t.Fatal("the fetched object has a different ID")
@@ -70,10 +68,9 @@ func TestObjectMetadataPersists(t *testing.T) {
 	ctx := context.Background()
 
 	uploaded := uploadPinned(t, sdk, payload(1<<20))
-	defer uploaded.Close()
 
 	want := []byte(`{"filename":"holiday.jpg"}`)
-	uploaded.SetMetadata(want)
+	uploaded = uploaded.WithMetadata(want)
 	if err := sdk.UpdateObjectMetadata(ctx, uploaded); err != nil {
 		t.Fatalf("update metadata: %v", err)
 	}
@@ -82,7 +79,6 @@ func TestObjectMetadataPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	defer fetched.Close()
 	if got := fetched.Metadata(); !bytes.Equal(got, want) {
 		t.Fatalf("metadata came back as %q", got)
 	}
@@ -95,13 +91,11 @@ func TestObjectDelete(t *testing.T) {
 
 	uploaded := uploadPinned(t, sdk, payload(1<<20))
 	id := uploaded.ID()
-	uploaded.Close()
 
 	if err := sdk.DeleteObject(ctx, id); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if obj, err := sdk.Object(ctx, id); err == nil {
-		obj.Close()
+	if _, err := sdk.Object(ctx, id); err == nil {
 		t.Fatal("the object is still fetchable after being deleted")
 	}
 }
@@ -126,7 +120,6 @@ func TestPruneSlabs(t *testing.T) {
 
 	uploaded := uploadPinned(t, sdk, payload(payloadSize))
 	id := uploaded.ID()
-	uploaded.Close()
 
 	if net.PinnedSlabs() == 0 {
 		t.Fatal("the upload pinned no slabs")
@@ -150,7 +143,6 @@ func TestObjectShareURLRoundTrip(t *testing.T) {
 	want := payload(payloadSize)
 
 	uploaded := uploadPinned(t, sdk, want)
-	defer uploaded.Close()
 
 	url, err := sdk.ObjectShareURL(uploaded, time.Now().Add(time.Hour))
 	if err != nil {
@@ -164,7 +156,6 @@ func TestObjectShareURLRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve share url: %v", err)
 	}
-	defer shared.Close()
 	if shared.ID() != uploaded.ID() {
 		t.Fatal("the shared URL resolved to a different object")
 	}
@@ -190,7 +181,6 @@ func TestObjectShareURLRequiresExpiry(t *testing.T) {
 	_, sdk := transferSDK(t)
 
 	uploaded := uploadPayload(t, sdk, payload(1<<20))
-	defer uploaded.Close()
 
 	if _, err := sdk.ObjectShareURL(uploaded, time.Time{}); err == nil {
 		t.Fatal("a zero expiration produced a share URL")
@@ -202,9 +192,8 @@ func TestObjectShareURLRequiresExpiry(t *testing.T) {
 func TestObjectFromBadShareURL(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	obj, err := sdk.ObjectFromShareURL(context.Background(), "https://example.invalid/not-a-share")
+	_, err := sdk.ObjectFromShareURL(context.Background(), "https://example.invalid/not-a-share")
 	if err == nil {
-		obj.Close()
 		t.Fatal("a malformed share URL resolved to an object")
 	}
 	if errors.Is(err, errClosed) {
@@ -221,8 +210,7 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 	want := payload(payloadSize)
 
 	uploaded := uploadPinned(t, sdk, want)
-	defer uploaded.Close()
-	uploaded.SetMetadata([]byte(`{"filename":"sealed.bin"}`))
+	uploaded = uploaded.WithMetadata([]byte(`{"filename":"sealed.bin"}`))
 
 	sealed, err := sdk.SealObject(uploaded)
 	if err != nil {
@@ -239,7 +227,6 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sealed: %v", err)
 	}
-	defer opened.Close()
 
 	if opened.ID() != uploaded.ID() {
 		t.Fatal("the opened object has a different ID")
@@ -273,7 +260,6 @@ func TestSealedObjectRejectsForeignKey(t *testing.T) {
 	net, sdk := transferSDK(t)
 
 	uploaded := uploadPinned(t, sdk, payload(1<<20))
-	defer uploaded.Close()
 	sealed, err := sdk.SealObject(uploaded)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
@@ -287,8 +273,7 @@ func TestSealedObjectRejectsForeignKey(t *testing.T) {
 	}
 	defer other.Close()
 
-	if obj, err := other.ObjectFromSealed(sealed); err == nil {
-		obj.Close()
+	if _, err := other.ObjectFromSealed(sealed); err == nil {
 		t.Fatal("a sealed object opened under a different app key")
 	}
 }
@@ -300,7 +285,6 @@ func TestSealedObjectRejectsInvalid(t *testing.T) {
 	_, sdk := transferSDK(t)
 
 	uploaded := uploadPinned(t, sdk, payload(1<<20))
-	defer uploaded.Close()
 	sealed, err := sdk.SealObject(uploaded)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
@@ -318,8 +302,7 @@ func TestSealedObjectRejectsInvalid(t *testing.T) {
 		"an object no slabs":  noSlabs,
 		"a tampered data key": tampered,
 	} {
-		if obj, err := sdk.ObjectFromSealed(bad); err == nil {
-			obj.Close()
+		if _, err := sdk.ObjectFromSealed(bad); err == nil {
 			t.Fatalf("%s opened as a sealed object", name)
 		}
 	}

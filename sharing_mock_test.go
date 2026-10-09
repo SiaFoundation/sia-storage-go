@@ -29,7 +29,6 @@ func TestSharingKeyLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	obj := uploadPinned(t, sdk, payload(payloadSize))
-	defer obj.Close()
 
 	key, err := sdk.CreateSharingKey(ctx, "holiday album", time.Time{})
 	if err != nil {
@@ -63,9 +62,6 @@ func TestSharingKeyLifecycle(t *testing.T) {
 		t.Fatalf("list shared: %v", err)
 	}
 	defer func() {
-		for _, o := range shared {
-			o.Close()
-		}
 	}()
 	if len(shared) != 1 {
 		t.Fatalf("the key lists %d objects, want 1", len(shared))
@@ -86,9 +82,6 @@ func TestSharingKeyLifecycle(t *testing.T) {
 	if after, err := sdk.SharedObjects(ctx, key, 0, 0); err != nil {
 		t.Fatalf("list after unshare: %v", err)
 	} else if len(after) != 0 {
-		for _, o := range after {
-			o.Close()
-		}
 		t.Fatalf("the key still lists %d objects after detaching", len(after))
 	}
 
@@ -131,7 +124,6 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 	want := payload(payloadSize)
 
 	obj := uploadPinned(t, sdk, want)
-	defer obj.Close()
 
 	key, err := sdk.CreateSharingKey(ctx, "reader", time.Time{})
 	if err != nil {
@@ -152,7 +144,6 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 	if len(shared) != 1 {
 		t.Fatalf("the recipient sees %d objects, want 1", len(shared))
 	}
-	defer shared[0].Close()
 
 	dl, err := sdk.Download(ctx, shared[0])
 	if err != nil {

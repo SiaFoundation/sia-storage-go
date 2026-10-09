@@ -123,7 +123,6 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 		return s, fmt.Errorf("upload finish: %w", err)
 	}
 	s.UploadNS = time.Since(start).Nanoseconds()
-	defer obj.Close()
 
 	s.EncodedBytes = int64(obj.EncodedSize())
 	s.ObjectID = obj.ID().String()

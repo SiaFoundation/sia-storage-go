@@ -118,11 +118,14 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, opts ...UploadOption) (*U
 	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return nil, errClosed
 	}
+	objPtr, err := obj.native()
+	if err != nil {
+		return nil, err
+	}
+	defer C.sia_object_free(objPtr)
 
 	progressID := registerProgress(o.OnShard)
 
@@ -145,7 +148,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, opts ...UploadOption) (*U
 
 	var ptr *C.sia_upload_t
 	var cerr *C.char
-	code := C.sia_upload_start(s.ptr, obj.ptr, &copts, &ptr, &cerr)
+	code := C.sia_upload_start(s.ptr, objPtr, &copts, &ptr, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {
