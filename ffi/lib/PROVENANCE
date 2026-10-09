@@ -1,3 +1,3 @@
-sia-sdk-rs: 92eb30d8873174fdabe91ad6a9225cb059e15281
-workflow run: https://github.com/SiaFoundation/sia-storage-go/actions/runs/37080278352
-built: 2026-10-03T00:06:24Z
+sia-sdk-rs: e28ecb564f4bf38f17dc47fd4f0de2c2fac77421
+workflow run: https://github.com/SiaFoundation/sia-storage-go/actions/runs/37965427364
+built: 2026-10-09T17:22:35Z
