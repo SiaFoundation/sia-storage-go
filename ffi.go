@@ -102,9 +102,10 @@ func registerProgress(fn func(ShardProgress)) uintptr {
 	return id
 }
 
-// deliver runs the caller's handler with a recover in place. A panic unwinding
-// from Go into Rust would terminate the process, so a handler that panics costs
-// its own event and nothing further.
+// deliver runs the caller's handler with a recover in place. It runs on the
+// sink's own goroutine, which has no caller to recover for it, so an escaping
+// panic would take the process down. A handler that panics costs its own event
+// and nothing further.
 func deliver(fn func(ShardProgress), p ShardProgress) {
 	defer func() { _ = recover() }()
 	fn(p)
