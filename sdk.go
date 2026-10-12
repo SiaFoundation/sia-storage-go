@@ -205,6 +205,58 @@ func (b *Builder) WaitForApproval(ctx context.Context) error {
 	return goError(ctx, code, cerr)
 }
 
+// Reconnecting reports whether the connect key the user approved with already
+// has an account for this application. A connect key may hold accounts under
+// more than one recovery phrase, so this does not say whether a particular
+// phrase is the one already registered; MatchesExistingAppKey answers that.
+//
+// Only valid once the connection is approved.
+func (b *Builder) Reconnecting() (bool, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return false, errClosed
+	}
+
+	var out C.bool
+	var cerr *C.char
+	code := C.sia_builder_reconnecting(b.ptr, &out, &cerr)
+	runtime.KeepAlive(b)
+	if code != C.SIA_OK {
+		return false, localError(code, cerr)
+	}
+	return bool(out), nil
+}
+
+// MatchesExistingAppKey reports whether mnemonic derives the app key the
+// indexer already knows, so a caller can tell a reconnect from a new
+// registration before calling Register, which cannot be undone. It registers
+// nothing and leaves the builder as it was.
+//
+// Only valid once the connection is approved.
+func (b *Builder) MatchesExistingAppKey(ctx context.Context, mnemonic string) (bool, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return false, errClosed
+	}
+
+	cMnemonic := C.CString(mnemonic)
+	defer C.free(unsafe.Pointer(cMnemonic))
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var out C.bool
+	var cerr *C.char
+	code := C.sia_builder_matches_existing_app_key(b.ptr, cMnemonic, tok, &out, &cerr)
+	runtime.KeepAlive(b)
+	if code != C.SIA_OK {
+		return false, goError(ctx, code, cerr)
+	}
+	return bool(out), nil
+}
+
 // Register derives an app key from mnemonic and registers it with the indexer.
 func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
 	b.mu.RLock()
@@ -249,6 +301,43 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 	var ptr *C.sia_sdk_t
 	var cerr *C.char
 	code := C.sia_builder_connect(b.ptr, (*C.uint8_t)(unsafe.Pointer(&appKey[0])), tok, &ptr, &cerr)
+	runtime.KeepAlive(b)
+	if code != C.SIA_OK {
+		return nil, goError(ctx, code, cerr)
+	}
+	return wrapSDK(ptr), nil
+}
+
+// ConnectPreAuthorized connects with a key the indexer has already authorized,
+// doing request, approve and register in one call with nothing to wait for.
+// The app key is derived from mnemonic, so a different phrase registers a new
+// account rather than reconnecting to the existing one.
+//
+// Consumes the builder, cancellation included, since the key may already have
+// been spent.
+//
+// Only the first 32 bytes of preAuthorizedKey are sent, which is the seed the
+// rest of the key is derived from.
+func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey types.PrivateKey, mnemonic string) (*SDK, error) {
+	if len(preAuthorizedKey) < 32 {
+		return nil, errors.New("pre-authorized key must be at least 32 bytes")
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, errClosed
+	}
+
+	cMnemonic := C.CString(mnemonic)
+	defer C.free(unsafe.Pointer(cMnemonic))
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	var ptr *C.sia_sdk_t
+	var cerr *C.char
+	code := C.sia_builder_connect_pre_authorized(b.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&preAuthorizedKey[0])), cMnemonic, tok, &ptr, &cerr)
 	runtime.KeepAlive(b)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
