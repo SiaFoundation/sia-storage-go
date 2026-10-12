@@ -69,6 +69,7 @@ extern "C"
 	typedef struct sia_cancel sia_cancel_t;
 	typedef struct sia_sharing_key sia_sharing_key_t;
 	typedef struct sia_key_records sia_key_records_t;
+	typedef struct sia_object_summaries sia_object_summaries_t;
 	typedef struct sia_shared_sdk sia_shared_sdk_t;
 	typedef struct sia_mock sia_mock_t;
 
@@ -80,9 +81,20 @@ extern "C"
 		uint64_t pinned_data;
 		uint64_t pinned_size;
 		int64_t created_at_unix_us;
+		int64_t updated_at_unix_us;
 		bool has_expiry; // false means the key never expires
 		int64_t expires_at_unix_us;
 	} sia_key_stats_t;
+
+	// The fixed part of an object summary. Metadata is variable length, so it
+	// is read separately with sia_object_summaries_metadata.
+	typedef struct
+	{
+		uint8_t id[32];
+		uint64_t size;
+		int64_t created_at_unix_us;
+		int64_t updated_at_unix_us;
+	} sia_object_summary_t;
 
 	typedef struct
 	{
@@ -177,7 +189,19 @@ extern "C"
 	// waiting, and calling it again reattaches to the same request.
 	int32_t sia_builder_request_connection(sia_builder_t *b, sia_cancel_t *cancel, char **response_url, char **err);
 	int32_t sia_builder_wait_for_approval(sia_builder_t *b, sia_cancel_t *cancel, char **err);
+	// Both ask about an approved connection and leave the builder as it was.
+	// reconnecting asks whether the connect key already has an account for this
+	// application; matches_existing_app_key asks whether one phrase is the one
+	// already registered, since a connect key may hold accounts under several.
+	int32_t sia_builder_reconnecting(const sia_builder_t *b, bool *out, char **err);
+	int32_t sia_builder_matches_existing_app_key(const sia_builder_t *b, const char *mnemonic, sia_cancel_t *cancel, bool *out, char **err);
 	int32_t sia_builder_register(sia_builder_t *b, const char *mnemonic, sia_cancel_t *cancel, sia_sdk_t **out, char **err);
+	// Connects with a key the indexer has already authorized, doing request,
+	// approve and register in one call with nothing to wait for. Consumes the
+	// builder, cancellation included, since the key may already be spent.
+	// The app key is derived from mnemonic, so a different phrase registers a
+	// new account rather than reconnecting to the existing one.
+	int32_t sia_builder_connect_pre_authorized(sia_builder_t *b, const uint8_t pre_authorized_key[32], const char *mnemonic, sia_cancel_t *cancel, sia_sdk_t **out, char **err);
 
 	void sia_sdk_free(sia_sdk_t *sdk);
 	void sia_sdk_app_key(const sia_sdk_t *sdk, uint8_t out[32]);
@@ -265,13 +289,15 @@ extern "C"
 	// object's data is exhausted, then add_finish (which reports the number of
 	// bytes packed). finalize returns the packed objects.
 	int32_t sia_packed_upload_start(const sia_sdk_t *sdk, const sia_upload_options_t *opts, sia_packed_upload_t **out, char **err);
-	// Both return immediately, including while an add is in progress. During an
-	// add they report the figures from before it began, since the bytes it will
-	// contribute are not settled until add_finish. Call them between adds for
-	// an exact answer.
+	// These return immediately, including while an add is in progress. During
+	// an add they report the figures from before it began, since the bytes it
+	// will contribute are not settled until add_finish. Call them between adds
+	// for an exact answer.
 	uint64_t sia_packed_upload_remaining(const sia_packed_upload_t *up);
 	uint64_t sia_packed_upload_length(const sia_packed_upload_t *up);
 	uint64_t sia_packed_upload_optimal_data_size(const sia_packed_upload_t *up);
+	// Slabs the finalized upload will occupy.
+	uint64_t sia_packed_upload_slabs(const sia_packed_upload_t *up);
 	int32_t sia_packed_upload_add_begin(sia_packed_upload_t *up, char **err);
 	// Any status other than SIA_OK ends the add, SIA_ERR_CANCELLED included.
 	// Part of the buffer may already be in the stream and there is no count to
@@ -371,6 +397,21 @@ extern "C"
 	// *out_objs receives a heap array of owned object handles. Free the array
 	// (not the objects) with sia_object_array_free.
 	int32_t sia_shared_sdk_objects(const sia_shared_sdk_t *sdk, uint64_t offset, uint64_t limit, sia_cancel_t *cancel, sia_object_t ***out_objs, size_t *out_len, char **err);
+	// Lists the same objects without their slabs, which is a small fraction of
+	// the size. Enough to show an object, not to download it: fetch the full
+	// object by id for that. Pass 0 for offset or limit to take the indexer's
+	// default paging.
+	int32_t sia_shared_sdk_object_summaries(const sia_shared_sdk_t *sdk, uint64_t offset, uint64_t limit, sia_cancel_t *cancel, sia_object_summaries_t **out, char **err);
+
+	size_t sia_object_summaries_len(const sia_object_summaries_t *s);
+	// Copies the summary at i out. Returns false when i is out of range,
+	// leaving out untouched.
+	bool sia_object_summaries_at(const sia_object_summaries_t *s, size_t i, sia_object_summary_t *out);
+	// Returns the metadata length of the summary at i. If buf is non-NULL and
+	// cap is large enough, copies the metadata into buf. An i out of range
+	// reports 0.
+	size_t sia_object_summaries_metadata(const sia_object_summaries_t *s, size_t i, uint8_t *buf, size_t cap);
+	void sia_object_summaries_free(sia_object_summaries_t *s);
 	// Reads with sia_download_read and frees with sia_download_free, like a
 	// download started from a sia_sdk_t. It keeps its own token refresh alive,
 	// so it stays usable after sia_shared_sdk_free.
