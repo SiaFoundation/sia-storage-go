@@ -208,6 +208,20 @@ func (p *PackedUpload) OptimalDataSize() int64 {
 	return n
 }
 
+// Slabs reports how many slabs the finalized upload will occupy, and zero once
+// the upload has been finalized or closed. It blocks while an Add is running,
+// as Remaining does.
+func (p *PackedUpload) Slabs() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return 0
+	}
+	n := int64(C.sia_packed_upload_slabs(p.ptr))
+	runtime.KeepAlive(p)
+	return n
+}
+
 // Finalize uploads the packed slabs and returns one object per Add, in the
 // order they were added. Every object is a handle the caller owns and must
 // Close.

@@ -114,6 +114,9 @@ func TestPackedUploadAccounting(t *testing.T) {
 	if before == 0 {
 		t.Fatal("a fresh packed upload has no room")
 	}
+	if pu.Slabs() != 0 {
+		t.Fatalf("a fresh packed upload already occupies %d slabs", pu.Slabs())
+	}
 
 	const size = 64 << 10
 	if _, err := pu.Add(bytes.NewReader(payload(size))); err != nil {
@@ -124,6 +127,11 @@ func TestPackedUploadAccounting(t *testing.T) {
 	}
 	if pu.Remaining() >= before {
 		t.Fatalf("remaining went from %d to %d after an add", before, pu.Remaining())
+	}
+	// Slabs is derived from the figures Length and OptimalDataSize report, so
+	// read between adds the three have to agree.
+	if want := (pu.Length() + optimal - 1) / optimal; pu.Slabs() != want {
+		t.Fatalf("slabs is %d, want %d for %d bytes at %d per slab", pu.Slabs(), want, pu.Length(), optimal)
 	}
 }
 
@@ -271,7 +279,7 @@ type errReader struct{ err error }
 
 func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 
-// TestPackedUploadQueriesAfterClose proves the three query methods do not read
+// TestPackedUploadQueriesAfterClose proves the four query methods do not read
 // a handle that Close already freed. They were the only methods on the type
 // that took neither the mutex nor the done flag, so before the guard this test
 // killed the process with SIGBUS rather than failing.
@@ -297,5 +305,8 @@ func TestPackedUploadQueriesAfterClose(t *testing.T) {
 	}
 	if n := pu.OptimalDataSize(); n != 0 {
 		t.Errorf("OptimalDataSize after Close = %d, want 0", n)
+	}
+	if n := pu.Slabs(); n != 0 {
+		t.Errorf("Slabs after Close = %d, want 0", n)
 	}
 }
