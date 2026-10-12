@@ -25,8 +25,7 @@ type ObjectEvent struct {
 
 	UpdatedAt time.Time
 
-	// Object is nil for a deletion. Otherwise it is a handle the caller owns
-	// and must Close.
+	// Object is nil for a deletion.
 	Object *Object
 }
 

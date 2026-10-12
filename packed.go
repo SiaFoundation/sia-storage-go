@@ -223,8 +223,7 @@ func (p *PackedUpload) Slabs() int64 {
 }
 
 // Finalize uploads the packed slabs and returns one object per Add, in the
-// order they were added. Every object is a handle the caller owns and must
-// Close.
+// order they were added.
 //
 // It consumes the upload whatever it returns, so Close afterwards is a no op.
 func (p *PackedUpload) Finalize() ([]*Object, error) {

@@ -332,8 +332,8 @@ func ExampleConnectShared() {
 }
 
 // An object ID is all that has to be stored to find an object again. Fetching
-// by ID decrypts the keys and metadata the record carries, so the result is a
-// handle ready to download from.
+// by ID decrypts the keys and metadata the record carries, so the result is
+// ready to download from.
 func ExampleSDK_Object() {
 	ctx := context.Background()
 	var sdk *siastorage.SDK
@@ -381,10 +381,9 @@ func ExampleSDK_DeleteObject() {
 	}
 }
 
-// A sealed object is the one thing this package hands back by value rather
-// than as a handle, because an application keeping its own index needs the
-// fields to persist. It is locked with the account's app key, so only the same
-// account can open it again.
+// A sealed object exposes its fields, unlike an [siastorage.Object], because an
+// application keeping its own index needs them to persist. It is locked with
+// the account's app key, so only the same account can open it again.
 func ExampleSDK_SealObject() {
 	var sdk *siastorage.SDK
 	var obj *siastorage.Object
@@ -402,7 +401,7 @@ func ExampleSDK_SealObject() {
 	}
 	fmt.Printf("persisting %d bytes for object %v\n", len(row), sealed.ID())
 
-	// Later, in another process, turn the stored form back into a handle.
+	// Later, in another process, turn the stored form back into an object.
 	var restored siastorage.SealedObject
 	if err := json.Unmarshal(row, &restored); err != nil {
 		log.Fatal("failed to decode the sealed object:", err)
@@ -481,9 +480,9 @@ func ExampleSDK_ObjectEvents() {
 	fmt.Println("save this cursor for the next poll:", cursor.After, cursor.AfterID)
 }
 
-// Metadata is held on the object handle, and whichever call next sends the
-// handle to the indexer persists it. For an object that has not been pinned
-// yet, that call is SDK.PinObject, so no separate metadata call is needed.
+// Metadata is held on the object, and whichever call next sends it to the
+// indexer persists it. For an object that has not been pinned yet, that call
+// is SDK.PinObject, so no separate metadata call is needed.
 func ExampleObject_WithMetadata() {
 	ctx := context.Background()
 	var sdk *siastorage.SDK
@@ -504,7 +503,7 @@ func ExampleObject_WithMetadata() {
 		log.Fatal("failed to finish upload:", err)
 	}
 
-	// Sets it on the handle only.
+	// Sets it locally only.
 	obj = obj.WithMetadata([]byte(`{"filename":"holiday.jpg","tags":["2026"]}`))
 
 	// Pinning seals the object, and the sealed form carries the metadata, so
@@ -562,8 +561,7 @@ func ExampleSDK_Hosts() {
 }
 
 // Truncate rewrites the slab list of a copy, leaving the original untouched.
-// Both handles have to be closed, and the copy is not known to the indexer
-// until it is pinned.
+// The copy is not known to the indexer until it is pinned.
 func ExampleObject_Truncate() {
 	ctx := context.Background()
 	var sdk *siastorage.SDK
@@ -572,7 +570,7 @@ func ExampleObject_Truncate() {
 	// The first megabyte of the object, as a new object.
 	prefix := obj.Truncate(1 << 20)
 	if prefix == nil {
-		log.Fatal("the object handle was already closed")
+		log.Fatal("the object is not usable")
 	}
 
 	// This only rewrote the slab list. Nothing is stored until it is pinned.

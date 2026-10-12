@@ -44,7 +44,7 @@ func TestObjectFetchByID(t *testing.T) {
 		t.Fatalf("fetched size %d, uploaded %d", fetched.Size(), uploaded.Size())
 	}
 
-	// The fetched handle has to carry usable keys, not just the right numbers,
+	// The fetched object has to carry usable keys, not just the right numbers,
 	// so read it back through the download path.
 	dl, err := sdk.Download(context.Background(), fetched)
 	if err != nil {
@@ -187,8 +187,8 @@ func TestObjectShareURLRequiresExpiry(t *testing.T) {
 	}
 }
 
-// TestObjectFromBadShareURL proves a malformed URL is an error rather than a
-// handle that fails later.
+// TestObjectFromBadShareURL proves a malformed URL is an error rather than an
+// object that fails later.
 func TestObjectFromBadShareURL(t *testing.T) {
 	_, sdk := transferSDK(t)
 
@@ -254,8 +254,8 @@ func TestSealedObjectRoundTrip(t *testing.T) {
 }
 
 // TestSealedObjectRejectsForeignKey proves the signature check is real, so a
-// sealed object from another account fails to open rather than yielding a
-// handle that reads nothing.
+// sealed object from another account fails to open rather than yielding an
+// object that reads nothing.
 func TestSealedObjectRejectsForeignKey(t *testing.T) {
 	net, sdk := transferSDK(t)
 
@@ -279,7 +279,7 @@ func TestSealedObjectRejectsForeignKey(t *testing.T) {
 }
 
 // TestSealedObjectRejectsInvalid proves a sealed object that does not verify is
-// an error rather than a handle that reads nothing. The typed API rules out the
+// an error rather than an object that reads nothing. The typed API rules out the
 // malformed document, so what is left is one that decodes and then fails.
 func TestSealedObjectRejectsInvalid(t *testing.T) {
 	_, sdk := transferSDK(t)
