@@ -49,6 +49,9 @@ func TestSharingKeyLifecycle(t *testing.T) {
 	if rec.Stats.CreatedAt.IsZero() {
 		t.Fatal("createdAt is zero")
 	}
+	if rec.Stats.UpdatedAt.IsZero() {
+		t.Fatal("updatedAt is zero")
+	}
 	if rec.Stats.ObjectCount != 0 {
 		t.Fatalf("a fresh key already has %d objects", rec.Stats.ObjectCount)
 	}
