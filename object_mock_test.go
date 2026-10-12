@@ -13,7 +13,7 @@ import (
 	"go.sia.tech/core/types"
 )
 
-// TestObjectEmpty covers the accessors on a fresh handle, before an upload has
+// TestObjectEmpty covers the accessors on a fresh object, before an upload has
 // given it slabs or timestamps.
 func TestObjectEmpty(t *testing.T) {
 	obj := NewEmptyObject()

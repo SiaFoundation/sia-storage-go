@@ -252,8 +252,6 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 
 // SharedObjects lists the objects attached to key. A zero offset and limit take
 // the indexer's defaults.
-//
-// Every returned object is a handle the caller owns and must Close.
 func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit int) ([]*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

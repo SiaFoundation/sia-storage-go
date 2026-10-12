@@ -104,8 +104,6 @@ func (s *SharedSDK) Stats(ctx context.Context) (KeyStats, error) {
 }
 
 // Object fetches and decrypts one object the key grants access to.
-//
-// The result is a handle the caller owns and must Close.
 func (s *SharedSDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -127,8 +125,6 @@ func (s *SharedSDK) Object(ctx context.Context, id types.Hash256) (*Object, erro
 
 // Objects lists and decrypts a page of the objects the key grants access to. A
 // zero offset and limit take the indexer's defaults.
-//
-// Every returned object is a handle the caller owns and must Close.
 func (s *SharedSDK) Objects(ctx context.Context, offset, limit int) ([]*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

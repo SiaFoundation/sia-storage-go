@@ -21,9 +21,9 @@ import (
 	"go.sia.tech/indexd/slabs"
 )
 
-// A SealedObject is an object locked with the account's app key. It is the one
-// thing a caller sees inside rather than holds as a handle, because a consumer
-// persisting objects into its own schema needs the fields.
+// A SealedObject is an object locked with the account's app key. Its fields are
+// exposed, unlike those of [Object], because a consumer persisting objects into
+// its own schema needs them.
 type SealedObject = slabs.SealedObject
 
 // An Object is a collection of slabs plus the keys needed to read them.
@@ -226,8 +226,8 @@ func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
 // not already pinned.
 //
 // An upload pins the slabs it writes but not the object itself, so until this
-// is called the object exists only as a local handle and no lookup by ID, share
-// URL or delete can find it.
+// is called the object exists only locally and no lookup by ID, share URL or
+// delete can find it.
 func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -420,7 +420,7 @@ func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 // signatures against the account's app key.
 //
 // A sealed object produced under a different app key fails here rather than
-// producing a handle that cannot read anything.
+// producing an object that cannot read anything.
 func (s *SDK) ObjectFromSealed(sealed SealedObject) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

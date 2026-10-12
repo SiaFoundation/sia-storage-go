@@ -10,7 +10,7 @@ import (
 )
 
 // TestObjectEventsReportWrites proves a pinned object shows up in the change
-// feed, carrying a usable handle rather than just an ID.
+// feed, carrying a usable object rather than just an ID.
 func TestObjectEventsReportWrites(t *testing.T) {
 	_, sdk := transferSDK(t)
 	ctx := context.Background()
