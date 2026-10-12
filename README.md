@@ -25,10 +25,10 @@ extra tooling.
 
 ## Usage
 
-Every exported call has a runnable example in the
-[Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261002235308-d2590c25520a#pkg-examples), covering
-connecting and registering, uploading and downloading, packed uploads, sharing
-keys and share URLs, the object event feed and the tuning options.
+The [Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261002235308-d2590c25520a#pkg-examples)
+carry runnable examples for connecting and registering, uploading and
+downloading, packed uploads, sharing keys and share URLs, the object event feed
+and the tuning options.
 
 `examples/demo` walks the whole surface end to end against a real indexer.
 
