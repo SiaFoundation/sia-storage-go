@@ -97,6 +97,7 @@ type KeyStats struct {
 	PinnedSize uint64
 
 	CreatedAt time.Time
+	UpdatedAt time.Time
 
 	// ExpiresAt is the zero time when the key never expires.
 	ExpiresAt time.Time
@@ -120,6 +121,7 @@ func goKeyStats(s C.sia_key_stats_t) KeyStats {
 		PinnedData:  uint64(s.pinned_data),
 		PinnedSize:  uint64(s.pinned_size),
 		CreatedAt:   unixMicro(int64(s.created_at_unix_us)),
+		UpdatedAt:   unixMicro(int64(s.updated_at_unix_us)),
 	}
 	if bool(s.has_expiry) {
 		stats.ExpiresAt = unixMicro(int64(s.expires_at_unix_us))
