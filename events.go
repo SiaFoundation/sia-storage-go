@@ -25,7 +25,8 @@ type ObjectEvent struct {
 
 	UpdatedAt time.Time
 
-	// Object is nil for a deletion.
+	// Object is nil for a deletion. Otherwise it is a handle the caller owns
+	// and may Close.
 	Object *Object
 }
 
@@ -121,4 +122,16 @@ func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([
 // Cursor returns the cursor that resumes a listing after e.
 func (e ObjectEvent) Cursor() EventCursor {
 	return EventCursor{After: e.UpdatedAt, AfterID: e.ID}
+}
+
+// CloseObjects releases the objects in a page of events, for a caller that
+// only wanted the IDs. Closing is optional, since an object the collector
+// reaches is released anyway, but a caller walking a long feed can free the
+// native memory as it goes rather than waiting for a collection.
+func CloseObjects(events []ObjectEvent) {
+	for _, e := range events {
+		if e.Object != nil {
+			e.Object.Close()
+		}
+	}
 }

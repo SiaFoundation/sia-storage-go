@@ -147,12 +147,11 @@ func TestSDKCloseDuringCall(t *testing.T) {
 	}
 }
 
-// TestObjectConcurrentUse proves an object is safe to share between goroutines
-// without a lock. Nothing can change one once it exists: WithMetadata returns a
-// new object and leaves the receiver alone, and Metadata hands back a copy. The
-// old handle needed a mutex because sia_object_set_metadata mutated it in
-// place, which left Metadata able to size a buffer against one value and fill
-// it from another.
+// TestObjectConcurrentUse proves an object is safe to share between goroutines.
+// Nothing can change one once it exists: the ABI has no setter, WithMetadata
+// returns a new object and leaves the receiver alone, and Metadata hands back a
+// copy. The lock the type carries guards the handle against Close, not the
+// values the accessors report.
 //
 // The race detector is what makes this test meaningful; it passes trivially
 // without -race.
