@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -29,13 +30,17 @@ type SealedObject = slabs.SealedObject
 // An Object is a collection of slabs plus the keys needed to read them.
 //
 // It has no exported fields, because the data key it carries must not leak.
-// Use the accessors.
+// Use the accessors, and Close when finished, since the handle is owned by the
+// native side rather than by Go.
 type Object struct {
-	// encoded is the whole object as the native side wrote it. The calls that
-	// need one rebuild it, use it and release it before returning, so an
-	// Object is an ordinary Go value: copy it, store it, share it between
-	// goroutines, and let the collector have it when you are done.
-	encoded []byte
+	ptr     *C.sia_object_t
+	cleanup runtime.Cleanup
+
+	// mu guards ptr against Close. Every method that hands the handle to C
+	// holds it for the read, so Close cannot free the handle underneath a
+	// call already running on another goroutine.
+	mu     sync.RWMutex
+	closed bool
 
 	// Read once, when the object was built. Nothing can change an object, so
 	// these never go stale: WithMetadata and Truncate return a new one rather
@@ -54,30 +59,14 @@ func NewEmptyObject() *Object {
 	return wrapObject(C.sia_object_new())
 }
 
-// wrapObject reads everything out of a native object and releases it. The
-// result owns no native memory.
+// wrapObject takes ownership of a native object and reads out everything the
+// accessors answer from Go.
 func wrapObject(ptr *C.sia_object_t) *Object {
 	if ptr == nil {
 		return nil
 	}
-	defer C.sia_object_free(ptr)
-	return readObject(ptr)
-}
-
-// readObject reads everything out of a native object, leaving it to the
-// caller to release.
-func readObject(ptr *C.sia_object_t) *Object {
-	n := C.sia_object_encode(ptr, nil, 0)
-	if n == 0 {
-		return nil
-	}
-	buf := make([]byte, int(n))
-	if C.sia_object_encode(ptr, (*C.uint8_t)(unsafe.Pointer(&buf[0])), n) != n {
-		return nil
-	}
-
 	o := &Object{
-		encoded:     buf,
+		ptr:         ptr,
 		size:        uint64(C.sia_object_size(ptr)),
 		encodedSize: uint64(C.sia_object_encoded_size(ptr)),
 		createdAt:   unixMicro(int64(C.sia_object_created_at(ptr))),
@@ -85,7 +74,28 @@ func readObject(ptr *C.sia_object_t) *Object {
 		metadata:    nativeMetadata(ptr),
 	}
 	C.sia_object_id(ptr, cBytes32((*[32]byte)(&o.id)))
+	o.cleanup = runtime.AddCleanup(o, func(p *C.sia_object_t) {
+		C.sia_object_free(p)
+	}, ptr)
 	return o
+}
+
+// Close releases the object. It is safe to call more than once, and waits for
+// any call already using the handle to return.
+//
+// The accessors keep answering afterwards, since they report values copied
+// when the object was built. What stops working is whatever needs the native
+// side: WithMetadata and Truncate return nil, and an SDK call fails.
+func (o *Object) Close() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return nil
+	}
+	o.closed = true
+	o.cleanup.Stop()
+	C.sia_object_free(o.ptr)
+	return nil
 }
 
 // nativeMetadata copies an object's metadata out of a native handle.
@@ -101,22 +111,6 @@ func nativeMetadata(ptr *C.sia_object_t) []byte {
 		return nil
 	}
 	return buf
-}
-
-// native rebuilds the object on the native side for the duration of one call.
-// The caller must release the result with C.sia_object_free.
-func (o *Object) native() (*C.sia_object_t, error) {
-	if o == nil || len(o.encoded) == 0 {
-		return nil, errors.New("object is not usable")
-	}
-	var ptr *C.sia_object_t
-	var cerr *C.char
-	code := C.sia_object_decode((*C.uint8_t)(unsafe.Pointer(&o.encoded[0])),
-		C.size_t(len(o.encoded)), &ptr, &cerr)
-	if code != C.SIA_OK {
-		return nil, goError(context.Background(), code, cerr)
-	}
-	return ptr, nil
 }
 
 // ID returns the object's identifier, which is a hash of its slabs. An empty
@@ -158,21 +152,20 @@ func (o *Object) Metadata() []byte {
 // indexer stores the metadata: [SDK.PinObject] for an object that is not
 // pinned yet, or [SDK.UpdateObjectMetadata] for one that is.
 func (o *Object) WithMetadata(metadata []byte) *Object {
-	ptr, err := o.native()
-	if err != nil {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
 		return nil
 	}
-	defer C.sia_object_free(ptr)
-
+	var ptr *C.sia_object_t
 	if len(metadata) == 0 {
-		C.sia_object_set_metadata(ptr, nil, 0)
+		ptr = C.sia_object_with_metadata(o.ptr, nil, 0)
 	} else {
-		C.sia_object_set_metadata(ptr,
+		ptr = C.sia_object_with_metadata(o.ptr,
 			(*C.uint8_t)(unsafe.Pointer(&metadata[0])), C.size_t(len(metadata)))
 	}
-	// set_metadata mutated the handle we already hold, so read it back rather
-	// than building another.
-	return readObject(ptr)
+	runtime.KeepAlive(o)
+	return wrapObject(ptr)
 }
 
 // Truncate returns a copy of the object shortened to length bytes.
@@ -183,12 +176,14 @@ func (o *Object) WithMetadata(metadata []byte) *Object {
 // This only rewrites the slab list. Pin the result with [SDK.PinObject] before
 // the indexer knows about it.
 func (o *Object) Truncate(length uint64) *Object {
-	ptr, err := o.native()
-	if err != nil {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
 		return nil
 	}
-	defer C.sia_object_free(ptr)
-	return wrapObject(C.sia_object_truncate(ptr, C.uint64_t(length)))
+	ptr := C.sia_object_truncate(o.ptr, C.uint64_t(length))
+	runtime.KeepAlive(o)
+	return wrapObject(ptr)
 }
 
 // unixMicro converts the microsecond timestamps the C ABI uses, mapping zero to
@@ -231,20 +226,17 @@ func (s *SDK) Object(ctx context.Context, id types.Hash256) (*Object, error) {
 func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
 		return errClosed
 	}
-	objPtr, err := obj.native()
-	if err != nil {
-		return err
-	}
-	defer C.sia_object_free(objPtr)
 
 	tok, release := cancelToken(ctx)
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_pin_object(s.ptr, objPtr, tok, &cerr)
+	code := C.sia_sdk_pin_object(s.ptr, obj.ptr, tok, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	return goError(ctx, code, cerr)
@@ -262,20 +254,17 @@ func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
 		return errClosed
 	}
-	objPtr, err := obj.native()
-	if err != nil {
-		return err
-	}
-	defer C.sia_object_free(objPtr)
 
 	tok, release := cancelToken(ctx)
 	defer release()
 
 	var cerr *C.char
-	code := C.sia_sdk_update_object_metadata(s.ptr, objPtr, tok, &cerr)
+	code := C.sia_sdk_update_object_metadata(s.ptr, obj.ptr, tok, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	return goError(ctx, code, cerr)
@@ -334,20 +323,17 @@ func (s *SDK) PruneSlabs(ctx context.Context, before time.Time) error {
 func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
 		return "", errClosed
 	}
-	objPtr, err := obj.native()
-	if err != nil {
-		return "", err
-	}
-	defer C.sia_object_free(objPtr)
 
 	if validUntil.IsZero() {
 		return "", errors.New("share URL requires an expiration time")
 	}
 	var cURL, cerr *C.char
-	code := C.sia_sdk_object_share_url(s.ptr, objPtr,
+	code := C.sia_sdk_object_share_url(s.ptr, obj.ptr,
 		C.int64_t(validUntil.UnixMicro()), &cURL, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
@@ -390,17 +376,14 @@ func (s *SDK) ObjectFromShareURL(ctx context.Context, shareURL string) (*Object,
 func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if s.closed || obj.closed {
 		return SealedObject{}, errClosed
 	}
-	objPtr, err := obj.native()
-	if err != nil {
-		return SealedObject{}, err
-	}
-	defer C.sia_object_free(objPtr)
 
 	var cJSON, cerr *C.char
-	code := C.sia_object_seal_json(s.ptr, objPtr, &cJSON, &cerr)
+	code := C.sia_object_seal_json(s.ptr, obj.ptr, &cJSON, &cerr)
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(obj)
 	if code != C.SIA_OK {
