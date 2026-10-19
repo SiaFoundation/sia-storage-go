@@ -78,6 +78,28 @@ func TestObjectIDIsContentAddressed(t *testing.T) {
 	}
 }
 
+// TestEncodedSize pairs the estimate with what an uploaded object reports,
+// since pricing an upload before making it is the point, and checks that zero
+// data shards is an error rather than a panic across the boundary.
+func TestEncodedSize(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	data := frand.Bytes(3 << 20)
+	obj := uploadPayload(t, sdk, data)
+
+	got, err := EncodedSize(uint64(len(data)), 10, 20)
+	if err != nil {
+		t.Fatalf("encoded size: %v", err)
+	}
+	if want := obj.EncodedSize(); got != want {
+		t.Fatalf("estimate is %d, the uploaded object reports %d", got, want)
+	}
+
+	if _, err := EncodedSize(1<<20, 0, 20); err == nil {
+		t.Fatal("zero data shards must be an error")
+	}
+}
+
 // TestSealAndOpenWithKey proves the pair works with no SDK in hand, which is
 // what a process restarting from a stored seed has: sealing and opening are
 // local, so neither needs an indexer. A different key must be refused.
