@@ -332,3 +332,18 @@ func goString(s *C.char) string {
 func NewSeedPhrase() string {
 	return goString(C.sia_generate_recovery_phrase())
 }
+
+// ValidateSeedPhrase reports whether phrase is a usable 12 word BIP-39
+// recovery phrase.
+//
+// A phrase that is merely wrong rather than malformed derives a different app
+// key, so checking before [Builder.Register] separates a typo from a phrase
+// for another account.
+func ValidateSeedPhrase(phrase string) error {
+	cPhrase := C.CString(phrase)
+	defer C.free(unsafe.Pointer(cPhrase))
+
+	var cerr *C.char
+	code := C.sia_validate_recovery_phrase(cPhrase, &cerr)
+	return goError(context.Background(), code, cerr)
+}
