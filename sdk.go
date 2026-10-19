@@ -259,8 +259,10 @@ func (b *Builder) MatchesExistingAppKey(ctx context.Context, mnemonic string) (b
 
 // Register derives an app key from mnemonic and registers it with the indexer.
 func (b *Builder) Register(ctx context.Context, mnemonic string) (*SDK, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	// The write lock, not the read lock: registering consumes the builder on
+	// the native side, which refuses while another call still holds it.
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.closed {
 		return nil, errClosed
 	}
