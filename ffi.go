@@ -333,6 +333,20 @@ func NewSeedPhrase() string {
 	return goString(C.sia_generate_recovery_phrase())
 }
 
+// EncodedSize estimates what dataSize bytes will occupy on the network once
+// erasure coded, so a caller can price an upload before making it. It is the
+// figure [Object.EncodedSize] reports for an object that already exists.
+func EncodedSize(dataSize uint64, dataShards, parityShards uint8) (uint64, error) {
+	var out C.uint64_t
+	var cerr *C.char
+	code := C.sia_encoded_size(C.uint64_t(dataSize), C.uint8_t(dataShards),
+		C.uint8_t(parityShards), &out, &cerr)
+	if code != C.SIA_OK {
+		return 0, localError(code, cerr)
+	}
+	return uint64(out), nil
+}
+
 // ValidateSeedPhrase reports whether phrase is a usable 12 word BIP-39
 // recovery phrase.
 //
