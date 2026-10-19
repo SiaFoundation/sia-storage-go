@@ -275,6 +275,41 @@ func TestPackedUploadSurvivesAFailedAdd(t *testing.T) {
 	}
 }
 
+// TestPackedUploadCancelledAddReportsCancellation covers the abort path: an
+// add that fails because the context was cancelled leaves the token fired, so
+// a cancellable abort would return before detaching the add and the next
+// Finalize would report an add in progress instead of the cancellation.
+func TestPackedUploadCancelledAddReportsCancellation(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pu, err := sdk.UploadPacked(ctx)
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	defer pu.Close()
+
+	// Cancel part way through the reader, so the add fails with the context
+	// rather than before it starts.
+	r := io.MultiReader(bytes.NewReader(payload(2<<10)), cancelReader{cancel})
+	if _, err := pu.Add(r); !errors.Is(err, context.Canceled) {
+		t.Fatalf("add returned %v, want context.Canceled", err)
+	}
+
+	if _, err := pu.Finalize(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("finalize returned %v, want the cancellation rather than a stuck add", err)
+	}
+}
+
+// cancelReader cancels the context on its first read, so the add fails with a
+// token that has already fired.
+type cancelReader struct{ cancel context.CancelFunc }
+
+func (r cancelReader) Read([]byte) (int, error) {
+	r.cancel()
+	return 0, context.Canceled
+}
+
 type errReader struct{ err error }
 
 func (r errReader) Read([]byte) (int, error) { return 0, r.err }
