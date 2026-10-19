@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"io"
 	"runtime"
 	"sync"
@@ -52,9 +53,15 @@ func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUp
 		return nil, errClosed
 	}
 
+	if o.StartOffset != nil {
+		// A packed add always appends, and the options the native side takes
+		// for one carry no offset to pass this through as.
+		return nil, errors.New("a packed upload cannot take a start offset")
+	}
+
 	progressID := registerProgress(o.OnShard)
 
-	copts := C.sia_upload_options_t{
+	copts := C.sia_packed_upload_options_t{
 		max_buffered_slabs: C.uint64_t(o.MaxBufferedSlabs),
 		userdata:           C.uintptr_t(progressID),
 	}
@@ -62,12 +69,6 @@ func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUp
 		copts.data_shards = C.uint8_t(o.DataShards)
 		copts.parity_shards = C.uint8_t(o.ParityShards)
 		copts.set_redundancy = true
-	}
-	if o.StartOffset != nil {
-		// Refused by the native side rather than dropped, since a packed add
-		// always appends.
-		copts.has_start_offset = true
-		copts.start_offset = C.uint64_t(*o.StartOffset)
 	}
 	if o.OnShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
