@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.sia.tech/core/types"
+	"lukechampine.com/frand"
 )
 
 // TestObjectEmpty covers the accessors on a fresh object, before an upload has
@@ -74,6 +75,39 @@ func TestObjectIDIsContentAddressed(t *testing.T) {
 	var zero types.Hash256
 	if a.ID() == zero {
 		t.Fatal("an empty object's ID should still be a real hash, not zero")
+	}
+}
+
+// TestSealAndOpenWithKey proves the pair works with no SDK in hand, which is
+// what a process restarting from a stored seed has: sealing and opening are
+// local, so neither needs an indexer. A different key must be refused.
+func TestSealAndOpenWithKey(t *testing.T) {
+	_, sdk := transferSDK(t)
+	appKey := sdk.AppKey()
+
+	data := frand.Bytes(1 << 20)
+	obj := uploadPayload(t, sdk, data)
+	obj = obj.WithMetadata([]byte(`{"name":"offline"}`))
+
+	sealed, err := SealObjectWithKey(appKey, obj)
+	if err != nil {
+		t.Fatalf("seal with key: %v", err)
+	}
+
+	reopened, err := ObjectFromSealedWithKey(appKey, sealed)
+	if err != nil {
+		t.Fatalf("open with key: %v", err)
+	}
+	if reopened.ID() != obj.ID() {
+		t.Fatalf("reopened id %v, want %v", reopened.ID(), obj.ID())
+	}
+	if got := reopened.Metadata(); string(got) != `{"name":"offline"}` {
+		t.Fatalf("metadata is %q after the round trip", got)
+	}
+
+	other := types.NewPrivateKeyFromSeed(frand.Bytes(32))
+	if _, err := ObjectFromSealedWithKey(other, sealed); err == nil {
+		t.Fatal("another app key opened the object")
 	}
 }
 

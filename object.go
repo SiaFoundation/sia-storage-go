@@ -426,6 +426,71 @@ func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 	return sealed, nil
 }
 
+// SealObjectWithKey seals obj under appKey rather than a connected SDK's.
+// Sealing is local, so this works with the indexer unreachable: a process
+// holding the seed it stored can re-seal what it already has.
+func SealObjectWithKey(appKey types.PrivateKey, obj *Object) (SealedObject, error) {
+	seed, err := appKeySeed(appKey)
+	if err != nil {
+		return SealedObject{}, err
+	}
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
+	if obj.closed {
+		return SealedObject{}, errClosed
+	}
+
+	var cJSON, cerr *C.char
+	code := C.sia_object_seal_json_with_key(cBytes32(&seed), obj.ptr, &cJSON, &cerr)
+	runtime.KeepAlive(obj)
+	if code != C.SIA_OK {
+		return SealedObject{}, localError(code, cerr)
+	}
+
+	var sealed SealedObject
+	if err := json.Unmarshal([]byte(goString(cJSON)), &sealed); err != nil {
+		return SealedObject{}, fmt.Errorf("failed to decode sealed object: %w", err)
+	}
+	return sealed, nil
+}
+
+// ObjectFromSealedWithKey opens a sealed object with appKey rather than a
+// connected SDK's, verifying its signatures. Opening is local, so a process
+// restarting from a stored seed can read what it persisted before it reaches
+// an indexer.
+func ObjectFromSealedWithKey(appKey types.PrivateKey, sealed SealedObject) (*Object, error) {
+	seed, err := appKeySeed(appKey)
+	if err != nil {
+		return nil, err
+	}
+	buf, err := json.Marshal(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode sealed object: %w", err)
+	}
+
+	cJSON := C.CString(string(buf))
+	defer C.free(unsafe.Pointer(cJSON))
+
+	var ptr *C.sia_object_t
+	var cerr *C.char
+	code := C.sia_object_from_sealed_json_with_key(cBytes32(&seed), cJSON, &ptr, &cerr)
+	if code != C.SIA_OK {
+		return nil, localError(code, cerr)
+	}
+	return wrapObject(ptr), nil
+}
+
+// appKeySeed takes the 32 byte seed the C ABI expects out of an app key, which
+// [SDK.AppKey] and [Builder.Register] hand back as a private key.
+func appKeySeed(appKey types.PrivateKey) ([32]byte, error) {
+	var seed [32]byte
+	if len(appKey) < 32 {
+		return seed, errors.New("app key must be at least 32 bytes")
+	}
+	copy(seed[:], appKey[:32])
+	return seed, nil
+}
+
 // ObjectFromSealed opens a sealed object from [SDK.SealObject], verifying its
 // signatures against the account's app key.
 //
