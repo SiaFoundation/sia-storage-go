@@ -157,9 +157,19 @@ func (p *PackedUpload) Add(r io.Reader) (int64, error) {
 // abortAdd abandons an add that failed part way, so the pack is left with no
 // object for it and the handle is free to take the next one. The caller holds
 // mu.
+//
+// The token is deliberately not passed. Whenever the context is what failed
+// the add, the token has already fired, and the native abort checks it after
+// tearing the add down but before detaching it: it would return early with
+// the add still attached, and the next Finalize would report an add in
+// progress instead of the cancellation.
+//
+// Waiting without a token is safe because the teardown comes first. The reader
+// is already failing by the time the abort joins the task, so it is waiting
+// on something that is ending rather than on the network.
 func (p *PackedUpload) abortAdd() {
 	var cerr *C.char
-	C.sia_packed_upload_add_abort(p.ptr, p.tok, &cerr)
+	C.sia_packed_upload_add_abort(p.ptr, nil, &cerr)
 	runtime.KeepAlive(p)
 	if cerr != nil {
 		C.sia_string_free(cerr)
