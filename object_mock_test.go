@@ -77,6 +77,49 @@ func TestObjectIDIsContentAddressed(t *testing.T) {
 	}
 }
 
+// TestObjectUseAfterClose covers the contract the other handles follow: a
+// closed object reports zero values rather than what it held, and anything
+// needing the native side refuses.
+func TestObjectUseAfterClose(t *testing.T) {
+	meta := []byte(`{"name":"closed"}`)
+	obj := NewEmptyObject().WithMetadata(meta)
+	if obj.ID() == (types.Hash256{}) {
+		t.Fatal("an open object should report an id")
+	}
+
+	if err := obj.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if id := obj.ID(); id != (types.Hash256{}) {
+		t.Errorf("ID after Close = %v, want the zero id", id)
+	}
+	if n := obj.Size(); n != 0 {
+		t.Errorf("Size after Close = %d, want 0", n)
+	}
+	if n := obj.EncodedSize(); n != 0 {
+		t.Errorf("EncodedSize after Close = %d, want 0", n)
+	}
+	if ts := obj.CreatedAt(); !ts.IsZero() {
+		t.Errorf("CreatedAt after Close = %v, want the zero time", ts)
+	}
+	if ts := obj.UpdatedAt(); !ts.IsZero() {
+		t.Errorf("UpdatedAt after Close = %v, want the zero time", ts)
+	}
+	if md := obj.Metadata(); md != nil {
+		t.Errorf("Metadata after Close = %q, want nil", md)
+	}
+	if obj.WithMetadata(meta) != nil {
+		t.Error("WithMetadata after Close should return nil")
+	}
+	if obj.Truncate(0) != nil {
+		t.Error("Truncate after Close should return nil")
+	}
+	if err := obj.Close(); err != nil {
+		t.Errorf("a second Close returned %v, want nil", err)
+	}
+}
+
 // TestSharingKeyUseAfterClose proves a closed key reports a zero value rather
 // than reading memory Close already freed. Before the guard these went straight
 // to the native side, which is harder to notice than a crash.
@@ -150,8 +193,8 @@ func TestSDKCloseDuringCall(t *testing.T) {
 // TestObjectConcurrentUse proves an object is safe to share between goroutines.
 // Nothing can change one once it exists: the ABI has no setter, WithMetadata
 // returns a new object and leaves the receiver alone, and Metadata hands back a
-// copy. The lock the type carries guards the handle against Close, not the
-// values the accessors report.
+// copy. The lock the type carries is for Close, which frees the handle and
+// clears what the accessors report.
 //
 // The race detector is what makes this test meaningful; it passes trivially
 // without -race.

@@ -42,9 +42,9 @@ type Object struct {
 	mu     sync.RWMutex
 	closed bool
 
-	// Read once, when the object was built. Nothing can change an object, so
-	// these never go stale: WithMetadata and Truncate return a new one rather
-	// than altering this.
+	// Read once, when the object was built, and cleared by Close. Nothing
+	// else changes them: WithMetadata and Truncate return a new object rather
+	// than altering this one.
 	id          types.Hash256
 	size        uint64
 	encodedSize uint64
@@ -83,9 +83,8 @@ func wrapObject(ptr *C.sia_object_t) *Object {
 // Close releases the object. It is safe to call more than once, and waits for
 // any call already using the handle to return.
 //
-// The accessors keep answering afterwards, since they report values copied
-// when the object was built. What stops working is whatever needs the native
-// side: WithMetadata and Truncate return nil, and an SDK call fails.
+// Afterwards the accessors report zero values, WithMetadata and Truncate
+// return nil, and an SDK call given the object fails.
 func (o *Object) Close() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -95,6 +94,12 @@ func (o *Object) Close() error {
 	o.closed = true
 	o.cleanup.Stop()
 	C.sia_object_free(o.ptr)
+	o.id = types.Hash256{}
+	o.size = 0
+	o.encodedSize = 0
+	o.createdAt = time.Time{}
+	o.updatedAt = time.Time{}
+	o.metadata = nil
 	return nil
 }
 
@@ -116,28 +121,50 @@ func nativeMetadata(ptr *C.sia_object_t) []byte {
 // ID returns the object's identifier, which is a hash of its slabs. An empty
 // object has a stable ID of its own, so two objects with the same contents
 // share an ID.
-func (o *Object) ID() types.Hash256 { return o.id }
+func (o *Object) ID() types.Hash256 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.id
+}
 
 // Size returns the length of the data the object holds.
-func (o *Object) Size() uint64 { return o.size }
+func (o *Object) Size() uint64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.size
+}
 
 // EncodedSize returns the storage the object occupies once erasure coded,
 // which is what the account is billed for.
-func (o *Object) EncodedSize() uint64 { return o.encodedSize }
+func (o *Object) EncodedSize() uint64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.encodedSize
+}
 
 // CreatedAt returns when the indexer first saw the object, or the zero time
 // for one that has never been pinned.
-func (o *Object) CreatedAt() time.Time { return o.createdAt }
+func (o *Object) CreatedAt() time.Time {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.createdAt
+}
 
 // UpdatedAt returns when the indexer last saw the object change, or the zero
 // time for one that has never been pinned.
-func (o *Object) UpdatedAt() time.Time { return o.updatedAt }
+func (o *Object) UpdatedAt() time.Time {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.updatedAt
+}
 
 // Metadata returns the object's metadata, which is encrypted at rest and
 // decrypted here. It returns nil when there is none.
 //
 // The result is a copy, so writing through it cannot change the object.
 func (o *Object) Metadata() []byte {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	if len(o.metadata) == 0 {
 		return nil
 	}
