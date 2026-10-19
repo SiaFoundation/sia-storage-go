@@ -36,8 +36,7 @@
 // underneath it.
 //
 // Using a handle after Close is not undefined: accessors report a zero value
-// and calls return an error. An [Object] is the exception: its accessors
-// report values copied when it was built, so they keep answering.
+// and calls return an error.
 //
 // # Testing
 //
