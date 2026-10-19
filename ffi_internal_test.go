@@ -31,6 +31,26 @@ func TestNewSeedPhrase(t *testing.T) {
 	}
 }
 
+// TestValidateSeedPhrase pairs with NewSeedPhrase: what one produces the other
+// must accept, and a phrase that is the right shape but not a real one has to
+// be refused rather than quietly deriving a different account.
+func TestValidateSeedPhrase(t *testing.T) {
+	if err := ValidateSeedPhrase(NewSeedPhrase()); err != nil {
+		t.Fatalf("a generated phrase must validate: %v", err)
+	}
+
+	for _, phrase := range []string{
+		"",
+		"not a recovery phrase at all",
+		// Twelve words from the list, failing the checksum.
+		strings.TrimSpace(strings.Repeat("abandon ", 12)),
+	} {
+		if err := ValidateSeedPhrase(phrase); err == nil {
+			t.Errorf("%q validated, want an error", phrase)
+		}
+	}
+}
+
 // TestCancelTokenLifecycle allocates, fires and frees the cancellation handle
 // that every blocking FFI call takes, in the order ffi.go's callers use it.
 func TestCancelTokenLifecycle(t *testing.T) {
