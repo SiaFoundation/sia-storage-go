@@ -2,7 +2,7 @@
 
 The official Go SDK for storing and retrieving data on the Sia network.
 
-For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261002235308-d2590c25520a).
+For guides and additional resources, visit the [developer portal](https://devs.sia.storage). For detailed API documentation, see the [Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261020213213-0158b946ad68).
 
 ## Requirements
 
@@ -25,7 +25,7 @@ extra tooling.
 
 ## Usage
 
-The [Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261002235308-d2590c25520a#pkg-examples)
+The [Godocs](https://pkg.go.dev/go.sia.tech/siastorage@v0.2.2-0.20261020213213-0158b946ad68#pkg-examples)
 carry runnable examples for connecting and registering, uploading and
 downloading, packed uploads, sharing keys and share URLs, the object event feed
 and the tuning options.
