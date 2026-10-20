@@ -25,11 +25,8 @@ on:
     branches:
       - "matt/**"
 
-# sia_storage_cabi has not merged to sia-sdk-rs master yet, so every checkout
-# of it has to name the branch that carries the crate. Change this to master
-# once it lands there; it is the only line that needs to move.
 env:
-  SIA_SDK_RS_REF: matt/cabi
+  SIA_SDK_RS_REF: master
 
 jobs:
   # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
