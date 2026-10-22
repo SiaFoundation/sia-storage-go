@@ -47,7 +47,7 @@ func payload(n int) []byte {
 // uploadPayload runs a whole upload through io.Copy and returns the object.
 func uploadPayload(t *testing.T, sdk *SDK, data []byte, opts ...UploadOption) *Object {
 	t.Helper()
-	up, err := sdk.Upload(context.Background(), NewEmptyObject(), opts...)
+	up, err := sdk.UploadStream(context.Background(), NewEmptyObject(), opts...)
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestTransferMissingSectors(t *testing.T) {
 func TestUploadCloseWithoutFinish(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewEmptyObject())
+	up, err := sdk.UploadStream(context.Background(), NewEmptyObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestUploadCloseWithoutFinish(t *testing.T) {
 func TestUploadCloseAfterFinish(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewEmptyObject())
+	up, err := sdk.UploadStream(context.Background(), NewEmptyObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestUploadCancelledContext(t *testing.T) {
 	_, sdk := transferSDK(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	up, err := sdk.Upload(ctx, NewEmptyObject())
+	up, err := sdk.UploadStream(ctx, NewEmptyObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestUploadCancelledContext(t *testing.T) {
 func TestUploadEmptyWriteIsANoop(t *testing.T) {
 	_, sdk := transferSDK(t)
 
-	up, err := sdk.Upload(context.Background(), NewEmptyObject())
+	up, err := sdk.UploadStream(context.Background(), NewEmptyObject())
 	if err != nil {
 		t.Fatalf("upload start: %v", err)
 	}

@@ -103,24 +103,10 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 
 	// ---- upload, measured from the first byte offered to the object returned
 	start := time.Now()
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(payload),
+		siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
 	if err != nil {
-		return s, fmt.Errorf("upload start: %w", err)
-	}
-	// 1 MiB, not io.Copy's 32 KiB default. This API is writer shaped where the
-	// native engine's is reader shaped, so the copy loop is the harness rather
-	// than the engine, and at 32 KiB it crosses the boundary 8192 times per
-	// 256 MB and costs about 10% of upload throughput. 1 MiB also matches the
-	// read size on the download side, so both directions are measured at the
-	// same granularity.
-	if _, err := io.CopyBuffer(up, bytes.NewReader(payload), make([]byte, 1<<20)); err != nil {
-		up.Close()
-		return s, fmt.Errorf("upload write: %w", err)
-	}
-	obj, err := up.Finish()
-	up.Close()
-	if err != nil {
-		return s, fmt.Errorf("upload finish: %w", err)
+		return s, fmt.Errorf("upload: %w", err)
 	}
 	s.UploadNS = time.Since(start).Nanoseconds()
 

@@ -544,9 +544,10 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	report(sdk)
 }
 
-// upload streams data in through io.Copy and returns the finished object.
+// upload drives the writes itself so it can report dropped progress events,
+// which only the upload handle exposes.
 func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadOptions(opts))
+	up, err := sdk.UploadStream(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -568,16 +569,7 @@ func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastora
 // uploadInto streams data into an existing object, which is what an overwrite
 // needs: the object carries the slabs the range is rewritten against.
 func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.Upload(ctx, obj, siastorage.WithUploadOptions(opts))
-	if err != nil {
-		return nil, err
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, bytes.NewReader(data)); err != nil {
-		return nil, err
-	}
-	return up.Finish()
+	return sdk.Upload(ctx, obj, bytes.NewReader(data), siastorage.WithUploadOptions(opts))
 }
 
 // download reads an object out through io.ReadAll.

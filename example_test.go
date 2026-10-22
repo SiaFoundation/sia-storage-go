@@ -117,20 +117,10 @@ func ExampleSDK_Upload() {
 	var sdk *siastorage.SDK // from Builder.Connect or Builder.Register
 	var src io.Reader       // the data to store
 
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject())
+	// Upload streams src in and returns the finished object.
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), src)
 	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, src); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-
-	// Finish signals EOF and waits for the transfer to complete.
-	obj, err := up.Finish()
-	if err != nil {
-		log.Fatal("failed to finish upload:", err)
+		log.Fatal("failed to upload:", err)
 	}
 
 	if err := sdk.PinObject(ctx, obj); err != nil {
@@ -149,7 +139,8 @@ func ExampleSDK_Upload_progress() {
 	var sdk *siastorage.SDK
 	var src io.Reader
 
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(),
+	// Dropped is on the upload handle, so this drives the writes itself.
+	up, err := sdk.UploadStream(ctx, siastorage.NewEmptyObject(),
 		siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
 			fmt.Printf("%d bytes transferred\n", p.Transferred)
 		}))
@@ -488,19 +479,9 @@ func ExampleObject_WithMetadata() {
 	var sdk *siastorage.SDK
 	var src io.Reader
 
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject())
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), src)
 	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, src); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-
-	obj, err := up.Finish()
-	if err != nil {
-		log.Fatal("failed to finish upload:", err)
+		log.Fatal("failed to upload:", err)
 	}
 
 	// Sets it locally only.
@@ -591,20 +572,10 @@ func ExampleSDK_Upload_redundancy() {
 
 	// Ten data shards and twenty parity: any ten of the thirty recover the
 	// data, at three times the stored size.
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(),
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), src,
 		siastorage.WithRedundancy(10, 20))
 	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, src); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-
-	obj, err := up.Finish()
-	if err != nil {
-		log.Fatal("failed to finish upload:", err)
+		log.Fatal("failed to upload:", err)
 	}
 
 	fmt.Printf("%d bytes stored as %d bytes on the network\n",
@@ -619,19 +590,9 @@ func ExampleSDK_Upload_startOffset() {
 	var obj *siastorage.Object
 	var patch io.Reader
 
-	up, err := sdk.Upload(ctx, obj, siastorage.WithUploadStartOffset(4<<20))
+	patched, err := sdk.Upload(ctx, obj, patch, siastorage.WithUploadStartOffset(4<<20))
 	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, patch); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-
-	patched, err := up.Finish()
-	if err != nil {
-		log.Fatal("failed to finish upload:", err)
+		log.Fatal("failed to upload:", err)
 	}
 
 	// The rewritten object is a new record until it is pinned.
@@ -648,21 +609,11 @@ func ExampleSDK_Upload_buffering() {
 	var sdk *siastorage.SDK
 	var src io.Reader
 
-	// At most two slabs are held in memory ahead of the writer.
-	up, err := sdk.Upload(ctx, siastorage.NewEmptyObject(),
+	// At most two slabs are held in memory ahead of the transfer.
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), src,
 		siastorage.WithUploadMaxBufferedSlabs(2))
 	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, src); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-
-	obj, err := up.Finish()
-	if err != nil {
-		log.Fatal("failed to finish upload:", err)
+		log.Fatal("failed to upload:", err)
 	}
 
 	// The download side has the same knob, counted in chunks rather than
