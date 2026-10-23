@@ -23,13 +23,12 @@ import (
 	"go.sia.tech/siastorage"
 )
 
-// A Sample is one upload and download of the same payload. The native harness
-// emits the same shape, so the two runs merge into one table.
 // betweenReps runs after each rep when the build provides one. The mock
 // network keeps every sector it is ever written, so without a hook to drop
 // them the harness outgrows what it is measuring.
 var betweenReps func()
 
+// A Sample is one upload and download of the same payload.
 type Sample struct {
 	Engine       string `json:"engine"`
 	Rep          int    `json:"rep"`
@@ -122,10 +121,9 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	}
 	defer dl.Close()
 
-	// Read and discard, which is what the native engine's own benchmark does.
-	// Accumulating the payload to hash it would put a 256 MB copy inside the
-	// timed region, and at these rates that copy is a large share of the
-	// measurement rather than a rounding error.
+	// Read and discard. Accumulating the payload to hash it would put a 256 MB
+	// copy inside the timed region, and at these rates that copy is a large
+	// share of the measurement rather than a rounding error.
 	buf := make([]byte, 1<<20)
 	first := true
 	for {

@@ -10,7 +10,7 @@ import (
 	"go.sia.tech/siastorage"
 )
 
-// engineName tags every sample, so a merged run says which arm it came from.
+// engineName tags every sample, so a merged run says which build produced it.
 const engineName = "cabi-mock"
 
 func connect(ctx context.Context, indexer, _ string, hosts int) (*siastorage.SDK, func(), error) {

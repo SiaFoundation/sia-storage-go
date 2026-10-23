@@ -75,9 +75,8 @@ func TestMapErrorNeverReturnsABlankError(t *testing.T) {
 }
 
 // TestMapErrorTransferSentinels covers the two failure modes callers most
-// need to branch on. They used to be recovered by matching Rust prose, which
-// nothing on either side of the boundary pinned; the C ABI now classifies them
-// itself and they arrive as status codes.
+// need to branch on. Each arrives as its own status code, so the sentinel
+// does not depend on the wording of the message beside it.
 func TestMapErrorTransferSentinels(t *testing.T) {
 	err := mapError(statusNotEnoughShards, "not enough shards: 7/10")
 	if !errors.Is(err, ErrNotEnoughShards) {
@@ -92,9 +91,8 @@ func TestMapErrorTransferSentinels(t *testing.T) {
 		t.Errorf("host exhaustion lost its sentinel, got %v", err)
 	}
 
-	// A generic failure must stay generic. Previously any message containing
-	// the right words was swept into a sentinel regardless of what actually
-	// failed.
+	// A generic failure must stay generic, however much its message reads
+	// like one of the sentinels.
 	err = mapError(1, "host refused the connection: not enough shards nearby")
 	for _, s := range []error{ErrNotEnoughShards, ErrNoMoreHosts} {
 		if errors.Is(err, s) {

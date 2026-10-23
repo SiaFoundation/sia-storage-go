@@ -11,7 +11,7 @@ import (
 	"go.sia.tech/siastorage"
 )
 
-// engineName tags every sample, so a merged run says which arm it came from.
+// engineName tags every sample, so a merged run says which build produced it.
 const engineName = "cabi"
 
 var benchApp = siastorage.AppMetadata{
