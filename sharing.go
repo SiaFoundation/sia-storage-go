@@ -83,15 +83,17 @@ type KeyStats struct {
 	ExpiresAt time.Time
 }
 
-// A KeyRecord is the indexer's view of one sharing key.
-type KeyRecord struct {
-	// Key is set by [SDK.SharingKeys], which mints a handle for each record.
-	// It is nil from [SDK.SharingKey], where the caller already holds the
-	// handle it asked about.
-	Key *SharingKey
-
+// A KeyInfo is the indexer's view of one sharing key.
+type KeyInfo struct {
 	Description string
 	Stats       KeyStats
+}
+
+// A KeyRecord is a [KeyInfo] with the handle for the key it describes, which
+// the caller owns.
+type KeyRecord struct {
+	Key *SharingKey
+	KeyInfo
 }
 
 func goKeyStats(s C.sia_key_stats_t) KeyStats {
@@ -138,15 +140,14 @@ func (s *SDK) CreateSharingKey(ctx context.Context, description string, expiresA
 	return wrapSharingKey(ptr), nil
 }
 
-// SharingKey fetches the indexer's record for key. The returned record's Key is
-// nil, since the caller already holds the handle.
-func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error) {
+// SharingKey fetches the indexer's view of key.
+func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
 	if s.closed {
-		return KeyRecord{}, errClosed
+		return KeyInfo{}, errClosed
 	}
 
 	tok, release := cancelToken(ctx)
@@ -158,15 +159,13 @@ func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(key)
 	if code != C.SIA_OK {
-		return KeyRecord{}, goError(ctx, code, cerr)
+		return KeyInfo{}, goError(ctx, code, cerr)
 	}
-	return KeyRecord{Description: goString(cDesc), Stats: goKeyStats(stats)}, nil
+	return KeyInfo{Description: goString(cDesc), Stats: goKeyStats(stats)}, nil
 }
 
 // SharingKeys lists the account's sharing keys. A zero offset and limit take
 // the indexer's defaults.
-//
-// Every returned record carries a handle the caller owns.
 func (s *SDK) SharingKeys(ctx context.Context, offset, limit int) ([]KeyRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -195,9 +194,8 @@ func (s *SDK) SharingKeys(ctx context.Context, offset, limit int) ([]KeyRecord, 
 			break
 		}
 		out = append(out, KeyRecord{
-			Key:         wrapSharingKey(ptr),
-			Description: goString(cDesc),
-			Stats:       goKeyStats(stats),
+			Key:     wrapSharingKey(ptr),
+			KeyInfo: KeyInfo{Description: goString(cDesc), Stats: goKeyStats(stats)},
 		})
 	}
 	return out, nil
