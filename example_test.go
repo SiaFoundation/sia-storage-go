@@ -696,7 +696,6 @@ func ExampleSDK_RevokeSharingKey() {
 	if err := sdk.RevokeSharingKey(ctx, key); err != nil {
 		log.Fatal("failed to revoke the sharing key:", err)
 	}
-
 }
 
 // The recipient downloads through the SharedSDK, not through an SDK. There is

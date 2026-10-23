@@ -86,7 +86,6 @@ const uploadChunk = 256 << 10
 
 // Upload streams r into obj, which supplies the metadata the finished object
 // carries, and returns that object once the transfer completes.
-
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) (*Object, error) {
 	up, err := s.uploadStream(ctx, obj, opts...)
 	if err != nil {

@@ -13,14 +13,6 @@ import (
 	"go.sia.tech/core/types"
 )
 
-// closeRecords releases the handles a listing minted, which the caller owns.
-func closeRecords(recs []KeyRecord) {
-	for _, r := range recs {
-		if r.Key != nil {
-		}
-	}
-}
-
 // TestSharingKeyLifecycle walks the whole owner side path: create a key, attach
 // an object, see it listed, detach it and revoke the key.
 func TestSharingKeyLifecycle(t *testing.T) {
@@ -175,7 +167,6 @@ func TestSharingKeysListing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	defer closeRecords(recs)
 	if len(recs) < len(want) {
 		t.Fatalf("listed %d keys, created %d", len(recs), len(want))
 	}
