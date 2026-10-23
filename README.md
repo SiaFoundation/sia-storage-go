@@ -38,7 +38,8 @@ The archives under `ffi/lib/` are built only by the **Build FFI Libraries**
 workflow, never locally: an archive compiled on a developer machine cannot be
 traced back to a revision or reproduced by anyone else. `ffi/lib/PROVENANCE`
 records which `sia-sdk-rs` revision and workflow run produced the current set,
-and a CI check rejects any pull request that edits `ffi/lib/` by hand.
+and every archive carries a build attestation that CI verifies, so one edited
+or rebuilt by hand is rejected.
 
     make fetch-lib    # download this platform's archive from a workflow run
     make testlib      # build the mock archive, the one thing built locally
