@@ -100,9 +100,6 @@ func (m *MockNetwork) PinnedSlabs() int {
 // SetSlowHosts makes the first n hosts delay every RPC by d, so that host
 // selection, racing and timeout behaviour can be exercised. Passing an n above
 // the host count marks every host.
-//
-// Nothing about host selection shows up in a run where every host is fast,
-// which is why the benchmarks have never covered it.
 func (m *MockNetwork) SetSlowHosts(n int, d time.Duration) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

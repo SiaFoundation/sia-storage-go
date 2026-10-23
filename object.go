@@ -29,9 +29,8 @@ type SealedObject = slabs.SealedObject
 
 // An Object is a collection of slabs plus the keys needed to read them.
 //
-// It has no exported fields, because the data key it carries must not leak.
-// Use the accessors, and Close when finished, since the handle is owned by the
-// native side rather than by Go.
+// It has no exported fields, since the data key it carries must not leak. Use
+// the accessors.
 type Object struct {
 	ptr     *C.sia_object_t
 	cleanup runtime.Cleanup
