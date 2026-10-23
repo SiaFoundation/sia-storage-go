@@ -9,7 +9,7 @@ import "C"
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"sync"
@@ -55,7 +55,7 @@ func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUp
 	if o.startOffset != nil {
 		// A packed add always appends, and the options the native side takes
 		// for one carry no offset to pass this through as.
-		return nil, errors.New("a packed upload cannot take a start offset")
+		return nil, fmt.Errorf("a packed upload cannot take a start offset: %w", ErrInvalidState)
 	}
 
 	progressID := registerProgress(o.onShard)

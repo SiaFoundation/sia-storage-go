@@ -137,6 +137,21 @@ func TestPackedUploadAccounting(t *testing.T) {
 	}
 }
 
+// TestPackedUploadRejectsStartOffset proves the refusal documented on
+// WithUploadStartOffset carries the sentinel it names, rather than only saying
+// so in its message.
+func TestPackedUploadRejectsStartOffset(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	pu, err := sdk.UploadPacked(context.Background(), WithUploadStartOffset(1<<20))
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("a packed upload with a start offset returned %v, want ErrInvalidState", err)
+	}
+	if pu != nil {
+		t.Fatal("a refused packed upload still returned a handle")
+	}
+}
+
 // TestPackedUploadCloseWithBlockedHandler proves Close does not wait for a
 // progress handler while holding the lock the accessors need, which hung the
 // close for as long as the handler ran.
