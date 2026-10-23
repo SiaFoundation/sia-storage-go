@@ -20,14 +20,12 @@ func connect(ctx context.Context, indexer, _ string, hosts int) (*siastorage.SDK
 	net := siastorage.NewMockNetwork(hosts)
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
-		net.Close()
 		return nil, nil, err
 	}
 	sdk, err := net.SDK(ctx, seed)
 	if err != nil {
-		net.Close()
 		return nil, nil, err
 	}
 	betweenReps = net.ClearSectors
-	return sdk, func() { net.Close() }, nil
+	return sdk, func() {}, nil
 }

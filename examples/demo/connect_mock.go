@@ -30,16 +30,14 @@ func connect(ctx context.Context, opts connectOptions) (*siastorage.SDK, func(),
 
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
-		network.Close()
 		return nil, nil, err
 	}
 	sdk, err := network.SDK(ctx, seed)
 	if err != nil {
-		network.Close()
 		return nil, nil, err
 	}
 	info("connected, no indexer and no credentials needed")
-	return sdk, func() { network.Close() }, nil
+	return sdk, func() {}, nil
 }
 
 // connectShared brings up the recipient side on the same mock network, so the

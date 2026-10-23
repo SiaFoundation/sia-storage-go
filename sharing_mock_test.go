@@ -17,7 +17,6 @@ import (
 func closeRecords(recs []KeyRecord) {
 	for _, r := range recs {
 		if r.Key != nil {
-			r.Key.Close()
 		}
 	}
 }
@@ -34,7 +33,6 @@ func TestSharingKeyLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer key.Close()
 
 	rec, err := sdk.SharingKey(ctx, key)
 	if err != nil {
@@ -102,7 +100,6 @@ func TestSharingKeySeedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer key.Close()
 
 	seed := key.Export()
 	if seed == ([32]byte{}) {
@@ -110,7 +107,6 @@ func TestSharingKeySeedRoundTrip(t *testing.T) {
 	}
 
 	imported := ImportSharingKey(seed)
-	defer imported.Close()
 	if imported.PublicKey() != key.PublicKey() {
 		t.Fatal("a key rebuilt from its seed has a different public key")
 	}
@@ -132,14 +128,12 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer key.Close()
 	if err := sdk.ShareObject(ctx, key, obj); err != nil {
 		t.Fatalf("share: %v", err)
 	}
 
 	// Come back to the object through nothing but the seed.
 	recipient := ImportSharingKey(key.Export())
-	defer recipient.Close()
 	shared, err := sdk.SharedObjects(ctx, recipient, 0, 0)
 	if err != nil {
 		t.Fatalf("list as recipient: %v", err)
@@ -175,7 +169,6 @@ func TestSharingKeysListing(t *testing.T) {
 			t.Fatalf("create %s: %v", desc, err)
 		}
 		want[key.PublicKey()] = desc
-		key.Close()
 	}
 
 	recs, err := sdk.SharingKeys(ctx, 0, 0)
@@ -217,7 +210,6 @@ func TestSharingKeyExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer key.Close()
 
 	rec, err := sdk.SharingKey(ctx, key)
 	if err != nil {
@@ -238,7 +230,6 @@ func TestUnshareNotAttached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer key.Close()
 
 	var id types.Hash256
 	id[0] = 0xCD
@@ -249,14 +240,3 @@ func TestUnshareNotAttached(t *testing.T) {
 
 // TestSharingKeyCloseIsIdempotent proves the cleanup and an explicit Close
 // cannot both free the same key.
-func TestSharingKeyCloseIsIdempotent(t *testing.T) {
-	var seed [32]byte
-	seed[0] = 3
-	key := ImportSharingKey(seed)
-	if err := key.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if err := key.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
-	}
-}

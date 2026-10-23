@@ -289,7 +289,6 @@ func ExampleSDK_CreateSharingKey() {
 	if err != nil {
 		log.Fatal("failed to create sharing key:", err)
 	}
-	defer key.Close()
 
 	if err := sdk.ShareObject(ctx, key, obj); err != nil {
 		log.Fatal("failed to share object:", err)
@@ -651,8 +650,6 @@ func ExampleSDK_SharingKeys() {
 		} else {
 			fmt.Println("  expires", record.Stats.ExpiresAt)
 		}
-
-		record.Key.Close()
 	}
 }
 
@@ -718,8 +715,6 @@ func ExampleSDK_RevokeSharingKey() {
 		log.Fatal("failed to revoke the sharing key:", err)
 	}
 
-	// The handle is still valid locally; it simply grants nothing now.
-	key.Close()
 }
 
 // The recipient downloads through the SharedSDK, not through an SDK. There is

@@ -351,7 +351,6 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err != nil {
 		fail("CreateSharingKey", err)
 	}
-	defer key.Close()
 	info("public key %v", key.PublicKey())
 	if err := sdk.ShareObject(ctx, key, obj); err != nil {
 		fail("ShareObject", err)
@@ -369,14 +368,10 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 		fail("SharingKeys", err)
 	}
 	info("the account has %d sharing key(s)", len(keys))
-	for _, r := range keys {
-		r.Key.Close()
-	}
 
 	stage("List the key's objects as its owner")
 	seed := key.Export()
 	recipient := siastorage.ImportSharingKey(seed)
-	defer recipient.Close()
 	if recipient.PublicKey() != key.PublicKey() {
 		fail("ImportSharingKey", fmt.Errorf("the reimported key differs"))
 	}

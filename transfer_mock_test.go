@@ -24,7 +24,6 @@ const payloadSize = 9 << 20
 func transferSDK(t *testing.T) (*MockNetwork, *SDK) {
 	t.Helper()
 	net := NewMockNetwork(transferHosts)
-	t.Cleanup(func() { net.Close() })
 
 	var seed [32]byte
 	seed[0] = 9
@@ -373,7 +372,6 @@ func TestSlowHostsBoundsAreHarmless(t *testing.T) {
 	net.ResetSlowHosts()
 
 	closed := NewMockNetwork(2)
-	closed.Close()
 	closed.SetSlowHosts(1, time.Millisecond) // must not touch a freed handle
 	closed.ResetSlowHosts()
 }

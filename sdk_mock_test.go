@@ -15,7 +15,6 @@ import (
 func testSDK(t *testing.T) (*MockNetwork, *SDK) {
 	t.Helper()
 	net := NewMockNetwork(10)
-	t.Cleanup(func() { net.Close() })
 
 	var seed [32]byte
 	seed[0] = 1
@@ -33,7 +32,6 @@ func testSDK(t *testing.T) (*MockNetwork, *SDK) {
 // call Close, and running both would free the same pointer twice.
 func TestSDKHandleLifecycle(t *testing.T) {
 	net := NewMockNetwork(10)
-	defer net.Close()
 
 	var seed [32]byte
 	seed[0] = 7
@@ -53,7 +51,6 @@ func TestSDKHandleLifecycle(t *testing.T) {
 // the key rebuilt from it is a usable private key rather than raw bytes.
 func TestSDKAppKey(t *testing.T) {
 	net := NewMockNetwork(10)
-	defer net.Close()
 
 	var seed [32]byte
 	for i := range seed {

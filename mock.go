@@ -27,8 +27,7 @@ type MockNetwork struct {
 	ptr     *C.sia_mock_t
 	cleanup runtime.Cleanup
 
-	mu     sync.RWMutex
-	closed bool
+	mu sync.RWMutex
 }
 
 // NewMockNetwork starts numHosts in-process hosts.
@@ -41,19 +40,6 @@ func NewMockNetwork(numHosts int) *MockNetwork {
 	return m
 }
 
-// Close releases the hosts. It is safe to call more than once.
-func (m *MockNetwork) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed {
-		return nil
-	}
-	m.closed = true
-	m.cleanup.Stop()
-	C.sia_mock_free(m.ptr)
-	return nil
-}
-
 // SDK returns a connection to the mock network for the given 32 byte app key
 // seed. The result is an ordinary SDK, so every other method drives the mock
 // without knowing about it.
@@ -63,9 +49,6 @@ func (m *MockNetwork) SDK(ctx context.Context, appKeySeed [32]byte) (*SDK, error
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed {
-		return nil, errClosed
-	}
 
 	var ptr *C.sia_sdk_t
 	var cerr *C.char
@@ -85,9 +68,6 @@ func (m *MockNetwork) SharedSDK(ctx context.Context, seed [32]byte) (*SharedSDK,
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed {
-		return nil, errClosed
-	}
 
 	var ptr *C.sia_shared_sdk_t
 	var cerr *C.char
@@ -104,9 +84,6 @@ func (m *MockNetwork) SharedSDK(ctx context.Context, seed [32]byte) (*SharedSDK,
 func (m *MockNetwork) ClearSectors() {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed {
-		return
-	}
 	C.sia_mock_clear_sectors(m.ptr)
 	runtime.KeepAlive(m)
 }
@@ -115,9 +92,6 @@ func (m *MockNetwork) ClearSectors() {
 func (m *MockNetwork) PinnedSlabs() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed {
-		return 0
-	}
 	n := int(C.sia_mock_pinned_slabs(m.ptr))
 	runtime.KeepAlive(m)
 	return n
@@ -132,7 +106,7 @@ func (m *MockNetwork) PinnedSlabs() int {
 func (m *MockNetwork) SetSlowHosts(n int, d time.Duration) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed || n < 0 {
+	if n < 0 {
 		return
 	}
 	C.sia_mock_set_slow_hosts(m.ptr, C.size_t(n), C.uint64_t(d.Milliseconds()))
@@ -143,9 +117,6 @@ func (m *MockNetwork) SetSlowHosts(n int, d time.Duration) {
 func (m *MockNetwork) ResetSlowHosts() {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.closed {
-		return
-	}
 	C.sia_mock_reset_slow_hosts(m.ptr)
 	runtime.KeepAlive(m)
 }

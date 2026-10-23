@@ -28,15 +28,10 @@
 //
 // # Handles
 //
-// [Builder], [SDK], [SharedSDK], [Object], [SharingKey], [Upload], [Download]
-// and [PackedUpload] are handles onto memory the native side owns. Each has a Close
-// that releases it, and every one is safe to call more than once. Close waits
-// for any call still using the handle to return, so closing an SDK while a
-// request is in flight blocks until that request finishes rather than freeing
-// underneath it.
-//
-// Using a handle after Close is not undefined: accessors report a zero value
-// and calls return an error.
+// [Builder], [SDK], [SharedSDK], [Upload], [Download] and [PackedUpload] have
+// a Close. It is safe to call more than once and blocks until any call still
+// using the handle returns. Afterwards accessors report zero values and calls
+// return an error.
 //
 // # Testing
 //

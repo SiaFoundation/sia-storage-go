@@ -144,7 +144,7 @@ func (s *SDK) UploadStream(ctx context.Context, obj *Object, opts ...UploadOptio
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return nil, errClosed
 	}
 

@@ -29,9 +29,9 @@ type SharingKey struct {
 	ptr     *C.sia_sharing_key_t
 	cleanup runtime.Cleanup
 
-	// mu guards ptr against Close, as on every other handle in this package.
-	mu     sync.RWMutex
-	closed bool
+	// mu orders the reads of ptr against the construction that filled it, as
+	// on every other handle in this package.
+	mu sync.RWMutex
 }
 
 // ImportSharingKey rebuilds a key from a seed handed out by its owner.
@@ -47,28 +47,11 @@ func wrapSharingKey(ptr *C.sia_sharing_key_t) *SharingKey {
 	return k
 }
 
-// Close releases the key. It is safe to call more than once, and waits for any
-// call already using the handle to return.
-func (k *SharingKey) Close() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.closed {
-		return nil
-	}
-	k.closed = true
-	k.cleanup.Stop()
-	C.sia_sharing_key_free(k.ptr)
-	return nil
-}
-
 // Export returns the seed, which is the whole credential. Treat it as a secret
 // and hand it out only over a channel you would send a password over.
 func (k *SharingKey) Export() (seed [32]byte) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
-	if k.closed {
-		return
-	}
 	C.sia_sharing_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
 	return
@@ -78,9 +61,6 @@ func (k *SharingKey) Export() (seed [32]byte) {
 func (k *SharingKey) PublicKey() (pk types.PublicKey) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
-	if k.closed {
-		return
-	}
 	C.sia_sharing_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
 	return
@@ -105,9 +85,9 @@ type KeyStats struct {
 
 // A KeyRecord is the indexer's view of one sharing key.
 type KeyRecord struct {
-	// Key is set by [SDK.SharingKeys], which mints a handle for each record
-	// that the caller must Close. It is nil from [SDK.SharingKey], where the
-	// caller already holds the handle it asked about.
+	// Key is set by [SDK.SharingKeys], which mints a handle for each record.
+	// It is nil from [SDK.SharingKey], where the caller already holds the
+	// handle it asked about.
 	Key *SharingKey
 
 	Description string
@@ -165,7 +145,7 @@ func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
-	if s.closed || key.closed {
+	if s.closed {
 		return KeyRecord{}, errClosed
 	}
 
@@ -186,7 +166,7 @@ func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyRecord, error
 // SharingKeys lists the account's sharing keys. A zero offset and limit take
 // the indexer's defaults.
 //
-// Every returned record carries a handle the caller owns and must Close.
+// Every returned record carries a handle the caller owns.
 func (s *SDK) SharingKeys(ctx context.Context, offset, limit int) ([]KeyRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -232,7 +212,7 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 	defer key.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || key.closed || obj.closed {
+	if s.closed {
 		return errClosed
 	}
 
@@ -254,7 +234,7 @@ func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit 
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
-	if s.closed || key.closed {
+	if s.closed {
 		return nil, errClosed
 	}
 
@@ -291,7 +271,7 @@ func (s *SDK) UnshareObject(ctx context.Context, key *SharingKey, id types.Hash2
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
-	if s.closed || key.closed {
+	if s.closed {
 		return errClosed
 	}
 
@@ -315,7 +295,7 @@ func (s *SDK) RevokeSharingKey(ctx context.Context, key *SharingKey) error {
 	defer s.mu.RUnlock()
 	key.mu.RLock()
 	defer key.mu.RUnlock()
-	if s.closed || key.closed {
+	if s.closed {
 		return errClosed
 	}
 

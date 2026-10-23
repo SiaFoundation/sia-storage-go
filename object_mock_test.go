@@ -133,82 +133,12 @@ func TestSealAndOpenWithKey(t *testing.T) {
 	}
 }
 
-// TestObjectUseAfterClose covers the contract the other handles follow: a
-// closed object reports zero values rather than what it held, and anything
-// needing the native side refuses.
-func TestObjectUseAfterClose(t *testing.T) {
-	meta := []byte(`{"name":"closed"}`)
-	obj := NewEmptyObject().WithMetadata(meta)
-	if obj.ID() == (types.Hash256{}) {
-		t.Fatal("an open object should report an id")
-	}
-
-	if err := obj.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	if id := obj.ID(); id != (types.Hash256{}) {
-		t.Errorf("ID after Close = %v, want the zero id", id)
-	}
-	if n := obj.Size(); n != 0 {
-		t.Errorf("Size after Close = %d, want 0", n)
-	}
-	if n := obj.EncodedSize(); n != 0 {
-		t.Errorf("EncodedSize after Close = %d, want 0", n)
-	}
-	if ts := obj.CreatedAt(); !ts.IsZero() {
-		t.Errorf("CreatedAt after Close = %v, want the zero time", ts)
-	}
-	if ts := obj.UpdatedAt(); !ts.IsZero() {
-		t.Errorf("UpdatedAt after Close = %v, want the zero time", ts)
-	}
-	if md := obj.Metadata(); md != nil {
-		t.Errorf("Metadata after Close = %q, want nil", md)
-	}
-	if obj.WithMetadata(meta) != nil {
-		t.Error("WithMetadata after Close should return nil")
-	}
-	if obj.Truncate(0) != nil {
-		t.Error("Truncate after Close should return nil")
-	}
-	if err := obj.Close(); err != nil {
-		t.Errorf("a second Close returned %v, want nil", err)
-	}
-}
-
-// TestSharingKeyUseAfterClose proves a closed key reports a zero value rather
-// than reading memory Close already freed. Before the guard these went straight
-// to the native side, which is harder to notice than a crash.
-func TestSharingKeyUseAfterClose(t *testing.T) {
-	_, sdk := testSDK(t)
-	ctx := context.Background()
-
-	key, err := sdk.CreateSharingKey(ctx, "closed key", time.Time{})
-	if err != nil {
-		t.Fatalf("create sharing key: %v", err)
-	}
-	pub := key.PublicKey()
-	if err := key.Close(); err != nil {
-		t.Fatalf("close key: %v", err)
-	}
-	if got := key.PublicKey(); got == pub {
-		t.Error("PublicKey after Close should be the zero key")
-	}
-	if seed := key.Export(); seed != ([32]byte{}) {
-		t.Error("Export after Close should be the zero seed")
-	}
-	if err := sdk.RevokeSharingKey(ctx, key); !errors.Is(err, errClosed) {
-		t.Errorf("RevokeSharingKey with a closed key returned %v, want errClosed", err)
-	}
-}
-
 // TestSDKCloseDuringCall is the race the guard exists for: a shutdown path
 // closing the SDK while another goroutine is mid-call. Without the lock, Close
 // freed the handle underneath the call. It is run under -race, where an
 // unsynchronised free shows up as a data race even when it does not crash.
 func TestSDKCloseDuringCall(t *testing.T) {
 	net := NewMockNetwork(10)
-	defer net.Close()
 
 	var seed [32]byte
 	seed[0] = 42

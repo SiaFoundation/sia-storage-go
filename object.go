@@ -36,13 +36,11 @@ type Object struct {
 	ptr     *C.sia_object_t
 	cleanup runtime.Cleanup
 
-	// mu guards ptr against Close. Every method that hands the handle to C
-	// holds it for the read, so Close cannot free the handle underneath a
-	// call already running on another goroutine.
-	mu     sync.RWMutex
-	closed bool
+	// mu orders the reads of ptr and the cached fields below against the
+	// construction that filled them.
+	mu sync.RWMutex
 
-	// Read once, when the object was built, and cleared by Close. Nothing
+	// Read once, when the object was built. Nothing
 	// else changes them: WithMetadata and Truncate return a new object rather
 	// than altering this one.
 	id          types.Hash256
@@ -78,29 +76,6 @@ func wrapObject(ptr *C.sia_object_t) *Object {
 		C.sia_object_free(p)
 	}, ptr)
 	return o
-}
-
-// Close releases the object. It is safe to call more than once, and waits for
-// any call already using the handle to return.
-//
-// Afterwards the accessors report zero values, WithMetadata and Truncate
-// return nil, and an SDK call given the object fails.
-func (o *Object) Close() error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.closed {
-		return nil
-	}
-	o.closed = true
-	o.cleanup.Stop()
-	C.sia_object_free(o.ptr)
-	o.id = types.Hash256{}
-	o.size = 0
-	o.encodedSize = 0
-	o.createdAt = time.Time{}
-	o.updatedAt = time.Time{}
-	o.metadata = nil
-	return nil
 }
 
 // nativeMetadata copies an object's metadata out of a native handle.
@@ -181,9 +156,6 @@ func (o *Object) Metadata() []byte {
 func (o *Object) WithMetadata(metadata []byte) *Object {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	if o.closed {
-		return nil
-	}
 	var ptr *C.sia_object_t
 	if len(metadata) == 0 {
 		ptr = C.sia_object_with_metadata(o.ptr, nil, 0)
@@ -205,9 +177,6 @@ func (o *Object) WithMetadata(metadata []byte) *Object {
 func (o *Object) Truncate(length uint64) *Object {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	if o.closed {
-		return nil
-	}
 	ptr := C.sia_object_truncate(o.ptr, C.uint64_t(length))
 	runtime.KeepAlive(o)
 	return wrapObject(ptr)
@@ -255,7 +224,7 @@ func (s *SDK) PinObject(ctx context.Context, obj *Object) error {
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return errClosed
 	}
 
@@ -283,7 +252,7 @@ func (s *SDK) UpdateObjectMetadata(ctx context.Context, obj *Object) error {
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return errClosed
 	}
 
@@ -352,7 +321,7 @@ func (s *SDK) ObjectShareURL(obj *Object, validUntil time.Time) (string, error) 
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return "", errClosed
 	}
 
@@ -405,7 +374,7 @@ func (s *SDK) SealObject(obj *Object) (SealedObject, error) {
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return SealedObject{}, errClosed
 	}
 
@@ -436,9 +405,6 @@ func SealObjectWithKey(appKey types.PrivateKey, obj *Object) (SealedObject, erro
 	}
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if obj.closed {
-		return SealedObject{}, errClosed
-	}
 
 	var cJSON, cerr *C.char
 	code := C.sia_object_seal_json_with_key(cBytes32(&seed), obj.ptr, &cJSON, &cerr)

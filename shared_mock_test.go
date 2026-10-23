@@ -24,7 +24,6 @@ func TestSharedObjectSummariesMatchObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create key: %v", err)
 	}
-	defer key.Close()
 
 	const count = 3
 	for i := range count {
@@ -103,7 +102,6 @@ func TestSharedObjectSummariesAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create key: %v", err)
 	}
-	defer key.Close()
 
 	shared, err := net.SharedSDK(ctx, key.Export())
 	if err != nil {

@@ -97,7 +97,7 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption)
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return nil, errClosed
 	}
 
@@ -153,7 +153,7 @@ func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts ...DownloadO
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
 	defer obj.mu.RUnlock()
-	if s.closed || obj.closed {
+	if s.closed {
 		return nil, errClosed
 	}
 
