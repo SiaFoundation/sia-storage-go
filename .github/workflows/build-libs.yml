@@ -107,6 +107,10 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Put the Rust LLVM tools on PATH
+        shell: bash
+        run: |
+          echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin" >> "$GITHUB_PATH"
       # The debug information belongs to std and the dependencies, which ship
       # prebuilt with it; this crate is built without any. Removing it shrinks
       # each archive by about a quarter, and these live in git history, so the
@@ -120,19 +124,19 @@ jobs:
         if: matrix.target != 'aarch64-pc-windows-gnullvm'
         shell: bash
         run: |
-          export PATH="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin:$PATH"
           a=sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
           before=$(wc -c < "$a")
           llvm-strip --strip-debug "$a"
           echo "$a: $before -> $(wc -c < "$a") bytes"
-      # A mock linked archive shipped as production is what invalidated the
-      # original throughput benchmark. Catch it before it reaches a PR.
       - name: Reject mock symbols
         shell: bash
         run: |
           a=sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
-          n=$(nm -g "$a" 2>/dev/null | grep -c _sia_mock || true)
-          if [ "$n" != "0" ]; then echo "FAIL: archive exports $n mock symbols"; exit 1; fi
+          llvm-nm --defined-only "$a" 2>/dev/null > symbols.txt
+          if grep -q sia_mock symbols.txt; then
+            echo "FAIL: archive exports mock symbols"
+            exit 1
+          fi
           echo "ok: no mock symbols"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
