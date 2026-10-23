@@ -1,44 +1,30 @@
 // Package siastorage stores and retrieves data on the Sia network.
 //
-// Erasure coding, encryption, host selection and the RHP4 transport are not
-// implemented here. They live in sia-sdk-rs and are reached through cgo, over
-// the C ABI its sia_storage_cabi crate exports, so there is one implementation
-// of that logic rather than two. This package is the Go surface over it.
-//
 // # Platforms
 //
-// Because the native code is linked from a prebuilt static archive, this
-// package builds only where an archive is committed: darwin/arm64,
-// darwin/amd64, linux/amd64, linux/arm64, windows/amd64 and windows/arm64.
-// CGO_ENABLED=0 and GOOS=js do not work at all, and the linux archives are
-// gnu, so a musl based image needs its own.
+// This package links a prebuilt static archive, so it builds only where one is
+// committed: darwin/arm64, darwin/amd64, linux/amd64, linux/arm64,
+// windows/amd64 and windows/arm64. CGO_ENABLED=0 and GOOS=js do not work at
+// all, and the linux archives are gnu, so a musl based image needs its own.
 //
 // # Getting started
 //
-// An application authorizes once against an indexer and reuses the app key it
-// receives. [NewBuilder] starts that flow. A new user is walked through
-// approval by [Builder.RequestConnection], which returns a URL for them to
-// visit, and [Builder.WaitForApproval], which blocks until they answer;
-// [Builder.Register] then derives the key and registers it. An application
-// holding a key already authorized skips all three and calls
-// [Builder.Connect].
+// An application authorizes once and reuses the app key it receives.
 //
-// The app key is derived from a BIP-39 recovery phrase, which [NewSeedPhrase]
-// produces. Store it: the account cannot be reached without it.
+// For a new account, from [NewBuilder]:
+//
+//   - [Builder.RequestConnection] returns a URL for the user to approve
+//   - [Builder.WaitForApproval] blocks until they answer
+//   - [Builder.Register] takes a phrase from [NewSeedPhrase], returns the SDK
+//
+// With a key already authorized, [Builder.Connect] replaces all three.
+//
+// Store the phrase: the account cannot be reached without it.
 //
 // # Handles
 //
-// [Builder], [SDK], [SharedSDK], [Upload], [Download] and [PackedUpload] have
-// a Close. It is safe to call more than once and blocks until any call still
-// using the handle returns. Afterwards accessors report zero values and calls
-// return an error.
-//
-// # Testing
-//
-// The siastorage_mock build tag swaps the host transport for an in-process
-// network, so real erasure coding, encryption and the whole transfer pipeline
-// run with only the network itself faked. It needs an archive built with the
-// mock cargo feature, which `make testlib` produces and which is never
-// committed or shipped. See the MockNetwork type, which that tag makes
-// available.
+// [Builder], [SDK], [SharedSDK], [Download] and [PackedUpload] have a Close.
+// It is safe to call more than once and blocks until any call still using the
+// handle returns. Afterwards accessors report zero values and calls return an
+// error.
 package siastorage
