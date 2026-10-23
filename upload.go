@@ -202,8 +202,8 @@ func (u *upload) Write(p []byte) (int, error) {
 // further and Close afterwards is a no op.
 func (u *upload) Finish() (*Object, error) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.done {
+		u.mu.Unlock()
 		return nil, errClosed
 	}
 
@@ -213,7 +213,10 @@ func (u *upload) Finish() (*Object, error) {
 	runtime.KeepAlive(u)
 	// Finish drains the transfer and consumes the upload task, but the handle
 	// itself is still ours to free, whatever it returned.
-	u.free()
+	u.retire()
+	u.mu.Unlock()
+	defer u.drain()
+
 	if code != C.SIA_OK {
 		return nil, goError(u.ctx, code, cerr)
 	}
@@ -227,21 +230,27 @@ func (u *upload) Close() {
 	// and releases it. Cancelling an already finished upload is harmless.
 	u.tokenOwner.fire()
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.done {
+		u.mu.Unlock()
 		return
 	}
-	u.free()
+	u.retire()
+	u.mu.Unlock()
+	u.drain()
 }
 
-// free releases the native handle and everything around it, exactly once. The
-// caller holds mu. Freeing a running upload aborts it.
-func (u *upload) free() {
+// retire releases the native handle, exactly once. The caller holds mu, and
+// must call drain once it no longer does. Retiring a running upload aborts it.
+func (u *upload) retire() {
 	u.done = true
 	u.cleanup.Stop()
 	C.sia_upload_free(u.ptr)
-	// Only once the call that can emit events has returned, so the handler
-	// cannot fire after this.
+}
+
+// drain waits for the queued progress events to reach the handler, then frees
+// the token. Outside mu, because a handler touching this upload would be
+// waiting for mu. After retire, which is what stops further events arriving.
+func (u *upload) drain() {
 	unregisterProgress(u.progressID)
 	u.tokenOwner.close()
 }

@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
+	"time"
 )
 
 // TestPackedUploadRoundTrip proves several small objects pack into shared slabs
@@ -132,6 +134,61 @@ func TestPackedUploadAccounting(t *testing.T) {
 	// read between adds the three have to agree.
 	if want := (pu.Length() + optimal - 1) / optimal; pu.Slabs() != want {
 		t.Fatalf("slabs is %d, want %d for %d bytes at %d per slab", pu.Slabs(), want, pu.Length(), optimal)
+	}
+}
+
+// TestPackedUploadCloseWithBlockedHandler proves Close does not wait for a
+// progress handler while holding the lock the accessors need, which hung the
+// close for as long as the handler ran.
+func TestPackedUploadCloseWithBlockedHandler(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	ready := make(chan *PackedUpload, 1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	handler := func(ShardProgress) {
+		once.Do(func() {
+			pu := <-ready
+			close(entered)
+			<-release
+			pu.Remaining()
+		})
+	}
+
+	pu, err := sdk.UploadPacked(context.Background(), WithUploadProgress(handler))
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	ready <- pu
+
+	// Past one slab, so its shards upload and the handler runs. A pack that
+	// never fills one emits nothing until Finalize.
+	for packed := int64(0); packed <= pu.OptimalDataSize(); packed += payloadSize {
+		if _, err := pu.Add(bytes.NewReader(payload(payloadSize))); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no shard progress arrived")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		pu.Close()
+		close(closed)
+	}()
+	// Long enough that Close is inside the drain before the handler reaches
+	// back into the upload, which is the ordering that used to hang.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return: a handler calling Remaining deadlocked it")
 	}
 }
 

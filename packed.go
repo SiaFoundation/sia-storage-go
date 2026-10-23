@@ -238,8 +238,8 @@ func (p *PackedUpload) Slabs() int64 {
 // It consumes the upload whatever it returns, so Close afterwards is a no op.
 func (p *PackedUpload) Finalize() ([]*Object, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.done {
+		p.mu.Unlock()
 		return nil, errClosed
 	}
 
@@ -249,7 +249,10 @@ func (p *PackedUpload) Finalize() ([]*Object, error) {
 	code := C.sia_packed_upload_finalize(p.ptr, p.tok, &objs, &n, &cerr)
 	runtime.KeepAlive(p)
 	// Finalize consumes the packed upload but not the handle around it.
-	p.free()
+	p.retire()
+	p.mu.Unlock()
+	defer p.drain()
+
 	if code != C.SIA_OK {
 		return nil, goError(p.ctx, code, cerr)
 	}
@@ -273,22 +276,30 @@ func (p *PackedUpload) Close() error {
 	// and releases it.
 	p.tokenOwner.fire()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.done {
+		p.mu.Unlock()
 		return nil
 	}
-	p.free()
+	p.retire()
+	p.mu.Unlock()
+	p.drain()
 	return nil
 }
 
-// free releases the native handle and everything around it, exactly once. The
-// caller holds mu. Freeing an unfinalized upload abandons it.
-func (p *PackedUpload) free() {
+// retire releases the native handle, exactly once. The caller holds mu, and
+// must call drain once it no longer does. Retiring an unfinalized upload
+// abandons it.
+func (p *PackedUpload) retire() {
 	p.done = true
 	p.cleanup.Stop()
 	C.sia_packed_upload_free(p.ptr)
-	// Only once the call that can emit events has returned, so the handler
-	// cannot fire after this.
+}
+
+// drain waits for the queued progress events to reach the handler, then frees
+// the token. Outside mu, because a handler calling Remaining or Length would
+// be waiting for mu. After retire, which is what stops further events
+// arriving.
+func (p *PackedUpload) drain() {
 	unregisterProgress(p.progressID)
 	p.tokenOwner.close()
 }
