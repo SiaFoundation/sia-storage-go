@@ -6,24 +6,9 @@
 # reproduced by anyone else, so the Makefile has no target that writes one to
 # the committed path and the Archives check on main.yml rejects a hand-edited
 # ffi/lib/.
-#
-# GitHub only offers the Run workflow button for workflow_dispatch workflows
-# that exist on the default branch, so until this file reaches master the only
-# way to start it is a push. Pushing all six platform builds on every commit
-# would be wasteful, so the push path is gated on a marker in the commit
-# message:
-#
-#     git commit --allow-empty -m "refresh the FFI archives [build-libs]"
-#     git push
-#
-# Once this file is on the default branch, drop the push trigger and the
-# `if` on the resolve job and use the button instead.
 name: Build FFI Libraries
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - "matt/**"
 
 env:
   SIA_SDK_RS_REF: master
@@ -32,13 +17,8 @@ jobs:
   # Pins one sia-sdk-rs revision for the whole run. Without this each matrix
   # job resolves `master` independently, so a merge landing mid-run would ship
   # a set of archives built from two different revisions.
-  #
-  # Skipping this job skips build and commit with it, since both depend on it.
   resolve:
     name: Resolve sia-sdk-rs
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.head_commit.message, '[build-libs]')
     runs-on: ubuntu-latest
     permissions:
       contents: read
