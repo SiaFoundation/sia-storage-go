@@ -1,8 +1,4 @@
-// Command benchmark measures upload and download throughput through the C ABI,
-// so the numbers can be compared against the native Go engine it replaces.
-//
-// The matching harness for the native engine lives in examples/benchmark-native
-// and prints the same JSON, so a run of each can be merged and compared.
+// Command benchmark measures upload and download throughput through the C ABI.
 //
 //	go run -tags siastorage_mock ./examples/benchmark -reps 3
 //	go run ./examples/benchmark -indexer https://sia.storage -app-key <hex> -reps 5
