@@ -137,6 +137,52 @@ func TestPackedUploadAccounting(t *testing.T) {
 	}
 }
 
+// cancelAtEOF cancels as it reports EOF, so the cancellation lands after the
+// last write and before the finish that follows it.
+type cancelAtEOF struct {
+	data []byte
+	at   func()
+}
+
+func (r *cancelAtEOF) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		r.at()
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestPackedUploadCancelledFinish proves a cancellation during the finish
+// reports the cause and consumes the pack, rather than leaving a handle whose
+// every later call reports an add in progress.
+func TestPackedUploadCancelledFinish(t *testing.T) {
+	_, sdk := transferSDK(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pu, err := sdk.UploadPacked(ctx)
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	defer pu.Close()
+
+	// The context watcher fires the native token on its own goroutine, so the
+	// token is fired here too. Otherwise the finish can run before it lands.
+	r := &cancelAtEOF{data: payload(64 << 10), at: func() {
+		cancel()
+		pu.tokenOwner.fire()
+	}}
+
+	if _, err := pu.Add(r); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled finish returned %v, want context.Canceled", err)
+	}
+	if _, err := pu.Finalize(); !errors.Is(err, errClosed) {
+		t.Fatalf("after a cancelled finish, Finalize returned %v, want errClosed", err)
+	}
+}
+
 // TestPackedUploadRejectsStartOffset proves the refusal documented on
 // WithUploadStartOffset carries the sentinel it names, rather than only saying
 // so in its message.

@@ -107,7 +107,13 @@ func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUp
 // Add, in order.
 func (p *PackedUpload) Add(r io.Reader) (int64, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	var retired bool
+	defer func() {
+		p.mu.Unlock()
+		if retired {
+			p.drain()
+		}
+	}()
 	if p.done {
 		return 0, errClosed
 	}
@@ -148,6 +154,13 @@ func (p *PackedUpload) Add(r io.Reader) (int64, error) {
 	code := C.sia_packed_upload_add_finish(p.ptr, p.tok, &written, &ferr)
 	runtime.KeepAlive(p)
 	if code != C.SIA_OK {
+		// A cancelled finish leaves the add attached, and the native side
+		// refuses to abort out of that state, so retiring is the only way
+		// out. The token is the pack's own, so the pack is spent anyway.
+		if code == C.SIA_ERR_CANCELLED {
+			p.retire()
+			retired = true
+		}
 		return 0, goError(p.ctx, code, ferr)
 	}
 	return int64(written), nil
