@@ -1,0 +1,232 @@
+//go:build siastorage_mock
+
+package siastorage
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"go.sia.tech/core/types"
+	"lukechampine.com/frand"
+)
+
+// TestObjectEmpty covers the accessors on a fresh object, before an upload has
+// given it slabs or timestamps.
+func TestObjectEmpty(t *testing.T) {
+	obj := NewEmptyObject()
+
+	if obj.Size() != 0 {
+		t.Fatalf("expected an empty object to have size 0, got %d", obj.Size())
+	}
+	if obj.EncodedSize() != 0 {
+		t.Fatalf("expected encoded size 0, got %d", obj.EncodedSize())
+	}
+	if md := obj.Metadata(); md != nil {
+		t.Fatalf("expected no metadata, got %d bytes", len(md))
+	}
+	// A new object is stamped on creation rather than left empty, so these are
+	// real times even before an upload.
+	if age := time.Since(obj.CreatedAt()); age < 0 || age > time.Minute {
+		t.Fatalf("expected CreatedAt to be just now, got %v", obj.CreatedAt())
+	}
+	if obj.UpdatedAt().Before(obj.CreatedAt()) {
+		t.Fatalf("UpdatedAt %v precedes CreatedAt %v", obj.UpdatedAt(), obj.CreatedAt())
+	}
+}
+
+// TestObjectMetadataRoundTrip proves metadata survives the boundary at sizes
+// either side of a single copy, and that clearing works.
+func TestObjectMetadataRoundTrip(t *testing.T) {
+	obj := NewEmptyObject()
+
+	for _, size := range []int{1, 31, 32, 33, 4096} {
+		want := bytes.Repeat([]byte{byte(size)}, size)
+		obj = obj.WithMetadata(want)
+		got := obj.Metadata()
+		if !bytes.Equal(got, want) {
+			t.Fatalf("metadata of %d bytes came back as %d bytes", size, len(got))
+		}
+	}
+
+	obj = obj.WithMetadata(nil)
+	if md := obj.Metadata(); md != nil {
+		t.Fatalf("expected clearing metadata to leave none, got %d bytes", len(md))
+	}
+}
+
+// TestObjectIDIsContentAddressed proves ID comes from the slabs rather than
+// being random, which is what lets a caller detect that two uploads produced
+// the same object.
+func TestObjectIDIsContentAddressed(t *testing.T) {
+	a, b := NewEmptyObject(), NewEmptyObject()
+
+	if a.ID() != b.ID() {
+		t.Fatal("two empty objects should share an ID, so the ID is not derived from the slabs")
+	}
+	// Metadata is not part of the ID, only the slabs are.
+	a = a.WithMetadata([]byte(`{"name":"a"}`))
+	if a.ID() != b.ID() {
+		t.Fatal("metadata must not change the object ID")
+	}
+	var zero types.Hash256
+	if a.ID() == zero {
+		t.Fatal("an empty object's ID should still be a real hash, not zero")
+	}
+}
+
+// TestEncodedSize pairs the estimate with what an uploaded object reports,
+// since pricing an upload before making it is the point, and checks that zero
+// data shards is an error rather than a panic across the boundary.
+func TestEncodedSize(t *testing.T) {
+	_, sdk := transferSDK(t)
+
+	data := frand.Bytes(3 << 20)
+	obj := uploadPayload(t, sdk, data)
+
+	got, err := EncodedSize(uint64(len(data)), 10, 20)
+	if err != nil {
+		t.Fatalf("encoded size: %v", err)
+	}
+	if want := obj.EncodedSize(); got != want {
+		t.Fatalf("estimate is %d, the uploaded object reports %d", got, want)
+	}
+
+	if _, err := EncodedSize(1<<20, 0, 20); err == nil {
+		t.Fatal("zero data shards must be an error")
+	}
+}
+
+// TestSealAndOpenWithKey proves the pair works with no SDK in hand, which is
+// what a process restarting from a stored seed has: sealing and opening are
+// local, so neither needs an indexer. A different key must be refused.
+func TestSealAndOpenWithKey(t *testing.T) {
+	_, sdk := transferSDK(t)
+	appKey := sdk.AppKey()
+
+	data := frand.Bytes(1 << 20)
+	obj := uploadPayload(t, sdk, data)
+	obj = obj.WithMetadata([]byte(`{"name":"offline"}`))
+
+	sealed, err := SealObjectWithKey(appKey, obj)
+	if err != nil {
+		t.Fatalf("seal with key: %v", err)
+	}
+
+	reopened, err := ObjectFromSealedWithKey(appKey, sealed)
+	if err != nil {
+		t.Fatalf("open with key: %v", err)
+	}
+	if reopened.ID() != obj.ID() {
+		t.Fatalf("reopened id %v, want %v", reopened.ID(), obj.ID())
+	}
+	if got := reopened.Metadata(); string(got) != `{"name":"offline"}` {
+		t.Fatalf("metadata is %q after the round trip", got)
+	}
+
+	other := types.NewPrivateKeyFromSeed(frand.Bytes(32))
+	if _, err := ObjectFromSealedWithKey(other, sealed); err == nil {
+		t.Fatal("another app key opened the object")
+	}
+}
+
+// TestSDKCloseDuringCall is the race the guard exists for: a shutdown path
+// closing the SDK while another goroutine is mid-call. Without the lock, Close
+// freed the handle underneath the call. It is run under -race, where an
+// unsynchronised free shows up as a data race even when it does not crash.
+func TestSDKCloseDuringCall(t *testing.T) {
+	net := NewMockNetwork(10)
+
+	var seed [32]byte
+	seed[0] = 42
+	sdk, err := net.SDK(context.Background(), seed)
+	if err != nil {
+		t.Fatalf("mock sdk: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			// Either outcome is fine. Crashing or racing is not.
+			if _, err := sdk.Account(context.Background()); err != nil && !errors.Is(err, errClosed) {
+				return
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		sdk.Close()
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Close must have taken effect however the race landed.
+	if _, err := sdk.Account(context.Background()); !errors.Is(err, errClosed) {
+		t.Errorf("Account after Close returned %v, want errClosed", err)
+	}
+}
+
+// TestObjectConcurrentUse proves an object is safe to share between goroutines.
+// Nothing can change one once it exists: the ABI has no setter, WithMetadata
+// returns a new object and leaves the receiver alone, and Metadata hands back a
+// copy. The lock the type carries is for Close, which frees the handle and
+// clears what the accessors report.
+//
+// The race detector is what makes this test meaningful; it passes trivially
+// without -race.
+func TestObjectConcurrentUse(t *testing.T) {
+	values := [][]byte{
+		bytes.Repeat([]byte("a"), 16),
+		bytes.Repeat([]byte("b"), 512),
+		bytes.Repeat([]byte("c"), 900),
+	}
+	shared := NewEmptyObject().WithMetadata(values[0])
+
+	var wg sync.WaitGroup
+	// Derive new objects from the shared one while others read it.
+	for i := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range 50 {
+				want := values[(i+j)%len(values)]
+				derived := shared.WithMetadata(want)
+				if !bytes.Equal(derived.Metadata(), want) {
+					t.Errorf("WithMetadata produced %d bytes, want %d", len(derived.Metadata()), len(want))
+					return
+				}
+			}
+		}()
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				// Deriving cannot disturb the object it was derived from.
+				if md := shared.Metadata(); !bytes.Equal(md, values[0]) {
+					t.Errorf("the shared object changed under a reader: %d bytes", len(md))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Writing through a returned copy cannot reach the object either.
+	md := shared.Metadata()
+	md[0] ^= 0xff
+	if bytes.Equal(shared.Metadata(), md) {
+		t.Fatal("Metadata handed out the object's own buffer")
+	}
+}
