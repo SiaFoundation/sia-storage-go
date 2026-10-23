@@ -173,6 +173,56 @@ func TestTransferProgress(t *testing.T) {
 	}
 }
 
+// TestDownloadCloseWithBlockedHandler proves Close does not wait for a
+// progress handler while holding the lock that handler needs, which hung the
+// close for as long as the handler ran.
+func TestDownloadCloseWithBlockedHandler(t *testing.T) {
+	_, sdk := transferSDK(t)
+	obj := uploadPayload(t, sdk, payload(payloadSize))
+
+	var dl *Download
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	handler := func(ShardProgress) {
+		once.Do(func() {
+			close(entered)
+			<-release
+			// Whatever this returns, it has to take d.mu to get there.
+			_, _ = dl.Read(make([]byte, 1))
+		})
+	}
+
+	dl, err := sdk.Download(context.Background(), obj, WithDownloadProgress(handler))
+	if err != nil {
+		t.Fatalf("download start: %v", err)
+	}
+	if _, err := dl.Read(make([]byte, 1<<20)); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no shard progress arrived")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		dl.Close()
+		close(closed)
+	}()
+	// Long enough that Close is inside the drain before the handler reaches
+	// back into the Download, which is the ordering that used to hang.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return: a handler touching the Download deadlocked it")
+	}
+}
+
 // TestTransferMissingSectors proves a download that cannot be satisfied reports
 // the sentinel rather than a bare message, which is what callers match on.
 func TestTransferMissingSectors(t *testing.T) {

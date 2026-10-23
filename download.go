@@ -215,15 +215,17 @@ func (d *Download) Close() error {
 	// read holds until it returns.
 	d.tokenOwner.fire()
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.done {
+		d.mu.Unlock()
 		return nil
 	}
 	d.done = true
 	d.cleanup.Stop()
 	C.sia_download_free(d.ptr)
-	// Only once the call that can emit events has returned, so the handler
-	// cannot fire after this.
+	d.mu.Unlock()
+	// Outside mu, because this waits for the handler and a handler touching
+	// this Download would be waiting for mu. It runs after sia_download_free,
+	// which is what stops further events arriving.
 	unregisterProgress(d.progressID)
 	d.tokenOwner.close()
 	return nil

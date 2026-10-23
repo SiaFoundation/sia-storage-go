@@ -41,7 +41,9 @@ func WithUploadMaxBufferedSlabs(n int) UploadOption {
 }
 
 // WithUploadProgress registers a handler for every shard that finishes
-// uploading. It may block, but events are dropped if it falls behind.
+// uploading. It may block, but events are dropped if it falls behind. It must
+// not close or finish the transfer, which waits for the handler to return;
+// cancel the context to stop early.
 func WithUploadProgress(fn func(ShardProgress)) UploadOption {
 	return func(o *uploadOptions) { o.onShard = fn }
 }
