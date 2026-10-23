@@ -539,26 +539,9 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	report(sdk)
 }
 
-// upload drives the writes itself so it can report dropped progress events,
-// which only the upload handle exposes.
+// upload streams data in and returns the finished object.
 func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	up, err := sdk.UploadStream(ctx, siastorage.NewEmptyObject(), siastorage.WithUploadOptions(opts))
-	if err != nil {
-		return nil, err
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, bytes.NewReader(data)); err != nil {
-		return nil, err
-	}
-	obj, err := up.Finish()
-	if err != nil {
-		return nil, err
-	}
-	if dropped := up.Dropped(); dropped > 0 {
-		info("%d progress events were dropped, the handler fell behind", dropped)
-	}
-	return obj, nil
+	return sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(data), siastorage.WithUploadOptions(opts))
 }
 
 // uploadInto streams data into an existing object, which is what an overwrite

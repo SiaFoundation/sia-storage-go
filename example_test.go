@@ -139,25 +139,11 @@ func ExampleSDK_Upload_progress() {
 	var sdk *siastorage.SDK
 	var src io.Reader
 
-	// Dropped is on the upload handle, so this drives the writes itself.
-	up, err := sdk.UploadStream(ctx, siastorage.NewEmptyObject(),
+	if _, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), src,
 		siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
 			fmt.Printf("%d bytes transferred\n", p.Transferred)
-		}))
-	if err != nil {
-		log.Fatal("failed to start upload:", err)
-	}
-	defer up.Close()
-
-	if _, err := io.Copy(up, src); err != nil {
-		log.Fatal("failed to write:", err)
-	}
-	if _, err := up.Finish(); err != nil {
-		log.Fatal("failed to finish upload:", err)
-	}
-
-	if dropped := up.Dropped(); dropped > 0 {
-		fmt.Printf("%d progress events were dropped\n", dropped)
+		})); err != nil {
+		log.Fatal("failed to upload:", err)
 	}
 }
 

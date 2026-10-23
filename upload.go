@@ -115,10 +115,9 @@ const uploadChunk = 256 << 10
 
 // Upload streams r into obj, which supplies the metadata the finished object
 // carries, and returns that object once the transfer completes.
-//
-// Use [SDK.UploadStream] if the transfer needs to resume after a cancellation.
+
 func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...UploadOption) (*Object, error) {
-	up, err := s.UploadStream(ctx, obj, opts...)
+	up, err := s.uploadStream(ctx, obj, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -130,15 +129,11 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 	return up.Finish()
 }
 
-// UploadStream begins streaming data into obj, which supplies the metadata the
-// finished object carries. Write the data, then call [Upload.Finish].
-//
-// Prefer [SDK.Upload] unless the transfer has to survive a cancellation. A
-// cancelled [Upload.Write] reports how much of the buffer it took, so the
-// caller can carry on from there rather than restarting the object.
+// uploadStream begins streaming data into obj. Write the data, then call
+// Finish.
 //
 // ctx cancels the whole transfer, not just the call that starts it.
-func (s *SDK) UploadStream(ctx context.Context, obj *Object, opts ...UploadOption) (*Upload, error) {
+func (s *SDK) uploadStream(ctx context.Context, obj *Object, opts ...UploadOption) (*Upload, error) {
 	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
