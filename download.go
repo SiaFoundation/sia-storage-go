@@ -15,52 +15,36 @@ import (
 	"unsafe"
 )
 
-// DownloadOptions configures a download. The zero value reads the whole object.
-type DownloadOptions struct {
-	// Offset is the byte to start at.
-	Offset uint64
-
-	// Length bounds how many bytes to read from Offset. A nil Length reads to
-	// the end of the object, which is not the same as a zero Length.
-	Length *uint64
-
-	// MaxBufferedChunks bounds how many recovered chunks are held in memory.
-	// Zero uses the SDK default.
-	MaxBufferedChunks uint64
-
-	// OnShard is called for every shard that finishes downloading, under the
-	// same terms as the upload's handler.
-	OnShard func(ShardProgress)
+// downloadOptions is what the With functions below build. The zero value reads
+// the whole object.
+type downloadOptions struct {
+	offset            uint64
+	length            *uint64
+	maxBufferedChunks uint64
+	onShard           func(ShardProgress)
 }
 
-// A DownloadOption sets a field on [DownloadOptions]. Pass options, or pass a
-// filled struct through [WithDownloadOptions], whichever reads better.
-type DownloadOption func(*DownloadOptions)
-
-// WithDownloadOptions supplies a whole [DownloadOptions] at once, for callers
-// that build one rather than composing options. Later options still override it.
-func WithDownloadOptions(o DownloadOptions) DownloadOption {
-	return func(dst *DownloadOptions) { *dst = o }
-}
+// A DownloadOption configures a download.
+type DownloadOption func(*downloadOptions)
 
 // WithDownloadRange bounds the read to length bytes starting at offset.
 func WithDownloadRange(offset, length uint64) DownloadOption {
-	return func(o *DownloadOptions) { o.Offset, o.Length = offset, &length }
+	return func(o *downloadOptions) { o.offset, o.length = offset, &length }
 }
 
 // WithDownloadMaxBufferedChunks bounds how many recovered chunks are held in
 // memory. Zero uses the SDK default.
 func WithDownloadMaxBufferedChunks(n int) DownloadOption {
-	return func(o *DownloadOptions) { o.MaxBufferedChunks = uint64(n) }
+	return func(o *downloadOptions) { o.maxBufferedChunks = uint64(n) }
 }
 
 // WithDownloadProgress registers a handler for every shard that finishes
-// downloading. See [DownloadOptions.OnShard] for the terms it runs under.
+// downloading, under the same terms as [WithUploadProgress].
 func WithDownloadProgress(fn func(ShardProgress)) DownloadOption {
-	return func(o *DownloadOptions) { o.OnShard = fn }
+	return func(o *downloadOptions) { o.onShard = fn }
 }
 
-func (o DownloadOptions) with(opts []DownloadOption) DownloadOptions {
+func (o downloadOptions) with(opts []DownloadOption) downloadOptions {
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -92,7 +76,7 @@ type Download struct {
 //
 // ctx cancels the whole transfer, not just the call that starts it.
 func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption) (*Download, error) {
-	o := DownloadOptions{}.with(opts)
+	o := downloadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
@@ -101,18 +85,18 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption)
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(o.OnShard)
+	progressID := registerProgress(o.onShard)
 
 	copts := C.sia_download_options_t{
-		offset:              C.uint64_t(o.Offset),
-		max_buffered_chunks: C.uint64_t(o.MaxBufferedChunks),
+		offset:              C.uint64_t(o.offset),
+		max_buffered_chunks: C.uint64_t(o.maxBufferedChunks),
 		userdata:            C.uintptr_t(progressID),
 	}
-	if o.Length != nil {
+	if o.length != nil {
 		copts.has_length = true
-		copts.length = C.uint64_t(*o.Length)
+		copts.length = C.uint64_t(*o.length)
 	}
-	if o.OnShard != nil {
+	if o.onShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 
@@ -148,7 +132,7 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption)
 //
 // ctx cancels the whole transfer, not just the call that starts it.
 func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption) (*Download, error) {
-	o := DownloadOptions{}.with(opts)
+	o := downloadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	obj.mu.RLock()
@@ -157,18 +141,18 @@ func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts ...DownloadO
 		return nil, errClosed
 	}
 
-	progressID := registerProgress(o.OnShard)
+	progressID := registerProgress(o.onShard)
 
 	copts := C.sia_download_options_t{
-		offset:              C.uint64_t(o.Offset),
-		max_buffered_chunks: C.uint64_t(o.MaxBufferedChunks),
+		offset:              C.uint64_t(o.offset),
+		max_buffered_chunks: C.uint64_t(o.maxBufferedChunks),
 		userdata:            C.uintptr_t(progressID),
 	}
-	if o.Length != nil {
+	if o.length != nil {
 		copts.has_length = true
-		copts.length = C.uint64_t(*o.Length)
+		copts.length = C.uint64_t(*o.length)
 	}
-	if o.OnShard != nil {
+	if o.onShard != nil {
 		copts.on_shard = C.sia_go_progress_cb()
 	}
 

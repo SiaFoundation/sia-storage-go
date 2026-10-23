@@ -148,17 +148,16 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	var shards int
 	var transferred uint64
 	bar := newProgress(uploadBytes(payloadSize))
-	obj, err := upload(ctx, sdk, want, siastorage.UploadOptions{
-		// Set explicitly so the bar's total is arithmetic rather than a guess,
-		// which also exercises set_redundancy on the options struct.
-		DataShards:   dataShards,
-		ParityShards: parityShards,
-		OnShard: func(p siastorage.ShardProgress) {
-			shards++
-			transferred = p.Transferred
-			bar.update(p.Transferred)
-		},
-	})
+	onShard := func(p siastorage.ShardProgress) {
+		shards++
+		transferred = p.Transferred
+		bar.update(p.Transferred)
+	}
+	// The redundancy is pinned rather than left to the SDK default so
+	// uploadBytes, which the bar's total comes from, matches what is written.
+	obj, err := upload(ctx, sdk, want,
+		siastorage.WithRedundancy(dataShards, parityShards),
+		siastorage.WithUploadProgress(onShard))
 	bar.finish()
 	if err != nil {
 		fail("upload", err)
@@ -200,9 +199,8 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	// -------------------------------------------------------------- download
 	stage("Download the whole object and verify it")
 	dlBar := newProgress(downloadBytes(payloadSize))
-	got, err := download(ctx, sdk, fetched, siastorage.DownloadOptions{
-		OnShard: func(p siastorage.ShardProgress) { dlBar.update(p.Transferred) },
-	})
+	got, err := download(ctx, sdk, fetched,
+		siastorage.WithDownloadProgress(func(p siastorage.ShardProgress) { dlBar.update(p.Transferred) }))
 	dlBar.finish()
 	if err != nil {
 		fail("download", err)
@@ -215,8 +213,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 
 	stage("Download a byte range")
 	const offset, length = 1 << 20, 64 << 10
-	n := uint64(length)
-	part, err := download(ctx, sdk, fetched, siastorage.DownloadOptions{Offset: offset, Length: &n})
+	part, err := download(ctx, sdk, fetched, siastorage.WithDownloadRange(offset, length))
 	if err != nil {
 		fail("range download", err)
 	}
@@ -282,8 +279,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	stage("Overwrite a range in place")
 	const patchAt = 2 << 20
 	patch := bytes.Repeat([]byte{0xAB}, 128<<10)
-	at := uint64(patchAt)
-	overwritten, err := uploadInto(ctx, sdk, obj, patch, siastorage.UploadOptions{StartOffset: &at})
+	overwritten, err := uploadInto(ctx, sdk, obj, patch, siastorage.WithUploadStartOffset(patchAt))
 	if err != nil {
 		fail("overwrite", err)
 	}
@@ -298,7 +294,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	expected := append([]byte(nil), want...)
 	copy(expected[patchAt:], patch)
-	after, err := download(ctx, sdk, overwritten, siastorage.DownloadOptions{})
+	after, err := download(ctx, sdk, overwritten)
 	if err != nil {
 		fail("download overwritten", err)
 	}
@@ -310,12 +306,12 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	info("the id moved to %v, since an id is derived from the slabs", overwritten.ID())
 
 	past := overwritten.Size() + 1
-	if _, err := uploadInto(ctx, sdk, overwritten, []byte("x"), siastorage.UploadOptions{StartOffset: &past}); !errors.Is(err, siastorage.ErrOutOfRange) {
+	if _, err := uploadInto(ctx, sdk, overwritten, []byte("x"), siastorage.WithUploadStartOffset(past)); !errors.Is(err, siastorage.ErrOutOfRange) {
 		fail("overwrite past the end", fmt.Errorf("wanted ErrOutOfRange, got %v", err))
 	}
 	info("starting past the end reports ErrOutOfRange")
 
-	if _, err := sdk.UploadPacked(ctx, siastorage.WithUploadStartOffset(at)); !errors.Is(err, siastorage.ErrInvalidState) {
+	if _, err := sdk.UploadPacked(ctx, siastorage.WithUploadStartOffset(patchAt)); !errors.Is(err, siastorage.ErrInvalidState) {
 		fail("packed with a start offset", fmt.Errorf("wanted ErrInvalidState, got %v", err))
 	}
 	info("a packed upload refuses one, since it always appends")
@@ -336,7 +332,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	if err := sdk.PinObject(ctx, short); err != nil {
 		fail("PinObject truncated", err)
 	}
-	prefix, err := download(ctx, sdk, short, siastorage.DownloadOptions{})
+	prefix, err := download(ctx, sdk, short)
 	if err != nil {
 		fail("download truncated", err)
 	}
@@ -474,7 +470,7 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 	}
 	info("each pinned, so the indexer can find them")
 	if len(packedObjs) > 0 {
-		first, err := download(ctx, sdk, packedObjs[0], siastorage.DownloadOptions{})
+		first, err := download(ctx, sdk, packedObjs[0])
 		if err != nil {
 			fail("packed download", err)
 		}
@@ -540,19 +536,19 @@ func run(ctx context.Context, sdk *siastorage.SDK) {
 }
 
 // upload streams data in and returns the finished object.
-func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	return sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(data), siastorage.WithUploadOptions(opts))
+func upload(ctx context.Context, sdk *siastorage.SDK, data []byte, opts ...siastorage.UploadOption) (*siastorage.Object, error) {
+	return sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(data), opts...)
 }
 
 // uploadInto streams data into an existing object, which is what an overwrite
 // needs: the object carries the slabs the range is rewritten against.
-func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, data []byte, opts siastorage.UploadOptions) (*siastorage.Object, error) {
-	return sdk.Upload(ctx, obj, bytes.NewReader(data), siastorage.WithUploadOptions(opts))
+func uploadInto(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, data []byte, opts ...siastorage.UploadOption) (*siastorage.Object, error) {
+	return sdk.Upload(ctx, obj, bytes.NewReader(data), opts...)
 }
 
 // download reads an object out through io.ReadAll.
-func download(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, opts siastorage.DownloadOptions) ([]byte, error) {
-	dl, err := sdk.Download(ctx, obj, siastorage.WithDownloadOptions(opts))
+func download(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, opts ...siastorage.DownloadOption) ([]byte, error) {
+	dl, err := sdk.Download(ctx, obj, opts...)
 	if err != nil {
 		return nil, err
 	}
