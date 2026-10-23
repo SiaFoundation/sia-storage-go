@@ -26,7 +26,6 @@ linters:
         - (*go.sia.tech/siastorage.PackedUpload).Close
         - (*go.sia.tech/siastorage.SDK).Close
         - (*go.sia.tech/siastorage.SharedSDK).Close
-        - (*go.sia.tech/siastorage.Upload).Close
         # Sync on a console logger returns an error on some platforms that no
         # caller can act on, which is why it is conventionally discarded.
         - (*go.uber.org/zap.Logger).Sync

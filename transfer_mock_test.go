@@ -210,12 +210,8 @@ func TestUploadCloseWithoutFinish(t *testing.T) {
 	if _, err := up.Write(payload(1 << 20)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := up.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if err := up.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
-	}
+	up.Close()
+	up.Close()
 	if _, err := up.Write([]byte("x")); !errors.Is(err, errClosed) {
 		t.Fatalf("write after close returned %v, want errClosed", err)
 	}
@@ -240,9 +236,7 @@ func TestUploadCloseAfterFinish(t *testing.T) {
 		t.Fatalf("finish: %v", err)
 	}
 
-	if err := up.Close(); err != nil {
-		t.Fatalf("close after finish: %v", err)
-	}
+	up.Close()
 	if _, err := up.Finish(); !errors.Is(err, errClosed) {
 		t.Fatalf("second finish returned %v, want errClosed", err)
 	}

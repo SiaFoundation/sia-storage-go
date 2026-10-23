@@ -88,13 +88,10 @@ func (o UploadOptions) with(opts []UploadOption) UploadOptions {
 	return o
 }
 
-// An Upload streams data into an object. It implements [io.Writer], so
-// [io.Copy] drives it.
-//
-// Call Finish to signal EOF and get the uploaded object. Close aborts an
-// upload that has not finished, and is safe to call afterwards either way, so
-// `defer up.Close()` is the right pattern.
-type Upload struct {
+// An upload streams data into an object. It implements io.Writer, so the copy
+// in [SDK.Upload] drives it. Finish signals EOF and returns the object; Close
+// abandons one that has not finished.
+type upload struct {
 	ptr        *C.sia_upload_t
 	cleanup    runtime.Cleanup
 	ctx        context.Context
@@ -133,7 +130,7 @@ func (s *SDK) Upload(ctx context.Context, obj *Object, r io.Reader, opts ...Uplo
 // Finish.
 //
 // ctx cancels the whole transfer, not just the call that starts it.
-func (s *SDK) uploadStream(ctx context.Context, obj *Object, opts ...UploadOption) (*Upload, error) {
+func (s *SDK) uploadStream(ctx context.Context, obj *Object, opts ...UploadOption) (*upload, error) {
 	o := UploadOptions{}.with(opts)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -173,7 +170,7 @@ func (s *SDK) uploadStream(ctx context.Context, obj *Object, opts ...UploadOptio
 	}
 
 	tok, tokenOwner := newStreamCancel(ctx)
-	u := &Upload{
+	u := &upload{
 		ptr:        ptr,
 		ctx:        ctx,
 		tok:        tok,
@@ -193,7 +190,7 @@ func (s *SDK) uploadStream(ctx context.Context, obj *Object, opts ...UploadOptio
 //
 // A cancelled write reports the count it managed, so the remainder can be
 // written again once the cause is resolved rather than restarting the object.
-func (u *Upload) Write(p []byte) (int, error) {
+func (u *upload) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -228,7 +225,7 @@ func (u *Upload) Write(p []byte) (int, error) {
 //
 // It consumes the upload whatever it returns, so a failure uploads nothing
 // further and Close afterwards is a no op.
-func (u *Upload) Finish() (*Object, error) {
+func (u *upload) Finish() (*Object, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.done {
@@ -250,17 +247,16 @@ func (u *Upload) Finish() (*Object, error) {
 
 // Close aborts an upload that has not finished. It is safe to call more than
 // once, and after Finish.
-func (u *Upload) Close() error {
+func (u *upload) Close() {
 	// Fire the token before taking mu so a write blocked inside Rust returns
 	// and releases it. Cancelling an already finished upload is harmless.
 	u.tokenOwner.fire()
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.done {
-		return nil
+		return
 	}
 	u.free()
-	return nil
 }
 
 // Dropped reports how many shard events the handler never saw because it could
@@ -268,7 +264,7 @@ func (u *Upload) Close() error {
 //
 // The byte count is not lost with them: every delivered event carries the
 // running total in [ShardProgress.Transferred].
-func (u *Upload) Dropped() uint64 {
+func (u *upload) Dropped() uint64 {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.dropped
@@ -276,7 +272,7 @@ func (u *Upload) Dropped() uint64 {
 
 // free releases the native handle and everything around it, exactly once. The
 // caller holds mu. Freeing a running upload aborts it.
-func (u *Upload) free() {
+func (u *upload) free() {
 	u.done = true
 	u.cleanup.Stop()
 	C.sia_upload_free(u.ptr)
