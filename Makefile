@@ -17,8 +17,7 @@
 # `testlib` is the one archive you do build here. It carries the mock cargo
 # feature, which swaps the host transport for an in-memory one. It is linked
 # only by `go build -tags siastorage_mock`, is covered by .gitignore, and must
-# never be committed or shipped. Shipping a mock linked archive as production
-# is what invalidated the original throughput benchmark.
+# never be committed or shipped.
 
 SIA_SDK_RS ?= ../../rs_sia_suite/sia-sdk-rs
 CABI := $(SIA_SDK_RS)/sia_storage_cabi
@@ -90,12 +89,20 @@ sync-header:
 check-header:
 	diff -u ffi/include/sia_storage.h $(CABI)/include/sia_storage.h
 
-# Asserts the archive in place was not built with the mock transport. This is
-# the check that a mock linked library once defeated.
+# Asserts the archive in place was not built with the mock transport. Mach-O
+# prefixes exported symbols with an underscore and ELF and COFF do not, so the
+# patterns are written without one and match either.
+# sia_sdk_free has to be present for the absence of sia_mock to mean anything,
+# because nm lists an archive it cannot read as having no symbols at all.
 .PHONY: check-no-mock
 check-no-mock:
-	@n=$$(nm -g $(LIB_DIR)/libsia_storage_cabi.a 2>/dev/null | grep -c _sia_mock || true); \
-	if [ "$$n" != "0" ]; then echo "FAIL: production archive exports $$n mock symbols"; exit 1; fi; \
+	@syms=$$(nm -g $(LIB_DIR)/libsia_storage_cabi.a 2>/dev/null); \
+	if ! echo "$$syms" | grep -q sia_sdk_free; then \
+		echo "FAIL: $(LIB_DIR)/libsia_storage_cabi.a exports no SDK symbols"; exit 1; \
+	fi; \
+	if echo "$$syms" | grep -q sia_mock; then \
+		echo "FAIL: production archive exports mock symbols"; exit 1; \
+	fi; \
 	echo "ok: production archive exports no mock symbols"
 
 # Expects the committed archive to already be in place, which it is in a fresh
