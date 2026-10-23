@@ -110,7 +110,7 @@ func TestSharingKeySeedRoundTrip(t *testing.T) {
 // TestSharingKeyGrantsReads is the point of the feature: a holder of the seed
 // alone can read the bytes, without the owner's app key.
 func TestSharingKeyGrantsReads(t *testing.T) {
-	_, sdk := transferSDK(t)
+	net, sdk := transferSDK(t)
 	ctx := context.Background()
 	want := payload(payloadSize)
 
@@ -124,9 +124,14 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 		t.Fatalf("share: %v", err)
 	}
 
-	// Come back to the object through nothing but the seed.
-	recipient := ImportSharingKey(key.Export())
-	shared, err := sdk.SharedObjects(ctx, recipient, 0, 0)
+	// Nothing past this point touches the owner's SDK.
+	recipient, err := net.SharedSDK(ctx, key.Export())
+	if err != nil {
+		t.Fatalf("shared sdk: %v", err)
+	}
+	defer recipient.Close()
+
+	shared, err := recipient.Objects(ctx, 0, 0)
 	if err != nil {
 		t.Fatalf("list as recipient: %v", err)
 	}
@@ -134,7 +139,7 @@ func TestSharingKeyGrantsReads(t *testing.T) {
 		t.Fatalf("the recipient sees %d objects, want 1", len(shared))
 	}
 
-	dl, err := sdk.Download(ctx, shared[0])
+	dl, err := recipient.Download(ctx, shared[0])
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
