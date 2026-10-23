@@ -34,7 +34,6 @@ type PackedUpload struct {
 	tok        *C.sia_cancel_t
 	tokenOwner *streamCancel
 	progressID uintptr
-	dropped    uint64
 
 	// mu serialises the native calls and guards done, as for a plain upload.
 	mu   sync.Mutex
@@ -282,14 +281,6 @@ func (p *PackedUpload) Close() error {
 	return nil
 }
 
-// Dropped reports how many shard events the handler never saw because it could
-// not keep up. It is final once the upload has been finalized or closed.
-func (p *PackedUpload) Dropped() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.dropped
-}
-
 // free releases the native handle and everything around it, exactly once. The
 // caller holds mu. Freeing an unfinalized upload abandons it.
 func (p *PackedUpload) free() {
@@ -298,6 +289,6 @@ func (p *PackedUpload) free() {
 	C.sia_packed_upload_free(p.ptr)
 	// Only once the call that can emit events has returned, so the handler
 	// cannot fire after this.
-	_, p.dropped = unregisterProgress(p.progressID)
+	unregisterProgress(p.progressID)
 	p.tokenOwner.close()
 }

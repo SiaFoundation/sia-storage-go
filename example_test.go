@@ -187,10 +187,6 @@ func ExampleSDK_Download_progress() {
 	if _, err := io.Copy(os.Stdout, dl); err != nil {
 		log.Fatal("failed to read:", err)
 	}
-
-	if dropped := dl.Dropped(); dropped > 0 {
-		fmt.Printf("%d progress events were dropped\n", dropped)
-	}
 }
 
 // Only the requested range is fetched, so a range read costs a fraction of

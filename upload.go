@@ -73,7 +73,6 @@ type upload struct {
 	tok        *C.sia_cancel_t
 	tokenOwner *streamCancel
 	progressID uintptr
-	dropped    uint64
 
 	// mu serialises the native calls and guards done. Close fires the token
 	// before taking it, so a write already blocked inside Rust returns rather
@@ -234,17 +233,6 @@ func (u *upload) Close() {
 	u.free()
 }
 
-// Dropped reports how many shard events the handler never saw because it could
-// not keep up. It is final once the upload has finished or been closed.
-//
-// The byte count is not lost with them: every delivered event carries the
-// running total in [ShardProgress.Transferred].
-func (u *upload) Dropped() uint64 {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.dropped
-}
-
 // free releases the native handle and everything around it, exactly once. The
 // caller holds mu. Freeing a running upload aborts it.
 func (u *upload) free() {
@@ -253,6 +241,6 @@ func (u *upload) free() {
 	C.sia_upload_free(u.ptr)
 	// Only once the call that can emit events has returned, so the handler
 	// cannot fire after this.
-	_, u.dropped = unregisterProgress(u.progressID)
+	unregisterProgress(u.progressID)
 	u.tokenOwner.close()
 }

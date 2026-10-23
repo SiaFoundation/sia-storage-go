@@ -63,7 +63,6 @@ type Download struct {
 	tok        *C.sia_cancel_t
 	tokenOwner *streamCancel
 	progressID uintptr
-	dropped    uint64
 
 	// mu serialises the native calls and guards done. Close fires the token
 	// before taking it, because the native side forbids freeing a download
@@ -225,15 +224,7 @@ func (d *Download) Close() error {
 	C.sia_download_free(d.ptr)
 	// Only once the call that can emit events has returned, so the handler
 	// cannot fire after this.
-	_, d.dropped = unregisterProgress(d.progressID)
+	unregisterProgress(d.progressID)
 	d.tokenOwner.close()
 	return nil
-}
-
-// Dropped reports how many shard events the handler never saw because it could
-// not keep up. It is final once the download has been closed.
-func (d *Download) Dropped() uint64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.dropped
 }
