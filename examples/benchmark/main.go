@@ -66,11 +66,10 @@ func main() {
 		siastorage.SetLogger(zap.New(zapcore.NewCore(
 			zapcore.NewConsoleEncoder(cfg), zapcore.Lock(os.Stderr), zap.DebugLevel)))
 	}
-	sdk, cleanup, err := connect(ctx, *indexer, *appKey, *hosts)
+	sdk, err := connect(ctx, *indexer, *appKey, *hosts)
 	if err != nil {
 		die("connect: %v", err)
 	}
-	defer cleanup()
 	defer sdk.Close()
 
 	// One payload for every rep, so the comparison is not measuring different

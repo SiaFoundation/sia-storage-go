@@ -13,19 +13,19 @@ import (
 // engineName tags every sample, so a merged run says which build produced it.
 const engineName = "cabi-mock"
 
-func connect(ctx context.Context, indexer, _ string, hosts int) (*siastorage.SDK, func(), error) {
+func connect(ctx context.Context, indexer, _ string, hosts int) (*siastorage.SDK, error) {
 	if indexer != "" {
-		return nil, nil, errors.New("built with siastorage_mock, so it cannot reach an indexer; rebuild without the tag")
+		return nil, errors.New("built with siastorage_mock, so it cannot reach an indexer; rebuild without the tag")
 	}
 	net := siastorage.NewMockNetwork(hosts)
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	sdk, err := net.SDK(ctx, seed)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	betweenReps = net.ClearSectors
-	return sdk, func() {}, nil
+	return sdk, nil
 }

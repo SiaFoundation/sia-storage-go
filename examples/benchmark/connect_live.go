@@ -21,28 +21,28 @@ var benchApp = siastorage.AppMetadata{
 	ServiceURL:  "https://sia.tech",
 }
 
-func connect(ctx context.Context, indexer, appKey string, _ int) (*siastorage.SDK, func(), error) {
+func connect(ctx context.Context, indexer, appKey string, _ int) (*siastorage.SDK, error) {
 	if indexer == "" {
-		return nil, nil, errors.New("pass -indexer, or rebuild with -tags siastorage_mock")
+		return nil, errors.New("pass -indexer, or rebuild with -tags siastorage_mock")
 	}
 	if appKey == "" {
-		return nil, nil, errors.New("pass -app-key; the benchmark does not run the approval flow")
+		return nil, errors.New("pass -app-key; the benchmark does not run the approval flow")
 	}
 	key, err := parseAppKey(appKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	builder, err := siastorage.NewBuilder(indexer, benchApp)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer builder.Close()
 
 	sdk, err := builder.Connect(ctx, key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return sdk, func() {}, nil
+	return sdk, nil
 }
 
 func mustAppID(s string) types.Hash256 {
