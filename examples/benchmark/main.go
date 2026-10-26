@@ -12,13 +12,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"io"
+	mrand "math/rand/v2"
 	"os"
 	"runtime"
 	"time"
@@ -130,11 +131,6 @@ func main() {
 		}
 		defer sdk.Close()
 
-		// One payload for every rep, so the reps are not measuring different
-		// data. Generated once because generating 120 MiB is not free either.
-		payload := makePayload(*size)
-		want := sha256.Sum256(payload)
-
 		opts := runOpts{
 			bufferedSlabs:  *slabs,
 			bufferedChunks: *chunks,
@@ -152,11 +148,9 @@ func main() {
 		if *warm {
 			// A tenth of the payload, but never less than a full slab, which
 			// is the smallest upload that exercises the whole pipeline.
-			warmSize := max(*size/10, int64(slabBytes))
-			warmPayload := makePayload(warmSize)
 			warmOpts := opts
 			warmOpts.hostSummary = false
-			if _, err := runOnce(ctx, sdk, warmPayload, sha256.Sum256(warmPayload), 0, warmOpts); err != nil {
+			if _, err := runOnce(ctx, sdk, max(*size/10, int64(slabBytes)), 0, warmOpts); err != nil {
 				die("warm up: %v", err)
 			}
 			if betweenReps != nil {
@@ -167,7 +161,7 @@ func main() {
 		enc := json.NewEncoder(os.Stdout)
 		samples := make([]Sample, 0, *runs)
 		for rep := 1; rep <= *runs; rep++ {
-			s, err := runOnce(ctx, sdk, payload, want, rep, opts)
+			s, err := runOnce(ctx, sdk, *size, rep, opts)
 			if err != nil {
 				die("run %d: %v", rep, err)
 			}
@@ -196,8 +190,13 @@ type runOpts struct {
 	bars           *mpb.Progress // nil draws nothing
 }
 
-func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]byte, rep int, opts runOpts) (Sample, error) {
-	s := Sample{Rep: rep, PayloadBytes: int64(len(payload))}
+func runOnce(ctx context.Context, sdk *siastorage.SDK, size int64, rep int, opts runOpts) (Sample, error) {
+	s := Sample{Rep: rep, PayloadBytes: size}
+
+	var seed [32]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return s, fmt.Errorf("seed: %w", err)
+	}
 
 	var upHosts, downHosts *hostStats
 	if opts.hostSummary {
@@ -211,7 +210,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	}
 	var uploadBar *mpb.Bar
 	if opts.bars != nil {
-		uploadBar = newTransferBar(opts.bars, "upload", uint64(len(payload)), start)
+		uploadBar = newTransferBar(opts.bars, "upload", uint64(size), start)
 	}
 	if upHosts != nil || uploadBar != nil {
 		uploadOpts = append(uploadOpts, siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
@@ -221,11 +220,11 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 			if uploadBar != nil {
 				// Transferred counts encoded bytes, so scale it back to a
 				// position in the payload the bar is measuring.
-				uploadBar.SetCurrent(min(int64(p.Transferred)*dataShards/totalShards, int64(len(payload))))
+				uploadBar.SetCurrent(min(int64(p.Transferred)*dataShards/totalShards, size))
 			}
 		}))
 	}
-	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(payload), uploadOpts...)
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), newSeededReader(seed, uint64(size)), uploadOpts...)
 	if err != nil {
 		if uploadBar != nil {
 			uploadBar.Abort(false)
@@ -234,7 +233,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	}
 	s.UploadNS = time.Since(start).Nanoseconds()
 	if uploadBar != nil {
-		uploadBar.SetCurrent(int64(len(payload)))
+		uploadBar.SetCurrent(size)
 	}
 
 	s.EncodedBytes = int64(obj.EncodedSize())
@@ -257,7 +256,7 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	}
 	var downloadBar *mpb.Bar
 	if opts.bars != nil {
-		downloadBar = newTransferBar(opts.bars, "download", uint64(len(payload)), start)
+		downloadBar = newTransferBar(opts.bars, "download", uint64(size), start)
 	}
 	dl, err := sdk.Download(ctx, obj, downloadOpts...)
 	if err != nil {
@@ -268,49 +267,25 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	}
 	defer dl.Close()
 
-	// Read and discard. Accumulating the payload to hash it would put a 256 MB
-	// copy inside the timed region, and at these rates that copy is a large
-	// share of the measurement rather than a rounding error.
-	buf := make([]byte, 1<<20)
-	first := true
-	// The largest gap between successive reads, which is what a stall looks
-	// like to a caller streaming the object.
-	var prev time.Duration
-	var maxGap time.Duration
-	for {
-		n, rerr := dl.Read(buf)
-		elapsed := time.Since(start)
-		if n > 0 {
-			if first {
-				s.TTFBNS = elapsed.Nanoseconds()
-				first = false
-			} else if gap := elapsed - prev; gap > maxGap {
-				maxGap = gap
-			}
-			prev = elapsed
-			if downloadBar != nil {
-				downloadBar.IncrBy(n)
-			}
+	// Verified as it arrives, inside the timer, which is where master and the
+	// Rust benchmark both do it.
+	verifier := newSeededVerifier(seed, uint64(size), downloadBar)
+	if _, err := io.Copy(verifier, dl); err != nil {
+		if downloadBar != nil {
+			downloadBar.Abort(false)
 		}
-		if rerr == io.EOF {
-			break
+		return s, fmt.Errorf("download: %w", err)
+	}
+	if verifier.remaining != 0 {
+		if downloadBar != nil {
+			downloadBar.Abort(false)
 		}
-		if rerr != nil {
-			if downloadBar != nil {
-				downloadBar.Abort(false)
-			}
-			return s, fmt.Errorf("download read: %w", rerr)
-		}
+		return s, fmt.Errorf("download: expected %d more bytes", verifier.remaining)
 	}
 	s.DownloadNS = time.Since(start).Nanoseconds()
-	s.MaxGapNS = maxGap.Nanoseconds()
-
-	// Correctness is checked on a second pass, outside the timer, so the
-	// benchmark never reports bytes it did not confirm.
-	s.Verified, err = verify(ctx, sdk, obj, want)
-	if err != nil {
-		return s, fmt.Errorf("verify: %w", err)
-	}
+	s.TTFBNS = verifier.ttfb.Nanoseconds()
+	s.MaxGapNS = verifier.gapMax.Nanoseconds()
+	s.Verified = true
 
 	s.PeakRSSBytes = peakRSS()
 	var ms runtime.MemStats
@@ -337,27 +312,85 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	return s, nil
 }
 
-// verify re-reads the object and checks it against the payload hash. It runs
-// outside the timed region, so correctness costs nothing in the numbers.
-func verify(ctx context.Context, sdk *siastorage.SDK, obj *siastorage.Object, want [32]byte) (bool, error) {
-	dl, err := sdk.Download(ctx, obj)
-	if err != nil {
-		return false, err
-	}
-	defer dl.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, dl); err != nil {
-		return false, err
-	}
-	return [32]byte(h.Sum(nil)) == want, nil
+// seededVerifier verifies a downloaded stream against the same seed used to
+// produce it, while recording latency metrics and driving a progress bar.
+type seededVerifier struct {
+	src       *mrand.ChaCha8
+	size      uint64
+	remaining uint64
+	buf       []byte
+	start     time.Time
+	ttfb      time.Duration
+	hasTTFB   bool
+	prev      time.Duration
+	hasPrev   bool
+	gapMax    time.Duration
+	bar       *mpb.Bar
 }
 
-func makePayload(n int64) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(i % 251)
+func newSeededVerifier(seed [32]byte, size uint64, bar *mpb.Bar) *seededVerifier {
+	return &seededVerifier{
+		src:       mrand.NewChaCha8(seed),
+		size:      size,
+		remaining: size,
+		start:     time.Now(),
+		bar:       bar,
 	}
-	return b
+}
+
+func (v *seededVerifier) Write(p []byte) (int, error) {
+	now := time.Now()
+	if !v.hasTTFB {
+		v.ttfb = now.Sub(v.start)
+		v.hasTTFB = true
+	}
+	elapsed := now.Sub(v.start)
+	if v.hasPrev {
+		if gap := elapsed - v.prev; gap > v.gapMax {
+			v.gapMax = gap
+		}
+	}
+	v.prev = elapsed
+	v.hasPrev = true
+
+	if uint64(len(p)) > v.remaining {
+		return 0, fmt.Errorf("expected %d more bytes, got %d", v.remaining, len(p))
+	}
+	if cap(v.buf) < len(p) {
+		v.buf = make([]byte, len(p))
+	}
+	expected := v.buf[:len(p)]
+	_, _ = v.src.Read(expected)
+	if !bytes.Equal(expected, p) {
+		return 0, fmt.Errorf("data mismatch at byte %d", v.size-v.remaining)
+	}
+	v.remaining -= uint64(len(p))
+	if v.bar != nil {
+		v.bar.IncrBy(len(p))
+	}
+	return len(p), nil
+}
+
+// seededReader produces a deterministic stream of bytes from a seed.
+type seededReader struct {
+	src       *mrand.ChaCha8
+	remaining uint64
+}
+
+func newSeededReader(seed [32]byte, size uint64) *seededReader {
+	return &seededReader{src: mrand.NewChaCha8(seed), remaining: size}
+}
+
+func (r *seededReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if uint64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, _ := r.src.Read(p)
+	r.remaining -= uint64(n)
+	return n, nil
 }
 
 func die(format string, args ...any) {
