@@ -1,14 +1,18 @@
 // Command benchmark measures upload and download throughput through the C ABI.
 //
-//	go run -tags siastorage_mock ./examples/benchmark -reps 3
-//	go run ./examples/benchmark -indexer https://sia.storage -app-key <hex> -reps 5
+// A profile binds an app key to an indexer, so only the first run needs the
+// approval flow. The config file is shared with the Rust benchmark in
+// sia-sdk-rs, so a profile made by either tool works in the other.
+//
+//	go run ./examples/benchmark login
+//	go run ./examples/benchmark run -n 5
+//	go run -tags siastorage_mock ./examples/benchmark run -n 3
 package main
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,7 +23,6 @@ import (
 	"runtime"
 	"time"
 
-	"go.sia.tech/core/types"
 	"go.sia.tech/siastorage"
 )
 
@@ -30,9 +33,8 @@ var betweenReps func()
 
 // A Sample is one upload and download of the same payload.
 type Sample struct {
-	Engine       string `json:"engine"`
-	Rep          int    `json:"rep"`
-	PayloadBytes int64  `json:"payloadBytes"`
+	Rep          int   `json:"rep"`
+	PayloadBytes int64 `json:"payloadBytes"`
 
 	UploadNS   int64 `json:"uploadNs"`
 	TTFBNS     int64 `json:"ttfbNs"`
@@ -45,55 +47,104 @@ type Sample struct {
 	ObjectID     string `json:"objectID"`
 }
 
+const (
+	defaultIndexer = "https://sia.storage"
+	defaultProfile = "default"
+)
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `benchmark measures Sia uploads and downloads
+
+Usage:
+  benchmark login    [-profile NAME] [-indexer URL] [-new]
+  benchmark run      [-profile NAME] [-size BYTES] [-runs N] [-keep]
+                     [-upload-max-buffered-slabs N]
+                     [-download-max-buffered-chunks N] [-hosts N] [-v]
+  benchmark profiles
+
+A profile binds an app key to an indexer so a run needs no approval flow. The
+config is shared with the Rust benchmark, so a profile made by either tool
+works in the other.`)
+}
+
 func main() {
-	var (
-		indexer = flag.String("indexer", "", "indexer URL; empty runs against the mock")
-		appKey  = flag.String("app-key", "", "hex app key to connect with")
-		size    = flag.Int64("size", 256*1000*1000, "payload size in bytes")
-		reps    = flag.Int("reps", 3, "how many upload and download cycles to run")
-		keep    = flag.Bool("keep", false, "leave the uploaded objects on the network")
-		hosts   = flag.Int("hosts", 90, "mock host pool size; ignored against a real indexer")
-		slabs   = flag.Uint64("buffered-slabs", 0, "max buffered slabs; 0 uses the SDK default")
-		chunks  = flag.Uint64("buffered-chunks", 0, "max buffered download chunks; 0 uses the SDK default")
-		verbose = flag.Bool("v", false, "log the engine's own decisions, including the inflight limit")
-	)
-	flag.Parse()
-
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
 	ctx := context.Background()
-	if *verbose {
-		// Debug records from the Rust side, stderr so stdout stays samples.
-		cfg := zap.NewDevelopmentEncoderConfig()
-		siastorage.SetLogger(zap.New(zapcore.NewCore(
-			zapcore.NewConsoleEncoder(cfg), zapcore.Lock(os.Stderr), zap.DebugLevel)))
-	}
-	sdk, err := connect(ctx, *indexer, *appKey, *hosts)
-	if err != nil {
-		die("connect: %v", err)
-	}
-	defer sdk.Close()
 
-	// One payload for every rep, so the comparison is not measuring different
-	// data. Generated once because generating 120 MiB is not free either.
-	payload := makePayload(*size)
-	want := sha256.Sum256(payload)
+	switch os.Args[1] {
+	case "login":
+		fs := flag.NewFlagSet("login", flag.ExitOnError)
+		profileName := fs.String("profile", defaultProfile, "profile to store the app key under")
+		indexer := fs.String("indexer", defaultIndexer, "indexer URL to authorize against")
+		newPhrase := fs.Bool("new", false, "generate a recovery phrase instead of prompting for one")
+		_ = fs.Parse(os.Args[2:])
+		if err := login(ctx, *profileName, *indexer, *newPhrase); err != nil {
+			die("login: %v", err)
+		}
 
-	enc := json.NewEncoder(os.Stdout)
-	for rep := 1; rep <= *reps; rep++ {
-		s, err := runOnce(ctx, sdk, payload, want, rep, *keep, *slabs, *chunks)
+	case "profiles":
+		if err := listProfiles(); err != nil {
+			die("profiles: %v", err)
+		}
+
+	case "run":
+		fs := flag.NewFlagSet("run", flag.ExitOnError)
+		profileName := fs.String("profile", defaultProfile, "profile to run against")
+		// Names and defaults follow the Rust benchmark so the same command
+		// drives either tool. -keep, -hosts and -v have no counterpart there.
+		size := fs.Int64("size", 120*1024*1024, "size of the data to upload and download in bytes")
+		fs.Int64Var(size, "s", 120*1024*1024, "shorthand for -size")
+		runs := fs.Int("runs", 1, "number of times to run the benchmark")
+		fs.IntVar(runs, "n", 1, "shorthand for -runs")
+		slabs := fs.Uint64("upload-max-buffered-slabs", 0, "maximum number of slabs buffered in memory during upload; 0 uses the SDK default")
+		chunks := fs.Uint64("download-max-buffered-chunks", 0, "maximum number of chunks buffered in memory during download; 0 uses the SDK default")
+		keep := fs.Bool("keep", false, "leave the uploaded objects on the network")
+		hosts := fs.Int("hosts", 90, "mock host pool size; ignored against a real indexer")
+		verbose := fs.Bool("v", false, "log the engine's own decisions, including the inflight limit")
+		_ = fs.Parse(os.Args[2:])
+
+		if *verbose {
+			// Debug records from the Rust side, stderr so stdout stays samples.
+			cfg := zap.NewDevelopmentEncoderConfig()
+			siastorage.SetLogger(zap.New(zapcore.NewCore(
+				zapcore.NewConsoleEncoder(cfg), zapcore.Lock(os.Stderr), zap.DebugLevel)))
+		}
+		sdk, err := connect(ctx, *profileName, *hosts)
 		if err != nil {
-			die("rep %d: %v", rep, err)
+			die("connect: %v", err)
 		}
-		if err := enc.Encode(s); err != nil {
-			die("encode: %v", err)
+		defer sdk.Close()
+
+		// One payload for every rep, so the reps are not measuring different
+		// data. Generated once because generating 120 MiB is not free either.
+		payload := makePayload(*size)
+		want := sha256.Sum256(payload)
+
+		enc := json.NewEncoder(os.Stdout)
+		for rep := 1; rep <= *runs; rep++ {
+			s, err := runOnce(ctx, sdk, payload, want, rep, *keep, *slabs, *chunks)
+			if err != nil {
+				die("rep %d: %v", rep, err)
+			}
+			if err := enc.Encode(s); err != nil {
+				die("encode: %v", err)
+			}
+			if betweenReps != nil {
+				betweenReps()
+			}
 		}
-		if betweenReps != nil {
-			betweenReps()
-		}
+
+	default:
+		usage()
+		os.Exit(2)
 	}
 }
 
 func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]byte, rep int, keep bool, bufferedSlabs, bufferedChunks uint64) (Sample, error) {
-	s := Sample{Engine: engineName, Rep: rep, PayloadBytes: int64(len(payload))}
+	s := Sample{Rep: rep, PayloadBytes: int64(len(payload))}
 
 	// ---- upload, measured from the first byte offered to the object returned
 	start := time.Now()
@@ -188,17 +239,6 @@ func makePayload(n int64) []byte {
 		b[i] = byte(i % 251)
 	}
 	return b
-}
-
-func parseAppKey(s string) (types.PrivateKey, error) {
-	raw, err := hex.DecodeString(s)
-	if err != nil {
-		return nil, fmt.Errorf("decode app key: %w", err)
-	}
-	if len(raw) < 32 {
-		return nil, fmt.Errorf("an app key is at least 32 bytes, got %d", len(raw))
-	}
-	return types.PrivateKey(raw), nil
 }
 
 func die(format string, args ...any) {
