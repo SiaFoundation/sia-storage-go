@@ -133,6 +133,13 @@ func (p *PackedUpload) Add(r io.Reader) (int64, error) {
 				(*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(n), p.tok, &cerr)
 			runtime.KeepAlive(p)
 			if code != C.SIA_OK {
+				if code == C.SIA_ERR_CANCELLED {
+					// The token is the pack's own, so the pack is spent, and an
+					// abort would wait on an add parked behind the slab backlog.
+					p.retire()
+					retired = true
+					return 0, goError(p.ctx, code, cerr)
+				}
 				// Abandon the object rather than finishing it. Finishing would
 				// leave a short but structurally valid object in the pack that
 				// the caller cannot tell apart from a complete one.

@@ -154,6 +154,35 @@ func (r *cancelAtEOF) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// TestPackedUploadCancelledAddReturnsPromptly proves a cancelled write returns
+// without waiting on a slab that is still uploading.
+func TestPackedUploadCancelledAddReturnsPromptly(t *testing.T) {
+	net, sdk := transferSDK(t)
+	net.SetSlowHosts(transferHosts, 2*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pu, err := sdk.UploadPacked(ctx, WithUploadMaxBufferedSlabs(1))
+	if err != nil {
+		t.Fatalf("packed start: %v", err)
+	}
+	defer pu.Close()
+
+	// Three slabs: the second parks the add in the slab reserve wait behind
+	// the first, and the third fills the pipe so the write is what gets
+	// cancelled.
+	data := payload(3*int(pu.OptimalDataSize()) + 4096)
+	time.AfterFunc(time.Second, cancel)
+	start := time.Now()
+	_, err = pu.Add(bytes.NewReader(data))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("add returned %v, want context.Canceled", err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("cancelled add took %v to return", d)
+	}
+}
+
 // TestPackedUploadCancelledFinish proves a cancellation during the finish
 // reports the cause and consumes the pack, rather than leaving a handle whose
 // every later call reports an add in progress.
