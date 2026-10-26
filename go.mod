@@ -4,8 +4,9 @@ go 1.27.0
 
 require (
 	go.sia.tech/core v0.21.7
-	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01
+	go.sia.tech/indexd v0.5.0
 	go.uber.org/zap v1.28.0
+	lukechampine.com/frand v1.5.1
 )
 
 require (
@@ -24,5 +25,4 @@ require (
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	lukechampine.com/frand v1.5.1 // indirect
 )

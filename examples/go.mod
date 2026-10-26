@@ -32,7 +32,7 @@ require (
 	github.com/quic-go/webtransport-go v0.12.0 // indirect
 	github.com/vbauerster/cupwriter v0.0.5 // indirect
 	go.sia.tech/coreutils v0.24.0 // indirect
-	go.sia.tech/indexd v0.4.5-0.20260831084636-eb58007edc01 // indirect
+	go.sia.tech/indexd v0.5.0 // indirect
 	go.sia.tech/mux v1.5.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
