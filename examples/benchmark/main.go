@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/vbauerster/mpb/v8"
 	"go.sia.tech/siastorage"
 )
 
@@ -40,6 +41,7 @@ type Sample struct {
 	TTFBNS     int64 `json:"ttfbNs"`
 	DownloadNS int64 `json:"downloadNs"`
 
+	MaxGapNS     int64  `json:"maxGapNs"`
 	EncodedBytes int64  `json:"encodedBytes"`
 	PeakRSSBytes int64  `json:"peakRssBytes"`
 	GoHeapBytes  int64  `json:"goHeapBytes"`
@@ -50,6 +52,13 @@ type Sample struct {
 const (
 	defaultIndexer = "https://sia.storage"
 	defaultProfile = "default"
+
+	// The SDK's default redundancy, used only to map encoded bytes back to an
+	// approximate position in the payload for the upload bar, and to size the
+	// warm up at a full slab.
+	dataShards  = 10
+	totalShards = 30
+	slabBytes   = dataShards * (4 << 20)
 )
 
 func usage() {
@@ -57,8 +66,8 @@ func usage() {
 
 Usage:
   benchmark login    [-profile NAME] [-indexer URL] [-new]
-  benchmark run      [-profile NAME] [-size BYTES] [-runs N] [-keep]
-                     [-upload-max-buffered-slabs N]
+  benchmark run      [-profile NAME] [-size BYTES] [-runs N] [-warm] [-keep]
+                     [-upload-max-buffered-slabs N] [-host-summary]
                      [-download-max-buffered-chunks N] [-hosts N] [-v]
   benchmark profiles
 
@@ -103,6 +112,9 @@ func main() {
 		chunks := fs.Uint64("download-max-buffered-chunks", 0, "maximum number of chunks buffered in memory during download; 0 uses the SDK default")
 		keep := fs.Bool("keep", false, "leave the uploaded objects on the network")
 		hosts := fs.Int("hosts", 90, "mock host pool size; ignored against a real indexer")
+		hostSummary := fs.Bool("host-summary", false, "print a per-host breakdown of shards and throughput after each run")
+		warm := fs.Bool("warm", false, "transfer a smaller object first to seed the pipeline's metrics")
+		fs.BoolVar(warm, "w", false, "shorthand for -warm")
 		verbose := fs.Bool("v", false, "log the engine's own decisions, including the inflight limit")
 		_ = fs.Parse(os.Args[2:])
 
@@ -123,19 +135,51 @@ func main() {
 		payload := makePayload(*size)
 		want := sha256.Sum256(payload)
 
-		enc := json.NewEncoder(os.Stdout)
-		for rep := 1; rep <= *runs; rep++ {
-			s, err := runOnce(ctx, sdk, payload, want, rep, *keep, *slabs, *chunks)
-			if err != nil {
-				die("rep %d: %v", rep, err)
-			}
-			if err := enc.Encode(s); err != nil {
-				die("encode: %v", err)
+		opts := runOpts{
+			bufferedSlabs:  *slabs,
+			bufferedChunks: *chunks,
+			keep:           *keep,
+			hostSummary:    *hostSummary,
+		}
+		// Bars go to stderr so stdout stays a stream of samples. Suppressed
+		// under -v, where the engine's own records would scribble over them.
+		if !*verbose {
+			bars := mpb.New(mpb.WithOutput(os.Stderr))
+			opts.bars = bars
+			defer bars.Wait()
+		}
+
+		if *warm {
+			// A tenth of the payload, but never less than a full slab, which
+			// is the smallest upload that exercises the whole pipeline.
+			warmSize := max(*size/10, int64(slabBytes))
+			warmPayload := makePayload(warmSize)
+			warmOpts := opts
+			warmOpts.hostSummary = false
+			if _, err := runOnce(ctx, sdk, warmPayload, sha256.Sum256(warmPayload), 0, warmOpts); err != nil {
+				die("warm up: %v", err)
 			}
 			if betweenReps != nil {
 				betweenReps()
 			}
 		}
+
+		enc := json.NewEncoder(os.Stdout)
+		samples := make([]Sample, 0, *runs)
+		for rep := 1; rep <= *runs; rep++ {
+			s, err := runOnce(ctx, sdk, payload, want, rep, opts)
+			if err != nil {
+				die("run %d: %v", rep, err)
+			}
+			if err := enc.Encode(s); err != nil {
+				die("encode: %v", err)
+			}
+			samples = append(samples, s)
+			if betweenReps != nil {
+				betweenReps()
+			}
+		}
+		printRunSummary(samples)
 
 	default:
 		usage()
@@ -143,17 +187,55 @@ func main() {
 	}
 }
 
-func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]byte, rep int, keep bool, bufferedSlabs, bufferedChunks uint64) (Sample, error) {
+// runOpts carries what a run needs beyond the payload itself.
+type runOpts struct {
+	bufferedSlabs  uint64
+	bufferedChunks uint64
+	keep           bool
+	hostSummary    bool
+	bars           *mpb.Progress // nil draws nothing
+}
+
+func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]byte, rep int, opts runOpts) (Sample, error) {
 	s := Sample{Rep: rep, PayloadBytes: int64(len(payload))}
+
+	var upHosts, downHosts *hostStats
+	if opts.hostSummary {
+		upHosts, downHosts = newHostStats(), newHostStats()
+	}
 
 	// ---- upload, measured from the first byte offered to the object returned
 	start := time.Now()
-	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(payload),
-		siastorage.WithUploadMaxBufferedSlabs(int(bufferedSlabs)))
+	uploadOpts := []siastorage.UploadOption{
+		siastorage.WithUploadMaxBufferedSlabs(int(opts.bufferedSlabs)),
+	}
+	var uploadBar *mpb.Bar
+	if opts.bars != nil {
+		uploadBar = newTransferBar(opts.bars, "upload", uint64(len(payload)), start)
+	}
+	if upHosts != nil || uploadBar != nil {
+		uploadOpts = append(uploadOpts, siastorage.WithUploadProgress(func(p siastorage.ShardProgress) {
+			if upHosts != nil {
+				upHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
+			}
+			if uploadBar != nil {
+				// Transferred counts encoded bytes, so scale it back to a
+				// position in the payload the bar is measuring.
+				uploadBar.SetCurrent(min(int64(p.Transferred)*dataShards/totalShards, int64(len(payload))))
+			}
+		}))
+	}
+	obj, err := sdk.Upload(ctx, siastorage.NewEmptyObject(), bytes.NewReader(payload), uploadOpts...)
 	if err != nil {
+		if uploadBar != nil {
+			uploadBar.Abort(false)
+		}
 		return s, fmt.Errorf("upload: %w", err)
 	}
 	s.UploadNS = time.Since(start).Nanoseconds()
+	if uploadBar != nil {
+		uploadBar.SetCurrent(int64(len(payload)))
+	}
 
 	s.EncodedBytes = int64(obj.EncodedSize())
 	s.ObjectID = obj.ID().String()
@@ -165,8 +247,23 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	// ---- download, with time to first byte split out, since a decentralised
 	// read pays a recovery cost before any data moves
 	start = time.Now()
-	dl, err := sdk.Download(ctx, obj, siastorage.WithDownloadMaxBufferedChunks(int(bufferedChunks)))
+	downloadOpts := []siastorage.DownloadOption{
+		siastorage.WithDownloadMaxBufferedChunks(int(opts.bufferedChunks)),
+	}
+	if downHosts != nil {
+		downloadOpts = append(downloadOpts, siastorage.WithDownloadProgress(func(p siastorage.ShardProgress) {
+			downHosts.record(p.HostKey.String(), p.ShardSize, p.Elapsed)
+		}))
+	}
+	var downloadBar *mpb.Bar
+	if opts.bars != nil {
+		downloadBar = newTransferBar(opts.bars, "download", uint64(len(payload)), start)
+	}
+	dl, err := sdk.Download(ctx, obj, downloadOpts...)
 	if err != nil {
+		if downloadBar != nil {
+			downloadBar.Abort(false)
+		}
 		return s, fmt.Errorf("download start: %w", err)
 	}
 	defer dl.Close()
@@ -176,20 +273,37 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	// share of the measurement rather than a rounding error.
 	buf := make([]byte, 1<<20)
 	first := true
+	// The largest gap between successive reads, which is what a stall looks
+	// like to a caller streaming the object.
+	var prev time.Duration
+	var maxGap time.Duration
 	for {
 		n, rerr := dl.Read(buf)
-		if n > 0 && first {
-			s.TTFBNS = time.Since(start).Nanoseconds()
-			first = false
+		elapsed := time.Since(start)
+		if n > 0 {
+			if first {
+				s.TTFBNS = elapsed.Nanoseconds()
+				first = false
+			} else if gap := elapsed - prev; gap > maxGap {
+				maxGap = gap
+			}
+			prev = elapsed
+			if downloadBar != nil {
+				downloadBar.IncrBy(n)
+			}
 		}
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
+			if downloadBar != nil {
+				downloadBar.Abort(false)
+			}
 			return s, fmt.Errorf("download read: %w", rerr)
 		}
 	}
 	s.DownloadNS = time.Since(start).Nanoseconds()
+	s.MaxGapNS = maxGap.Nanoseconds()
 
 	// Correctness is checked on a second pass, outside the timer, so the
 	// benchmark never reports bytes it did not confirm.
@@ -203,7 +317,12 @@ func runOnce(ctx context.Context, sdk *siastorage.SDK, payload []byte, want [32]
 	runtime.ReadMemStats(&ms)
 	s.GoHeapBytes = int64(ms.HeapAlloc)
 
-	if !keep {
+	if upHosts != nil {
+		upHosts.printSummary("Upload")
+		downHosts.printSummary("Download")
+	}
+
+	if !opts.keep {
 		if err := sdk.DeleteObject(ctx, obj.ID()); err != nil {
 			return s, fmt.Errorf("delete: %w", err)
 		}
