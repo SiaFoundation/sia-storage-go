@@ -379,12 +379,13 @@ func (s *SDK) Close() error {
 	return nil
 }
 
-// AppKey returns the key this connection is authorized under.
+// AppKey returns the key this connection is authorized under, or a zeroed key
+// once the SDK is closed
 func (s *SDK) AppKey() types.PrivateKey {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
-		return nil
+		return make(types.PrivateKey, 64)
 	}
 	var seed [32]byte
 	C.sia_sdk_app_key(s.ptr, cBytes32(&seed))

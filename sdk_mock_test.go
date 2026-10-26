@@ -76,6 +76,28 @@ func TestSDKAppKey(t *testing.T) {
 	}
 }
 
+// TestSDKAppKeyAfterClose proves the key a closed SDK returns is long enough
+// to take a public key from, so a caller reading one during shutdown gets a
+// zeroed key rather than a panic.
+func TestSDKAppKeyAfterClose(t *testing.T) {
+	net := NewMockNetwork(1)
+	var seed [32]byte
+	seed[0] = 7
+	sdk, err := net.SDK(context.Background(), seed)
+	if err != nil {
+		t.Fatalf("mock sdk: %v", err)
+	}
+	sdk.Close()
+
+	key := sdk.AppKey()
+	if len(key) != 64 {
+		t.Fatalf("a closed SDK returned a %d byte key, want 64", len(key))
+	}
+	if key.PublicKey() != (types.PublicKey{}) {
+		t.Fatal("a closed SDK returned a key that is not zeroed")
+	}
+}
+
 // TestSDKAccount proves the account JSON the native side emits decodes into
 // this package's Account, which is the crossing most likely to break silently
 // if either side renames a field.
