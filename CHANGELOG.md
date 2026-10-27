@@ -1,3 +1,9 @@
+## 0.3.0 (2026-10-27)
+
+### Breaking Changes
+
+- Replace the storage engine with sia-sdk-rs over cgo
+
 ## 0.2.1 (2026-08-27)
 
 ### Features

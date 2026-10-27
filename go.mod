@@ -1,4 +1,4 @@
-module go.sia.tech/siastorage // v0.2.1
+module go.sia.tech/siastorage // v0.3.0
 
 go 1.27.0
 
