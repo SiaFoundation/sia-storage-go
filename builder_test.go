@@ -3,6 +3,7 @@ package siastorage
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"go.sia.tech/core/types"
@@ -39,18 +40,15 @@ func TestBuilderInspectorsRequireApproval(t *testing.T) {
 	}
 }
 
-// TestConnectPreAuthorizedRejectsShortKey proves the length is checked in Go.
-// The native side takes a bare pointer to 32 bytes, so a short slice would be
-// read past its end rather than rejected.
-func TestConnectPreAuthorizedRejectsShortKey(t *testing.T) {
+// TestConnectPreAuthorizedChecksPhraseFirst proves a bad phrase is refused
+// before the request goes out, since a request that reached the indexer would
+// spend one of the key's uses.
+func TestConnectPreAuthorizedChecksPhraseFirst(t *testing.T) {
 	b := testBuilder(t)
-	mnemonic := NewSeedPhrase()
 
-	if _, err := b.ConnectPreAuthorized(context.Background(), types.PrivateKey(make([]byte, 31)), mnemonic); err == nil {
-		t.Fatal("a 31 byte key was accepted")
-	}
-	if _, err := b.ConnectPreAuthorized(context.Background(), nil, mnemonic); err == nil {
-		t.Fatal("a nil key was accepted")
+	_, err := b.ConnectPreAuthorized(context.Background(), NewPreAuthorizedKey(), "not a recovery phrase")
+	if err == nil || !strings.Contains(err.Error(), "mnemonic") {
+		t.Fatalf("expected the phrase to be refused before the request, got %v", err)
 	}
 }
 
@@ -69,7 +67,7 @@ func TestBuilderClosedRefusesNewCalls(t *testing.T) {
 	if _, err := b.MatchesExistingAppKey(context.Background(), mnemonic); !errors.Is(err, errClosed) {
 		t.Fatalf("matchesExistingAppKey after close: %v", err)
 	}
-	if _, err := b.ConnectPreAuthorized(context.Background(), types.PrivateKey(make([]byte, 32)), mnemonic); !errors.Is(err, errClosed) {
+	if _, err := b.ConnectPreAuthorized(context.Background(), NewPreAuthorizedKey(), mnemonic); !errors.Is(err, errClosed) {
 		t.Fatalf("connectPreAuthorized after close: %v", err)
 	}
 }
