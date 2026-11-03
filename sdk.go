@@ -314,15 +314,11 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 //
 // Consumes the builder, cancellation included, since the key may already have
 // been spent.
-//
-// Only the first 32 bytes of preAuthorizedKey are sent, which is the seed the
-// rest of the key is derived from.
-func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey types.PrivateKey, mnemonic string) (*SDK, error) {
-	if len(preAuthorizedKey) < 32 {
-		return nil, errors.New("pre-authorized key must be at least 32 bytes")
-	}
+func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey *PreAuthorizedKey, mnemonic string) (*SDK, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	preAuthorizedKey.mu.RLock()
+	defer preAuthorizedKey.mu.RUnlock()
 	if b.closed {
 		return nil, errClosed
 	}
@@ -335,9 +331,9 @@ func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey typ
 
 	var ptr *C.sia_sdk_t
 	var cerr *C.char
-	code := C.sia_builder_connect_pre_authorized(b.ptr,
-		(*C.uint8_t)(unsafe.Pointer(&preAuthorizedKey[0])), cMnemonic, tok, &ptr, &cerr)
+	code := C.sia_builder_connect_pre_authorized(b.ptr, preAuthorizedKey.ptr, cMnemonic, tok, &ptr, &cerr)
 	runtime.KeepAlive(b)
+	runtime.KeepAlive(preAuthorizedKey)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
 	}
