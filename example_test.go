@@ -452,6 +452,44 @@ func ExampleSDK_ObjectEvents() {
 	fmt.Println("save this cursor for the next poll:", cursor.After, cursor.AfterID)
 }
 
+// A listing that shows names and sizes reads the same feed without the slabs,
+// which are most of each object's size. Fetch the full object by ID only when
+// the user opens one.
+func ExampleSDK_ObjectEventSummaries() {
+	ctx := context.Background()
+	var sdk *siastorage.SDK
+	var cursor siastorage.EventCursor
+
+	for {
+		events, err := sdk.ObjectEventSummaries(ctx, cursor, 500)
+		if err != nil {
+			log.Fatal("failed to read the event feed:", err)
+		}
+		if len(events) == 0 {
+			break // caught up
+		}
+
+		for _, event := range events {
+			if event.Deleted {
+				fmt.Printf("%v was deleted\n", event.ID)
+				continue
+			}
+			fmt.Printf("%v: %d bytes, metadata %s\n",
+				event.ID, event.Object.Size, event.Object.Metadata)
+		}
+		cursor = events[len(events)-1].Cursor()
+	}
+
+	// Downloading needs the slabs, so fetch the whole object when the user
+	// opens one.
+	var opened types.Hash256
+	obj, err := sdk.Object(ctx, opened)
+	if err != nil {
+		log.Fatal("failed to fetch the object:", err)
+	}
+	fmt.Println("ready to download", obj.Size(), "bytes")
+}
+
 // Metadata is held on the object, and whichever call next sends it to the
 // indexer persists it. For an object that has not been pinned yet, that call
 // is SDK.PinObject, so no separate metadata call is needed.
