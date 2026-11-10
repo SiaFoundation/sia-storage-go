@@ -9,7 +9,6 @@ import "C"
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -76,14 +75,44 @@ func (q HostQuery) cQuery() (C.sia_host_query_t, func()) {
 	return cq, func() { C.free(unsafe.Pointer(country)) }
 }
 
-// decodeHosts parses the JSON array the C ABI hands back. goString owns the
-// free, so this must not release cJSON itself.
-func decodeHosts(cJSON *C.char) ([]Host, error) {
-	var hosts []Host
-	if err := json.Unmarshal([]byte(goString(cJSON)), &hosts); err != nil {
-		return nil, fmt.Errorf("decoding hosts: %w", err)
+// goHosts copies a host array out of C memory and frees it. The slices are
+// never nil, so an empty listing reads the same as it did over JSON.
+func goHosts(cHosts *C.sia_host_t, n C.uintptr_t) []Host {
+	defer C.sia_host_array_free(cHosts, n)
+	hosts := make([]Host, 0, int(n))
+	for _, c := range unsafe.Slice(cHosts, int(n)) {
+		h := Host{
+			Addresses:     make([]NetAddress, 0, int(c.addresses_len)),
+			CountryCode:   C.GoString(c.country_code),
+			Latitude:      float64(c.latitude),
+			Longitude:     float64(c.longitude),
+			GoodForUpload: bool(c.good_for_upload),
+		}
+		for i, b := range c.public_key {
+			h.PublicKey[i] = byte(b)
+		}
+		for _, a := range unsafe.Slice(c.addresses, int(c.addresses_len)) {
+			h.Addresses = append(h.Addresses, NetAddress{
+				Protocol: protocolName(a.protocol),
+				Address:  C.GoString(a.address),
+			})
+		}
+		hosts = append(hosts, h)
 	}
-	return hosts, nil
+	return hosts
+}
+
+// protocolName maps the C ABI's protocol constants to the names the indexer
+// uses for them.
+func protocolName(p C.uint8_t) string {
+	switch p {
+	case C.SIA_PROTOCOL_SIAMUX:
+		return "siamux"
+	case C.SIA_PROTOCOL_QUIC:
+		return "quic"
+	default:
+		return fmt.Sprintf("unknown protocol %d", p)
+	}
 }
 
 // Hosts lists the usable hosts the indexer knows about.
@@ -102,13 +131,15 @@ func (s *SDK) Hosts(ctx context.Context, query HostQuery) ([]Host, error) {
 	cq, freeQuery := query.cQuery()
 	defer freeQuery()
 
-	var cJSON, cerr *C.char
-	code := C.sia_sdk_hosts(s.ptr, &cq, tok, &cJSON, &cerr)
+	var cHosts *C.sia_host_t
+	var n C.uintptr_t
+	var cerr *C.char
+	code := C.sia_sdk_hosts(s.ptr, &cq, tok, &cHosts, &n, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
 	}
-	return decodeHosts(cJSON)
+	return goHosts(cHosts, n), nil
 }
 
 // Hosts lists the hosts serving this sharing key's objects, scoped to the key
@@ -126,11 +157,13 @@ func (s *SharedSDK) Hosts(ctx context.Context, query HostQuery) ([]Host, error) 
 	cq, freeQuery := query.cQuery()
 	defer freeQuery()
 
-	var cJSON, cerr *C.char
-	code := C.sia_shared_sdk_hosts(s.ptr, &cq, tok, &cJSON, &cerr)
+	var cHosts *C.sia_host_t
+	var n C.uintptr_t
+	var cerr *C.char
+	code := C.sia_shared_sdk_hosts(s.ptr, &cq, tok, &cHosts, &n, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
 	}
-	return decodeHosts(cJSON)
+	return goHosts(cHosts, n), nil
 }

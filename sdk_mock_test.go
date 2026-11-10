@@ -4,7 +4,10 @@ package siastorage
 
 import (
 	"context"
+	"math"
+	"slices"
 	"testing"
+	"time"
 
 	"go.sia.tech/core/types"
 )
@@ -98,9 +101,9 @@ func TestSDKAppKeyAfterClose(t *testing.T) {
 	}
 }
 
-// TestSDKAccount proves the account JSON the native side emits decodes into
-// this package's Account, which is the crossing most likely to break silently
-// if either side renames a field.
+// TestSDKAccount proves every account field crosses from the struct the C ABI
+// returns, including the unlimited limit the mock reports and the optional
+// URLs it leaves unset.
 func TestSDKAccount(t *testing.T) {
 	_, sdk := testSDK(t)
 
@@ -108,14 +111,74 @@ func TestSDKAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("account: %v", err)
 	}
-	if account.AccountKey == (types.PublicKey{}) {
-		t.Fatal("accountKey decoded as zero, so the field name is wrong")
+	if want := sdk.AppKey().PublicKey(); account.AccountKey != want {
+		t.Fatalf("account key %v, want the app key's %v", account.AccountKey, want)
 	}
-	if account.MaxPinnedData == 0 {
-		t.Fatal("maxPinnedData decoded as zero, so the field name is wrong")
+	if account.MaxPinnedData != math.MaxUint64 || account.RemainingStorage != math.MaxUint64 {
+		t.Fatalf("limits %d and %d, want the mock's unlimited %d",
+			account.MaxPinnedData, account.RemainingStorage, uint64(math.MaxUint64))
 	}
-	if account.LastUsed.IsZero() {
-		t.Fatal("lastUsed decoded as zero, so the field name is wrong")
+	if account.PinnedData != 0 || account.PinnedSize != 0 {
+		t.Fatalf("a fresh account reports %d pinned, %d encoded", account.PinnedData, account.PinnedSize)
+	}
+	if !account.Ready {
+		t.Fatal("the mock account must be ready")
+	}
+	if account.App.Name != "mock" || account.App.Description != "mock indexer" {
+		t.Fatalf("app %q, %q", account.App.Name, account.App.Description)
+	}
+	if account.App.LogoURL != nil || account.App.ServiceURL != nil {
+		t.Fatal("unset URLs must stay nil rather than become empty strings")
+	}
+	if age := time.Since(account.LastUsed); age < 0 || age > time.Minute {
+		t.Fatalf("lastUsed %v is not recent", account.LastUsed)
+	}
+}
+
+// TestSDKHosts proves a host listing crosses with every field and address
+// intact, and that paging reaches the native side.
+func TestSDKHosts(t *testing.T) {
+	_, sdk := testSDK(t)
+	ctx := context.Background()
+
+	hosts, err := sdk.Hosts(ctx, HostQuery{})
+	if err != nil {
+		t.Fatalf("hosts: %v", err)
+	}
+	if len(hosts) != 10 {
+		t.Fatalf("listed %d hosts, want the mock's 10", len(hosts))
+	}
+	// The mock announces every host on QUIC, which covers the protocol
+	// constant that is not zero.
+	want := []NetAddress{{Protocol: "quic", Address: "localhost:9984"}}
+	seen := make(map[types.PublicKey]bool)
+	for _, h := range hosts {
+		if h.PublicKey == (types.PublicKey{}) || seen[h.PublicKey] {
+			t.Fatalf("host key %v is zero or repeated", h.PublicKey)
+		}
+		seen[h.PublicKey] = true
+		if !slices.Equal(h.Addresses, want) {
+			t.Fatalf("addresses %v, want %v", h.Addresses, want)
+		}
+		if h.CountryCode != "US" || !h.GoodForUpload {
+			t.Fatalf("host %+v", h)
+		}
+	}
+
+	page, err := sdk.Hosts(ctx, HostQuery{Offset: 8, Limit: 5})
+	if err != nil {
+		t.Fatalf("paged hosts: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("offset 8 of 10 listed %d hosts, want 2", len(page))
+	}
+
+	empty, err := sdk.Hosts(ctx, HostQuery{Offset: 10})
+	if err != nil {
+		t.Fatalf("empty hosts: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("a listing past the end must be empty but not nil, got %#v", empty)
 	}
 }
 

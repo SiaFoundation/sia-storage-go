@@ -24,6 +24,23 @@ func testBuilder(t *testing.T) *Builder {
 	return b
 }
 
+// TestNewBuilderWithEveryField proves metadata with the optional URLs set
+// crosses too. testBuilder leaves them empty, which sends them as null.
+func TestNewBuilderWithEveryField(t *testing.T) {
+	b, err := NewBuilder("https://indexer.invalid", AppMetadata{
+		AppID:       types.HashBytes([]byte("every field")),
+		Name:        "every field",
+		Description: "a builder with every metadata field set",
+		ServiceURL:  "https://service.invalid",
+		LogoURL:     "https://logo.invalid",
+		CallbackURL: "https://callback.invalid",
+	})
+	if err != nil {
+		t.Fatalf("new builder: %v", err)
+	}
+	b.Close()
+}
+
 // TestBuilderInspectorsRequireApproval proves both inspectors refuse a builder
 // that has not been approved rather than answering false, which a caller would
 // read as "this phrase is not the registered one" and register over the top of
