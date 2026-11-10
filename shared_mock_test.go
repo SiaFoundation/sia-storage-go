@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"go.sia.tech/core/types"
 )
 
 // TestSharedObjectSummariesMatchObjects proves a summary describes the same
@@ -112,5 +114,33 @@ func TestSharedObjectSummariesAfterClose(t *testing.T) {
 	}
 	if _, err := shared.ObjectSummaries(ctx, 0, 0); err == nil {
 		t.Fatal("summaries after close returned no error")
+	}
+}
+
+// TestSharedSDKHosts proves the recipient's host listing crosses the same way
+// the owner's does.
+func TestSharedSDKHosts(t *testing.T) {
+	net, sdk := testSDK(t)
+	ctx := context.Background()
+
+	key, err := sdk.CreateSharingKey(ctx, "hosts", time.Time{})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	shared, err := net.SharedSDK(ctx, key.Export())
+	if err != nil {
+		t.Fatalf("shared sdk: %v", err)
+	}
+	defer shared.Close()
+
+	hosts, err := shared.Hosts(ctx, HostQuery{})
+	if err != nil {
+		t.Fatalf("hosts: %v", err)
+	}
+	if len(hosts) == 0 {
+		t.Fatal("a key with tokens must see the hosts serving it")
+	}
+	if hosts[0].PublicKey == (types.PublicKey{}) || len(hosts[0].Addresses) == 0 {
+		t.Fatalf("host %+v is missing its key or addresses", hosts[0])
 	}
 }

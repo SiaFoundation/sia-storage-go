@@ -10,9 +10,7 @@ import "C"
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -34,17 +32,6 @@ type AppMetadata struct {
 	// LogoURL and CallbackURL are optional and sent as null when empty.
 	LogoURL     string
 	CallbackURL string
-}
-
-// appMetadataJSON is the wire form sia_builder_new parses. The field names are
-// the contract with the Rust side and do not all follow one convention.
-type appMetadataJSON struct {
-	AppID       types.Hash256 `json:"appID"`
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	ServiceURL  string        `json:"serviceURL"`
-	LogoURL     *string       `json:"logoURL"`
-	CallbackURL *string       `json:"callbackURL"`
 }
 
 // GenerateAppID returns a random application identifier.
@@ -103,31 +90,42 @@ type Builder struct {
 
 // NewBuilder prepares a connection to the indexer at indexerURL.
 func NewBuilder(indexerURL string, metadata AppMetadata) (*Builder, error) {
-	meta := appMetadataJSON{
-		AppID:       metadata.AppID,
-		Name:        metadata.Name,
-		Description: metadata.Description,
-		ServiceURL:  metadata.ServiceURL,
+	// Every string is copied to C memory, because cgo refuses a struct holding
+	// a pointer into Go memory.
+	var owned []*C.char
+	defer func() {
+		for _, p := range owned {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	cString := func(s string) *C.char {
+		p := C.CString(s)
+		owned = append(owned, p)
+		return p
 	}
-	if metadata.LogoURL != "" {
-		meta.LogoURL = &metadata.LogoURL
-	}
-	if metadata.CallbackURL != "" {
-		meta.CallbackURL = &metadata.CallbackURL
-	}
-	metaJSON, err := json.Marshal(meta)
-	if err != nil {
-		return nil, fmt.Errorf("encode app metadata: %w", err)
+	// The optional URLs are null when empty, which the indexer reads as unset.
+	optional := func(s string) *C.char {
+		if s == "" {
+			return nil
+		}
+		return cString(s)
 	}
 
-	cURL := C.CString(indexerURL)
-	defer C.free(unsafe.Pointer(cURL))
-	cMeta := C.CString(string(metaJSON))
-	defer C.free(unsafe.Pointer(cMeta))
+	meta := C.sia_app_metadata_t{
+		name:         cString(metadata.Name),
+		description:  cString(metadata.Description),
+		service_url:  cString(metadata.ServiceURL),
+		logo_url:     optional(metadata.LogoURL),
+		callback_url: optional(metadata.CallbackURL),
+	}
+	for i, b := range metadata.AppID {
+		meta.id[i] = C.uint8_t(b)
+	}
+	cURL := cString(indexerURL)
 
 	var ptr *C.sia_builder_t
 	var cerr *C.char
-	if code := C.sia_builder_new(cURL, cMeta, &ptr, &cerr); code != C.SIA_OK {
+	if code := C.sia_builder_new(cURL, &meta, &ptr, &cerr); code != C.SIA_OK {
 		return nil, localError(code, cerr)
 	}
 	return wrapBuilder(ptr), nil
@@ -399,15 +397,44 @@ func (s *SDK) Account(ctx context.Context) (Account, error) {
 	tok, release := cancelToken(ctx)
 	defer release()
 
-	var cJSON, cerr *C.char
-	code := C.sia_sdk_account(s.ptr, tok, &cJSON, &cerr)
+	var c *C.sia_account_t
+	var cerr *C.char
+	code := C.sia_sdk_account(s.ptr, tok, &c, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return Account{}, goError(ctx, code, cerr)
 	}
-	var a Account
-	if err := json.Unmarshal([]byte(goString(cJSON)), &a); err != nil {
-		return Account{}, fmt.Errorf("decode account: %w", err)
+	defer C.sia_account_free(c)
+
+	a := Account{
+		MaxPinnedData:    uint64(c.max_pinned_data),
+		RemainingStorage: uint64(c.remaining_storage),
+		PinnedData:       uint64(c.pinned_data),
+		PinnedSize:       uint64(c.pinned_size),
+		Ready:            bool(c.ready),
+		App: App{
+			Name:        C.GoString(c.app.name),
+			Description: C.GoString(c.app.description),
+			LogoURL:     optionalGoString(c.app.logo_url),
+			ServiceURL:  optionalGoString(c.app.service_url),
+		},
+		LastUsed: unixMicro(int64(c.last_used_unix_us)),
+	}
+	for i, b := range c.account_key {
+		a.AccountKey[i] = byte(b)
+	}
+	for i, b := range c.app.id {
+		a.App.ID[i] = byte(b)
 	}
 	return a, nil
+}
+
+// optionalGoString copies a string the C ABI may leave null, reading null as
+// absent rather than empty.
+func optionalGoString(s *C.char) *string {
+	if s == nil {
+		return nil
+	}
+	v := C.GoString(s)
+	return &v
 }
