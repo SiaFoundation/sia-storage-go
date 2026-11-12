@@ -9,9 +9,15 @@
 name: Build FFI Libraries
 on:
   workflow_dispatch:
+    inputs:
+      sia_sdk_rs_ref:
+        description: >-
+          sia-sdk-rs branch, tag or commit to build
+        type: string
+        default: master
 
 env:
-  SIA_SDK_RS_REF: master
+  SIA_SDK_RS_REF: ${{ inputs.sia_sdk_rs_ref || 'master' }}
 
 jobs:
   # Pins one sia-sdk-rs revision for the whole run. Without this each matrix

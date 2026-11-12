@@ -18,7 +18,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26"
+          go-version: "1.27"
+          check-latest: true
       # No Rust and no archive: cgo type checks without linking, so lint runs
       # against a bare checkout.
       - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
@@ -34,7 +35,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26"
+          go-version: "1.27"
+          check-latest: true
       # The archives were built from one revision, and the vendored header has
       # to be that revision's. Checking against a branch would compare it to
       # whatever sia-sdk-rs has moved on to, which is not what these archives
@@ -48,6 +50,9 @@ jobs:
           ref: ${{ steps.provenance.outputs.sha }}
           path: sia-sdk-rs
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          # make testlib strips LLVM bitcode from the mock archive.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
           workspaces: sia-sdk-rs
@@ -132,7 +137,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26"
+          go-version: "1.27"
+          check-latest: true
       # Needs no Rust and no archive: cgo type checks without linking. Without
       # this pass the mock tests and the mock-only example shims are linted
       # nowhere.
@@ -190,7 +196,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26"
+          go-version: "1.27"
+          check-latest: true
       # Proves the committed archive for this platform actually links. Four of
       # the five were never exercised, so a truncated or wrong-arch .a could
       # ship and only fail for whoever imported the module.
