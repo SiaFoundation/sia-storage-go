@@ -1,3 +1,13 @@
+## 0.3.0 (2026-11-12)
+
+### Breaking Changes
+
+- Replace the storage engine with sia-sdk-rs over cgo
+
+### Fixes
+
+- Strip LLVM bitcode from the FFI archives
+
 ## 0.2.1 (2026-08-27)
 
 ### Features
