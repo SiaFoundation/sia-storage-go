@@ -66,15 +66,29 @@ fetch-lib:
 	$(MAKE) check-no-mock
 	go clean -cache
 
+# llvm-objcopy from the rustup llvm-tools component, so it matches the LLVM
+# that produced the archive. Lazy, like CABI_TARGET, so only testlib asks rustc.
+LLVM_OBJCOPY = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy
+
 # The mock archive, and the only one built from local Rust. Removed before each
 # build so a failed compile leaves no archive behind for the next copy to pick
 # up.
+#
+# Go 1.27.4 and 1.26.11 refuse a cgo linker input that carries LLVM bitcode
+# (golang/go#82572), which the prebuilt compiler_builtins objects in every Rust
+# staticlib do. Build FFI Libraries strips the shipped archives member by
+# member because of the windows arm64 import stubs; this one is only ever
+# built for the host, ELF or Mach-O, so the whole archive can be stripped.
 .PHONY: testlib
 testlib: sync-header
+	@test -x "$(LLVM_OBJCOPY)" || { echo "llvm-objcopy not found; run 'rustup component add llvm-tools'"; exit 1; }
 	rm -f $(CABI_ARCHIVE)
 	cargo build --release --features mock --manifest-path $(CABI)/Cargo.toml
 	mkdir -p $(LIB_DIR)
 	cp $(CABI_ARCHIVE) $(LIB_DIR)/libsia_storage_cabi_mock.a
+	"$(LLVM_OBJCOPY)" --remove-section=.llvmbc --remove-section=.llvmcmd \
+		--remove-section=__LLVM,__bitcode --remove-section=__LLVM,__cmdline \
+		$(LIB_DIR)/libsia_storage_cabi_mock.a
 	go clean -cache
 
 # The header is the contract between the two repos. Copying it on every build
