@@ -109,6 +109,63 @@ func ExampleBuilder_Connect() {
 		account.PinnedData, account.MaxPinnedData)
 }
 
+// An indexer operator can authorize an app ahead of time, so it connects
+// without the approval prompt. The signed request goes to the indexer's admin
+// API, which indexd's admin client takes as is, and the seed to the app.
+func ExamplePreAuthorizedKey_SignRequest() {
+	key := siastorage.NewPreAuthorizedKey()
+	req, err := key.SignRequest(siastorage.PreAuthorizedKeyRequest{
+		ConnectKey:   os.Getenv("SIA_CONNECT_KEY"),
+		Expiration:   time.Now().Add(7 * 24 * time.Hour),
+		TotalUses:    1,
+		AllowedAppID: &appID, // nil allows any app
+	})
+	if err != nil {
+		log.Fatal("failed to sign the request:", err)
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		log.Fatal("failed to encode the request:", err)
+	}
+	fmt.Println("POST this to the admin API's /apps/preauthorized/keys:", string(body))
+
+	seed := key.Export()
+	fmt.Printf("hand this seed to the app: %x\n", seed)
+}
+
+// An app given a pre-authorized seed connects and registers in one call. The
+// recovery phrase still decides which account the app key belongs to.
+func ExampleBuilder_ConnectPreAuthorized() {
+	ctx := context.Background()
+
+	raw, err := hex.DecodeString(os.Getenv("SIA_PRE_AUTHORIZED_KEY"))
+	if err != nil || len(raw) != 32 {
+		log.Fatal("SIA_PRE_AUTHORIZED_KEY must be a 32 byte hex seed")
+	}
+	key := siastorage.ImportPreAuthorizedKey([32]byte(raw))
+
+	builder, err := siastorage.NewBuilder("https://sia.storage", siastorage.AppMetadata{
+		AppID: appID,
+		Name:  "MyApp",
+	})
+	if err != nil {
+		log.Fatal("failed to create builder:", err)
+	}
+	defer builder.Close()
+
+	phrase := siastorage.NewSeedPhrase()
+	fmt.Println("Recovery phrase, store this somewhere safe:", phrase)
+
+	sdk, err := builder.ConnectPreAuthorized(ctx, key, phrase)
+	if err != nil {
+		log.Fatal("failed to connect:", err)
+	}
+	defer sdk.Close()
+
+	fmt.Printf("App key, store this for Builder.Connect: %x\n", sdk.AppKey())
+}
+
 // Upload implements io.Writer, so io.Copy drives it. Uploading pins the slabs
 // it writes but not the object record, so the object has to be pinned before
 // anything can look it up.
