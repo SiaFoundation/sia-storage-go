@@ -130,6 +130,35 @@ jobs:
           before=$(wc -c < "$a")
           llvm-strip --strip-debug "$a"
           echo "$a: $before -> $(wc -c < "$a") bytes"
+      # Go refuses cgo inputs carrying LLVM bitcode, golang/go#82572. Rewritten
+      # per member because llvm-objcopy cannot parse the windows arm64 import stubs.
+      - name: Strip LLVM bitcode
+        shell: bash
+        run: |
+          a=$PWD/sia-sdk-rs/target/${{ matrix.target }}/release/libsia_storage_cabi.a
+          llvm-objdump -h "$a" | awk '/\.a\(.*\):/ {m=$0; sub(/.*\(/,"",m); sub(/\):.*/,"",m)} /\.llvmbc|\.llvmcmd|__bitcode|__cmdline/ {c[m]++} END {for (k in c) print k}' > members.txt
+          if ! [ -s members.txt ]; then
+            echo "no member carries bitcode"
+            exit 0
+          fi
+          if [ "$(llvm-ar t "$a" | grep -Fxf members.txt | wc -l)" != "$(wc -l < members.txt)" ]; then
+            echo "FAIL: a member carrying bitcode shares its name with another member"
+            exit 1
+          fi
+          mkdir bitcode
+          cd bitcode
+          xargs llvm-ar x "$a" < ../members.txt
+          for o in *; do
+            llvm-objcopy --remove-section=.llvmbc --remove-section=.llvmcmd --remove-section=__LLVM,__bitcode --remove-section=__LLVM,__cmdline "$o"
+          done
+          xargs llvm-ar d "$a" < ../members.txt
+          llvm-ar rs "$a" ./*
+          echo "rewrote $(wc -l < ../members.txt) members"
+          llvm-objdump -h "$a" > sections.txt
+          if grep -q -E '\.llvmbc|\.llvmcmd|__bitcode|__cmdline' sections.txt; then
+            echo "FAIL: bitcode remains in $a"
+            exit 1
+          fi
       - name: Reject mock symbols
         shell: bash
         run: |
