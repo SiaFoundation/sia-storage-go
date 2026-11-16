@@ -130,7 +130,10 @@ func ExamplePreAuthorizedKey_SignRequest() {
 	}
 	fmt.Println("POST this to the admin API's /apps/preauthorized/keys:", string(body))
 
-	seed := key.Export()
+	seed, err := key.Export()
+	if err != nil {
+		log.Fatal("failed to export the key:", err)
+	}
 	fmt.Printf("hand this seed to the app: %x\n", seed)
 }
 

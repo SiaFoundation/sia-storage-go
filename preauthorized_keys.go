@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -32,6 +33,28 @@ type PreAuthorizedKey struct {
 	// mu orders the reads of ptr against the construction that filled it, as
 	// on every other handle in this package.
 	mu sync.RWMutex
+}
+
+var errNilPreAuthorizedKey = errors.New("pre-authorized key is nil")
+
+// acquire read locks k for an FFI call, refusing a nil key or a zero value one
+// that holds no native key. Release it with release, which is only needed on
+// success.
+func (k *PreAuthorizedKey) acquire() error {
+	if k == nil {
+		return errNilPreAuthorizedKey
+	}
+	k.mu.RLock()
+	if k.ptr == nil {
+		k.mu.RUnlock()
+		return errNilPreAuthorizedKey
+	}
+	return nil
+}
+
+// release ends a successful acquire.
+func (k *PreAuthorizedKey) release() {
+	k.mu.RUnlock()
 }
 
 // A PreAuthorizedKeyRequest is the policy an indexer attaches to a
@@ -68,39 +91,52 @@ func wrapPreAuthorizedKey(ptr *C.sia_pre_authorized_key_t) *PreAuthorizedKey {
 
 // Export returns the seed, which is the whole credential. Store it no longer
 // than it takes to hand to the app that will connect with it.
-func (k *PreAuthorizedKey) Export() (seed [32]byte) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+func (k *PreAuthorizedKey) Export() (seed [32]byte, err error) {
+	if err := k.acquire(); err != nil {
+		return seed, err
+	}
+	defer k.release()
 	C.sia_pre_authorized_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
-	return
+	return seed, nil
 }
 
 // PublicKey returns the half the indexer identifies the key by. Safe to log.
+// A nil key returns the zero public key.
 func (k *PreAuthorizedKey) PublicKey() (pk types.PublicKey) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	if k.acquire() != nil {
+		return
+	}
+	defer k.release()
 	C.sia_pre_authorized_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
 	return
 }
 
 // Sign signs message with the key.
-func (k *PreAuthorizedKey) Sign(message []byte) (sig types.Signature) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	// The status is ignored because it only reports a nil handle or a nil
-	// message with a nonzero length, and neither can be passed from here.
-	C.sia_pre_authorized_key_sign(k.ptr, cMessage(message), C.uintptr_t(len(message)),
-		(*C.uint8_t)(unsafe.Pointer(&sig[0])), nil)
+func (k *PreAuthorizedKey) Sign(message []byte) (types.Signature, error) {
+	if err := k.acquire(); err != nil {
+		return types.Signature{}, err
+	}
+	defer k.release()
+	var sig types.Signature
+	var cerr *C.char
+	code := C.sia_pre_authorized_key_sign(k.ptr, cMessage(message), C.uintptr_t(len(message)),
+		(*C.uint8_t)(unsafe.Pointer(&sig[0])), &cerr)
 	runtime.KeepAlive(k)
-	return
+	if code != C.SIA_OK {
+		return types.Signature{}, localError(code, cerr)
+	}
+	return sig, nil
 }
 
-// VerifySignature reports whether sig is the key's signature of message.
+// VerifySignature reports whether sig is the key's signature of message. A nil
+// key verifies nothing.
 func (k *PreAuthorizedKey) VerifySignature(message []byte, sig types.Signature) bool {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	if k.acquire() != nil {
+		return false
+	}
+	defer k.release()
 	ok := C.sia_pre_authorized_key_verify_signature(k.ptr, cMessage(message),
 		C.uintptr_t(len(message)), (*C.uint8_t)(unsafe.Pointer(&sig[0])))
 	runtime.KeepAlive(k)
@@ -130,8 +166,10 @@ func (k *PreAuthorizedKey) SignRequest(req PreAuthorizedKeyRequest) (accounts.Pr
 		creq.allowed_app_id = (*C.uint8_t)(appID)
 	}
 
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	if err := k.acquire(); err != nil {
+		return accounts.PreAuthorizedKeyRequest{}, err
+	}
+	defer k.release()
 	var cJSON, cerr *C.char
 	code := C.sia_pre_authorized_key_sign_request_json(k.ptr, &creq, &cJSON, &cerr)
 	runtime.KeepAlive(k)

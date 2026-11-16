@@ -317,11 +317,13 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey *PreAuthorizedKey, mnemonic string) (*SDK, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	preAuthorizedKey.mu.RLock()
-	defer preAuthorizedKey.mu.RUnlock()
 	if b.closed {
 		return nil, errClosed
 	}
+	if err := preAuthorizedKey.acquire(); err != nil {
+		return nil, err
+	}
+	defer preAuthorizedKey.release()
 
 	cMnemonic := C.CString(mnemonic)
 	defer C.free(unsafe.Pointer(cMnemonic))

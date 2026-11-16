@@ -52,6 +52,16 @@ func TestConnectPreAuthorizedChecksPhraseFirst(t *testing.T) {
 	}
 }
 
+// TestConnectPreAuthorizedNilKey proves a nil key is refused rather than
+// dereferenced.
+func TestConnectPreAuthorizedNilKey(t *testing.T) {
+	b := testBuilder(t)
+
+	if _, err := b.ConnectPreAuthorized(context.Background(), nil, NewSeedPhrase()); !errors.Is(err, errNilPreAuthorizedKey) {
+		t.Fatalf("connectPreAuthorized with a nil key: %v", err)
+	}
+}
+
 // TestBuilderClosedRefusesNewCalls proves the three new methods take the same
 // closed check as the rest, so none of them hands a freed handle to C.
 func TestBuilderClosedRefusesNewCalls(t *testing.T) {
