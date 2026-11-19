@@ -80,12 +80,18 @@ func TestPreAuthorizedKeyNil(t *testing.T) {
 	}
 }
 
-// TestSharingKeyZeroValue checks that a zero value sharing key panics rather
-// than export a zero seed.
-func TestSharingKeyZeroValue(t *testing.T) {
-	key := new(SharingKey)
-	wantPanic(t, "export", errNilSharingKey, func() { key.Export() })
-	wantPanic(t, "public key", errNilSharingKey, func() { key.PublicKey() })
+// TestSharingKeyNil checks that a nil sharing key and a zero value one panic
+// rather than export a zero seed.
+func TestSharingKeyNil(t *testing.T) {
+	for name, key := range map[string]*SharingKey{
+		"nil":        nil,
+		"zero value": new(SharingKey),
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantPanic(t, "export", errNilSharingKey, func() { key.Export() })
+			wantPanic(t, "public key", errNilSharingKey, func() { key.PublicKey() })
+		})
+	}
 }
 
 func wantPanic(t *testing.T, name string, want error, fn func()) {
