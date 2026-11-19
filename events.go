@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -46,6 +47,15 @@ func (c EventCursor) IsZero() bool {
 	return c.After.IsZero() && c.AfterID == types.Hash256{}
 }
 
+// cArgs splits the cursor into the arguments both event listings take. The ID
+// comes back by value so the caller holds an addressable copy for the call.
+func (c EventCursor) cArgs() (hasCursor C.bool, afterMicro C.int64_t, afterID types.Hash256) {
+	if c.IsZero() {
+		return false, 0, types.Hash256{}
+	}
+	return true, C.int64_t(c.After.UnixMicro()), c.AfterID
+}
+
 // pageArg converts a paging count for the C boundary. A negative value would
 // wrap to an enormous number there, so it means the same as zero: the
 // indexer's default.
@@ -71,17 +81,7 @@ func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([
 	tok, release := cancelToken(ctx)
 	defer release()
 
-	var (
-		hasCursor  C.bool
-		afterMicro C.int64_t
-		afterID    types.Hash256
-	)
-	if !after.IsZero() {
-		hasCursor = true
-		afterMicro = C.int64_t(after.After.UnixMicro())
-		afterID = after.AfterID
-	}
-
+	hasCursor, afterMicro, afterID := after.cArgs()
 	var evs *C.sia_events_t
 	var cerr *C.char
 	code := C.sia_sdk_object_events(s.ptr, hasCursor, afterMicro,
@@ -121,4 +121,78 @@ func (s *SDK) ObjectEvents(ctx context.Context, after EventCursor, limit int) ([
 // Cursor returns the cursor that resumes a listing after e.
 func (e ObjectEvent) Cursor() EventCursor {
 	return EventCursor{After: e.UpdatedAt, AfterID: e.ID}
+}
+
+// An ObjectEventSummary is an [ObjectEvent] carrying an [ObjectSummary] in
+// place of the object, so a listing does not pay for slabs it never reads.
+type ObjectEventSummary struct {
+	ID types.Hash256
+
+	// Deleted reports whether the object was removed rather than written.
+	Deleted bool
+
+	UpdatedAt time.Time
+
+	// Object is nil for a deletion.
+	Object *ObjectSummary
+}
+
+// Cursor returns the cursor that resumes a listing after e.
+func (e ObjectEventSummary) Cursor() EventCursor {
+	return EventCursor{After: e.UpdatedAt, AfterID: e.ID}
+}
+
+// ObjectEventSummaries lists the same events as [SDK.ObjectEvents], paged by
+// the same cursor, without the objects' slabs. Each page is a small fraction
+// of the size, which is what a listing that shows names and sizes wants.
+// [SDK.Object] fetches the whole object by ID to download it.
+func (s *SDK) ObjectEventSummaries(ctx context.Context, after EventCursor, limit int) ([]ObjectEventSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+
+	tok, release := cancelToken(ctx)
+	defer release()
+
+	hasCursor, afterMicro, afterID := after.cArgs()
+	var evs *C.sia_event_summaries_t
+	var cerr *C.char
+	code := C.sia_sdk_object_event_summaries(s.ptr, hasCursor, afterMicro,
+		cBytes32((*[32]byte)(&afterID)), pageArg(limit), tok, &evs, &cerr)
+	runtime.KeepAlive(s)
+	if code != C.SIA_OK {
+		return nil, goError(ctx, code, cerr)
+	}
+	defer C.sia_event_summaries_free(evs)
+
+	n := int(C.sia_event_summaries_len(evs))
+	out := make([]ObjectEventSummary, 0, n)
+	for i := range n {
+		var (
+			id        types.Hash256
+			deleted   C.bool
+			updated   C.int64_t
+			hasObject C.bool
+			sum       C.sia_object_summary_t
+		)
+		if !bool(C.sia_event_summaries_at(evs, C.size_t(i), cBytes32((*[32]byte)(&id)),
+			&deleted, &updated, &hasObject, &sum)) {
+			return nil, fmt.Errorf("event %d of %d is out of range", i, n)
+		}
+		e := ObjectEventSummary{
+			ID:        id,
+			Deleted:   bool(deleted),
+			UpdatedAt: unixMicro(int64(updated)),
+		}
+		if bool(hasObject) {
+			obj := goObjectSummary(sum, readMetadata(func(buf *C.uint8_t, n C.size_t) C.size_t {
+				return C.sia_event_summaries_metadata(evs, C.size_t(i), buf, n)
+			}))
+			e.Object = &obj
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
