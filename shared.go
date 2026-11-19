@@ -29,6 +29,10 @@ import (
 // Reads are paid for with account tokens drawn from the key owner's account,
 // refreshed in the background before they expire.
 type SharedSDK struct {
+	*sharedSDKHandle
+}
+
+type sharedSDKHandle struct {
 	ptr     *C.sia_shared_sdk_t
 	cleanup runtime.Cleanup
 
@@ -38,11 +42,11 @@ type SharedSDK struct {
 }
 
 func wrapSharedSDK(ptr *C.sia_shared_sdk_t) *SharedSDK {
-	s := &SharedSDK{ptr: ptr}
-	s.cleanup = runtime.AddCleanup(s, func(p *C.sia_shared_sdk_t) {
+	h := &sharedSDKHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_shared_sdk_t) {
 		C.sia_shared_sdk_free(p)
 	}, ptr)
-	return s
+	return &SharedSDK{h}
 }
 
 // ConnectShared connects to indexerURL as the recipient of the sharing key

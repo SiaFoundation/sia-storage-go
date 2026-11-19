@@ -90,6 +90,10 @@ type Account struct {
 // A Builder authorizes an app key against an indexer and produces an SDK.
 // Close it once the SDK has been obtained.
 type Builder struct {
+	*builderHandle
+}
+
+type builderHandle struct {
 	ptr     *C.sia_builder_t
 	cleanup runtime.Cleanup
 
@@ -134,19 +138,19 @@ func NewBuilder(indexerURL string, metadata AppMetadata) (*Builder, error) {
 }
 
 func wrapBuilder(ptr *C.sia_builder_t) *Builder {
-	b := &Builder{ptr: ptr}
+	h := &builderHandle{ptr: ptr}
 	// The cleanup is a backstop for a caller who never calls Close. It must not
-	// capture b, or b would never become unreachable.
+	// capture h, or h would never become unreachable.
 	//
-	// Because it does not, b is unreachable from the moment a method loads
-	// b.ptr, so every method that hands the handle to C has to keep b alive
-	// until that call returns. Without it the cleanup can free the handle
-	// while the call is still running, and for the blocking calls that window
-	// is a whole network round trip.
-	b.cleanup = runtime.AddCleanup(b, func(p *C.sia_builder_t) {
+	// Because it does not, h can become unreachable as soon as a method loads
+	// b.ptr, so every method that hands the handle to C has to keep b, and
+	// through it h, alive until that call returns. Without it the cleanup can
+	// free the handle while the call is still running, and for the blocking
+	// calls that window is a whole network round trip.
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_builder_t) {
 		C.sia_builder_free(p)
 	}, ptr)
-	return b
+	return &Builder{h}
 }
 
 // Close releases the builder. It is safe to call more than once.
@@ -346,6 +350,10 @@ func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey typ
 
 // An SDK is an authorized connection to an indexer.
 type SDK struct {
+	*sdkHandle
+}
+
+type sdkHandle struct {
 	ptr     *C.sia_sdk_t
 	cleanup runtime.Cleanup
 
@@ -358,11 +366,11 @@ type SDK struct {
 }
 
 func wrapSDK(ptr *C.sia_sdk_t) *SDK {
-	s := &SDK{ptr: ptr}
-	s.cleanup = runtime.AddCleanup(s, func(p *C.sia_sdk_t) {
+	h := &sdkHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_sdk_t) {
 		C.sia_sdk_free(p)
 	}, ptr)
-	return s
+	return &SDK{h}
 }
 
 // Close releases the connection and its resources. It is safe to call more

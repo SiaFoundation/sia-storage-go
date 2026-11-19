@@ -28,6 +28,10 @@ const packedChunk = 256 << 10
 // per Add in the order they were added. Close abandons an upload that has not
 // been finalized and is safe afterwards either way.
 type PackedUpload struct {
+	*packedUploadHandle
+}
+
+type packedUploadHandle struct {
 	ptr        *C.sia_packed_upload_t
 	cleanup    runtime.Cleanup
 	ctx        context.Context
@@ -83,17 +87,17 @@ func (s *SDK) UploadPacked(ctx context.Context, opts ...UploadOption) (*PackedUp
 	}
 
 	tok, tokenOwner := newStreamCancel(ctx)
-	p := &PackedUpload{
+	h := &packedUploadHandle{
 		ptr:        ptr,
 		ctx:        ctx,
 		tok:        tok,
 		tokenOwner: tokenOwner,
 		progressID: progressID,
 	}
-	p.cleanup = runtime.AddCleanup(p, func(h *C.sia_packed_upload_t) {
-		C.sia_packed_upload_free(h)
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_packed_upload_t) {
+		C.sia_packed_upload_free(p)
 	}, ptr)
-	return p, nil
+	return &PackedUpload{h}, nil
 }
 
 // Add packs one object, reading r to EOF, and reports how many bytes it held.
