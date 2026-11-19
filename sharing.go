@@ -26,6 +26,10 @@ import (
 // made. [SDK.RevokeSharingKey] detaches everything at once, which is the only
 // way to undo it.
 type SharingKey struct {
+	*sharingKeyHandle
+}
+
+type sharingKeyHandle struct {
 	ptr     *C.sia_sharing_key_t
 	cleanup runtime.Cleanup
 
@@ -40,11 +44,11 @@ func ImportSharingKey(seed [32]byte) *SharingKey {
 }
 
 func wrapSharingKey(ptr *C.sia_sharing_key_t) *SharingKey {
-	k := &SharingKey{ptr: ptr}
-	k.cleanup = runtime.AddCleanup(k, func(p *C.sia_sharing_key_t) {
+	h := &sharingKeyHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_sharing_key_t) {
 		C.sia_sharing_key_free(p)
 	}, ptr)
-	return k
+	return &SharingKey{h}
 }
 
 // Export returns the seed, which is the whole credential. Treat it as a secret

@@ -57,6 +57,10 @@ func (o downloadOptions) with(opts []DownloadOption) downloadOptions {
 // Close releases the transfer and must be called, whether or not the read
 // reached EOF.
 type Download struct {
+	*downloadHandle
+}
+
+type downloadHandle struct {
 	ptr        *C.sia_download_t
 	cleanup    runtime.Cleanup
 	ctx        context.Context
@@ -110,17 +114,17 @@ func (s *SDK) Download(ctx context.Context, obj *Object, opts ...DownloadOption)
 	}
 
 	tok, tokenOwner := newStreamCancel(ctx)
-	d := &Download{
+	h := &downloadHandle{
 		ptr:        ptr,
 		ctx:        ctx,
 		tok:        tok,
 		tokenOwner: tokenOwner,
 		progressID: progressID,
 	}
-	d.cleanup = runtime.AddCleanup(d, func(p *C.sia_download_t) {
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_download_t) {
 		C.sia_download_free(p)
 	}, ptr)
-	return d, nil
+	return &Download{h}, nil
 }
 
 // Download streams a shared object's data, paid for with the account tokens the
@@ -166,17 +170,17 @@ func (s *SharedSDK) Download(ctx context.Context, obj *Object, opts ...DownloadO
 	}
 
 	tok, tokenOwner := newStreamCancel(ctx)
-	d := &Download{
+	h := &downloadHandle{
 		ptr:        ptr,
 		ctx:        ctx,
 		tok:        tok,
 		tokenOwner: tokenOwner,
 		progressID: progressID,
 	}
-	d.cleanup = runtime.AddCleanup(d, func(p *C.sia_download_t) {
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_download_t) {
 		C.sia_download_free(p)
 	}, ptr)
-	return d, nil
+	return &Download{h}, nil
 }
 
 // Read fills p with recovered data, blocking until at least one byte is
