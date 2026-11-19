@@ -14,11 +14,11 @@ import (
 // TestPreAuthorizedKeySeedRoundTrip proves the seed is the whole credential.
 func TestPreAuthorizedKeySeedRoundTrip(t *testing.T) {
 	key := NewPreAuthorizedKey()
-	seed := mustExport(t, key)
+	seed := key.Export()
 	if seed == ([32]byte{}) {
 		t.Fatal("the exported seed is all zeroes")
 	}
-	if mustExport(t, NewPreAuthorizedKey()) == seed {
+	if NewPreAuthorizedKey().Export() == seed {
 		t.Fatal("two generated keys share a seed")
 	}
 
@@ -26,7 +26,7 @@ func TestPreAuthorizedKeySeedRoundTrip(t *testing.T) {
 	if imported.PublicKey() != key.PublicKey() {
 		t.Fatal("a key rebuilt from its seed has a different public key")
 	}
-	if mustExport(t, imported) != seed {
+	if imported.Export() != seed {
 		t.Fatal("the reimported key exports a different seed")
 	}
 }
@@ -37,7 +37,7 @@ func TestPreAuthorizedKeySign(t *testing.T) {
 	key := NewPreAuthorizedKey()
 
 	h := types.HashBytes([]byte("hello"))
-	sig := mustSign(t, key, h[:])
+	sig := key.Sign(h[:])
 	if !key.PublicKey().VerifyHash(h, sig) {
 		t.Fatal("core rejects the key's signature")
 	}
@@ -53,7 +53,7 @@ func TestPreAuthorizedKeySign(t *testing.T) {
 	}
 
 	for _, empty := range [][]byte{nil, {}} {
-		sig := mustSign(t, key, empty)
+		sig := key.Sign(empty)
 		if !key.VerifySignature(empty, sig) {
 			t.Fatalf("the signature of %#v does not verify", empty)
 		}
@@ -61,30 +61,42 @@ func TestPreAuthorizedKeySign(t *testing.T) {
 }
 
 // TestPreAuthorizedKeyNil checks that a nil key and a zero value one, neither of
-// which holds a native key, fail rather than hand back a zero seed or signature.
+// which holds a native key, fail rather than hand back a zero seed or signature:
+// with an error where the method returns one, and a panic where it does not.
 func TestPreAuthorizedKeyNil(t *testing.T) {
 	for name, key := range map[string]*PreAuthorizedKey{
 		"nil":        nil,
 		"zero value": new(PreAuthorizedKey),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := key.Export(); !errors.Is(err, errNilPreAuthorizedKey) {
-				t.Fatalf("export: %v", err)
-			}
-			if _, err := key.Sign([]byte("hello")); !errors.Is(err, errNilPreAuthorizedKey) {
-				t.Fatalf("sign: %v", err)
-			}
 			if _, err := key.SignRequest(PreAuthorizedKeyRequest{ConnectKey: "connect-key"}); !errors.Is(err, errNilPreAuthorizedKey) {
 				t.Fatalf("sign request: %v", err)
 			}
-			if pk := key.PublicKey(); pk != (types.PublicKey{}) {
-				t.Fatalf("public key %v, want zero", pk)
-			}
-			if key.VerifySignature([]byte("hello"), types.Signature{}) {
-				t.Fatal("a nil key verified a signature")
-			}
+			wantPanic(t, "export", errNilPreAuthorizedKey, func() { key.Export() })
+			wantPanic(t, "public key", errNilPreAuthorizedKey, func() { key.PublicKey() })
+			wantPanic(t, "sign", errNilPreAuthorizedKey, func() { key.Sign([]byte("hello")) })
+			wantPanic(t, "verify", errNilPreAuthorizedKey, func() { key.VerifySignature([]byte("hello"), types.Signature{}) })
 		})
 	}
+}
+
+// TestSharingKeyZeroValue checks that a zero value sharing key panics rather
+// than export a zero seed.
+func TestSharingKeyZeroValue(t *testing.T) {
+	key := new(SharingKey)
+	wantPanic(t, "export", errNilSharingKey, func() { key.Export() })
+	wantPanic(t, "public key", errNilSharingKey, func() { key.PublicKey() })
+}
+
+func wantPanic(t *testing.T, name string, want error, fn func()) {
+	t.Helper()
+	defer func() {
+		t.Helper()
+		if err, _ := recover().(error); !errors.Is(err, want) {
+			t.Fatalf("%s: recovered %v, want a panic with %v", name, err, want)
+		}
+	}()
+	fn()
 }
 
 // TestPreAuthorizedKeySignRequestMatchesIndexd verifies the signed request with
@@ -151,22 +163,4 @@ func TestPreAuthorizedKeySignRequestVector(t *testing.T) {
 	if got := hex.EncodeToString(signed.Signature[:]); got != wantSignature {
 		t.Fatalf("signature %s, want %s", got, wantSignature)
 	}
-}
-
-func mustExport(t *testing.T, key *PreAuthorizedKey) [32]byte {
-	t.Helper()
-	seed, err := key.Export()
-	if err != nil {
-		t.Fatalf("export: %v", err)
-	}
-	return seed
-}
-
-func mustSign(t *testing.T, key *PreAuthorizedKey, message []byte) types.Signature {
-	t.Helper()
-	sig, err := key.Sign(message)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	return sig
 }

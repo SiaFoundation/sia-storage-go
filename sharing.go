@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"time"
@@ -34,6 +35,16 @@ type SharingKey struct {
 	mu sync.RWMutex
 }
 
+var errNilSharingKey = errors.New("sharing key is nil")
+
+// mustHold panics on a zero value key, which the native side would otherwise
+// answer with a zero seed or public key.
+func (k *SharingKey) mustHold() {
+	if k.ptr == nil {
+		panic(errNilSharingKey)
+	}
+}
+
 // ImportSharingKey rebuilds a key from a seed handed out by its owner.
 func ImportSharingKey(seed [32]byte) *SharingKey {
 	return wrapSharingKey(C.sia_sharing_key_import(cBytes32(&seed)))
@@ -52,6 +63,7 @@ func wrapSharingKey(ptr *C.sia_sharing_key_t) *SharingKey {
 func (k *SharingKey) Export() (seed [32]byte) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
+	k.mustHold()
 	C.sia_sharing_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
 	return
@@ -61,6 +73,7 @@ func (k *SharingKey) Export() (seed [32]byte) {
 func (k *SharingKey) PublicKey() (pk types.PublicKey) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
+	k.mustHold()
 	C.sia_sharing_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
 	return

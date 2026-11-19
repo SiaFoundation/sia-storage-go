@@ -52,6 +52,14 @@ func (k *PreAuthorizedKey) acquire() error {
 	return nil
 }
 
+// mustAcquire is acquire for the methods with no error to return, which panic
+// rather than hand back a zero seed or signature.
+func (k *PreAuthorizedKey) mustAcquire() {
+	if err := k.acquire(); err != nil {
+		panic(err)
+	}
+}
+
 // release ends a successful acquire.
 func (k *PreAuthorizedKey) release() {
 	k.mu.RUnlock()
@@ -91,22 +99,17 @@ func wrapPreAuthorizedKey(ptr *C.sia_pre_authorized_key_t) *PreAuthorizedKey {
 
 // Export returns the seed, which is the whole credential. Store it no longer
 // than it takes to hand to the app that will connect with it.
-func (k *PreAuthorizedKey) Export() (seed [32]byte, err error) {
-	if err := k.acquire(); err != nil {
-		return seed, err
-	}
+func (k *PreAuthorizedKey) Export() (seed [32]byte) {
+	k.mustAcquire()
 	defer k.release()
 	C.sia_pre_authorized_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
-	return seed, nil
+	return
 }
 
 // PublicKey returns the half the indexer identifies the key by. Safe to log.
-// A nil key returns the zero public key.
 func (k *PreAuthorizedKey) PublicKey() (pk types.PublicKey) {
-	if k.acquire() != nil {
-		return
-	}
+	k.mustAcquire()
 	defer k.release()
 	C.sia_pre_authorized_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
@@ -114,28 +117,24 @@ func (k *PreAuthorizedKey) PublicKey() (pk types.PublicKey) {
 }
 
 // Sign signs message with the key.
-func (k *PreAuthorizedKey) Sign(message []byte) (types.Signature, error) {
-	if err := k.acquire(); err != nil {
-		return types.Signature{}, err
-	}
+func (k *PreAuthorizedKey) Sign(message []byte) (sig types.Signature) {
+	k.mustAcquire()
 	defer k.release()
-	var sig types.Signature
+	// The status only reports a nil handle or a nil message with a nonzero
+	// length, neither of which can be passed from here, so a failure is a bug.
 	var cerr *C.char
 	code := C.sia_pre_authorized_key_sign(k.ptr, cMessage(message), C.uintptr_t(len(message)),
 		(*C.uint8_t)(unsafe.Pointer(&sig[0])), &cerr)
 	runtime.KeepAlive(k)
-	if code != C.SIA_OK {
-		return types.Signature{}, localError(code, cerr)
+	if err := localError(code, cerr); err != nil {
+		panic(err)
 	}
-	return sig, nil
+	return
 }
 
-// VerifySignature reports whether sig is the key's signature of message. A nil
-// key verifies nothing.
+// VerifySignature reports whether sig is the key's signature of message.
 func (k *PreAuthorizedKey) VerifySignature(message []byte, sig types.Signature) bool {
-	if k.acquire() != nil {
-		return false
-	}
+	k.mustAcquire()
 	defer k.release()
 	ok := C.sia_pre_authorized_key_verify_signature(k.ptr, cMessage(message),
 		C.uintptr_t(len(message)), (*C.uint8_t)(unsafe.Pointer(&sig[0])))
