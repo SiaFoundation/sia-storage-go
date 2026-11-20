@@ -114,9 +114,9 @@ func TestSDKAccount(t *testing.T) {
 	if want := sdk.AppKey().PublicKey(); account.AccountKey != want {
 		t.Fatalf("account key %v, want the app key's %v", account.AccountKey, want)
 	}
-	if account.MaxPinnedData != math.MaxUint64 || account.RemainingStorage != math.MaxUint64 {
+	if account.MaxPinnedData != math.MaxInt64 || account.RemainingStorage != math.MaxInt64 {
 		t.Fatalf("limits %d and %d, want the mock's unlimited %d",
-			account.MaxPinnedData, account.RemainingStorage, uint64(math.MaxUint64))
+			account.MaxPinnedData, account.RemainingStorage, int64(math.MaxInt64))
 	}
 	if account.PinnedData != 0 || account.PinnedSize != 0 {
 		t.Fatalf("a fresh account reports %d pinned, %d encoded", account.PinnedData, account.PinnedSize)
