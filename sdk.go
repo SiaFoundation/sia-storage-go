@@ -10,9 +10,7 @@ import "C"
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -34,17 +32,6 @@ type AppMetadata struct {
 	// LogoURL and CallbackURL are optional and sent as null when empty.
 	LogoURL     string
 	CallbackURL string
-}
-
-// appMetadataJSON is the wire form sia_builder_new parses. The field names are
-// the contract with the Rust side and do not all follow one convention.
-type appMetadataJSON struct {
-	AppID       types.Hash256 `json:"appID"`
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	ServiceURL  string        `json:"serviceURL"`
-	LogoURL     *string       `json:"logoURL"`
-	CallbackURL *string       `json:"callbackURL"`
 }
 
 // GenerateAppID returns a random application identifier.
@@ -90,6 +77,10 @@ type Account struct {
 // A Builder authorizes an app key against an indexer and produces an SDK.
 // Close it once the SDK has been obtained.
 type Builder struct {
+	*builderHandle
+}
+
+type builderHandle struct {
 	ptr     *C.sia_builder_t
 	cleanup runtime.Cleanup
 
@@ -103,50 +94,61 @@ type Builder struct {
 
 // NewBuilder prepares a connection to the indexer at indexerURL.
 func NewBuilder(indexerURL string, metadata AppMetadata) (*Builder, error) {
-	meta := appMetadataJSON{
-		AppID:       metadata.AppID,
-		Name:        metadata.Name,
-		Description: metadata.Description,
-		ServiceURL:  metadata.ServiceURL,
+	// Every string is copied to C memory, because cgo refuses a struct holding
+	// a pointer into Go memory.
+	var owned []*C.char
+	defer func() {
+		for _, p := range owned {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	cString := func(s string) *C.char {
+		p := C.CString(s)
+		owned = append(owned, p)
+		return p
 	}
-	if metadata.LogoURL != "" {
-		meta.LogoURL = &metadata.LogoURL
-	}
-	if metadata.CallbackURL != "" {
-		meta.CallbackURL = &metadata.CallbackURL
-	}
-	metaJSON, err := json.Marshal(meta)
-	if err != nil {
-		return nil, fmt.Errorf("encode app metadata: %w", err)
+	// The optional URLs are null when empty, which the indexer reads as unset.
+	optional := func(s string) *C.char {
+		if s == "" {
+			return nil
+		}
+		return cString(s)
 	}
 
-	cURL := C.CString(indexerURL)
-	defer C.free(unsafe.Pointer(cURL))
-	cMeta := C.CString(string(metaJSON))
-	defer C.free(unsafe.Pointer(cMeta))
+	meta := C.sia_app_metadata_t{
+		name:         cString(metadata.Name),
+		description:  cString(metadata.Description),
+		service_url:  cString(metadata.ServiceURL),
+		logo_url:     optional(metadata.LogoURL),
+		callback_url: optional(metadata.CallbackURL),
+	}
+	for i, b := range metadata.AppID {
+		meta.id[i] = C.uint8_t(b)
+	}
+	cURL := cString(indexerURL)
 
 	var ptr *C.sia_builder_t
 	var cerr *C.char
-	if code := C.sia_builder_new(cURL, cMeta, &ptr, &cerr); code != C.SIA_OK {
+	if code := C.sia_builder_new(cURL, &meta, &ptr, &cerr); code != C.SIA_OK {
 		return nil, localError(code, cerr)
 	}
 	return wrapBuilder(ptr), nil
 }
 
 func wrapBuilder(ptr *C.sia_builder_t) *Builder {
-	b := &Builder{ptr: ptr}
+	h := &builderHandle{ptr: ptr}
 	// The cleanup is a backstop for a caller who never calls Close. It must not
-	// capture b, or b would never become unreachable.
+	// capture h, or h would never become unreachable.
 	//
-	// Because it does not, b is unreachable from the moment a method loads
-	// b.ptr, so every method that hands the handle to C has to keep b alive
-	// until that call returns. Without it the cleanup can free the handle
-	// while the call is still running, and for the blocking calls that window
-	// is a whole network round trip.
-	b.cleanup = runtime.AddCleanup(b, func(p *C.sia_builder_t) {
+	// Because it does not, h can become unreachable as soon as a method loads
+	// b.ptr, so every method that hands the handle to C has to keep b, and
+	// through it h, alive until that call returns. Without it the cleanup can
+	// free the handle while the call is still running, and for the blocking
+	// calls that window is a whole network round trip.
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_builder_t) {
 		C.sia_builder_free(p)
 	}, ptr)
-	return b
+	return &Builder{h}
 }
 
 // Close releases the builder. It is safe to call more than once.
@@ -314,18 +316,16 @@ func (b *Builder) Connect(ctx context.Context, appKey types.PrivateKey) (*SDK, e
 //
 // Consumes the builder, cancellation included, since the key may already have
 // been spent.
-//
-// Only the first 32 bytes of preAuthorizedKey are sent, which is the seed the
-// rest of the key is derived from.
-func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey types.PrivateKey, mnemonic string) (*SDK, error) {
-	if len(preAuthorizedKey) < 32 {
-		return nil, errors.New("pre-authorized key must be at least 32 bytes")
-	}
+func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey *PreAuthorizedKey, mnemonic string) (*SDK, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
 		return nil, errClosed
 	}
+	if err := preAuthorizedKey.acquire(); err != nil {
+		return nil, err
+	}
+	defer preAuthorizedKey.release()
 
 	cMnemonic := C.CString(mnemonic)
 	defer C.free(unsafe.Pointer(cMnemonic))
@@ -335,9 +335,9 @@ func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey typ
 
 	var ptr *C.sia_sdk_t
 	var cerr *C.char
-	code := C.sia_builder_connect_pre_authorized(b.ptr,
-		(*C.uint8_t)(unsafe.Pointer(&preAuthorizedKey[0])), cMnemonic, tok, &ptr, &cerr)
+	code := C.sia_builder_connect_pre_authorized(b.ptr, preAuthorizedKey.ptr, cMnemonic, tok, &ptr, &cerr)
 	runtime.KeepAlive(b)
+	runtime.KeepAlive(preAuthorizedKey)
 	if code != C.SIA_OK {
 		return nil, goError(ctx, code, cerr)
 	}
@@ -346,6 +346,10 @@ func (b *Builder) ConnectPreAuthorized(ctx context.Context, preAuthorizedKey typ
 
 // An SDK is an authorized connection to an indexer.
 type SDK struct {
+	*sdkHandle
+}
+
+type sdkHandle struct {
 	ptr     *C.sia_sdk_t
 	cleanup runtime.Cleanup
 
@@ -358,11 +362,11 @@ type SDK struct {
 }
 
 func wrapSDK(ptr *C.sia_sdk_t) *SDK {
-	s := &SDK{ptr: ptr}
-	s.cleanup = runtime.AddCleanup(s, func(p *C.sia_sdk_t) {
+	h := &sdkHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_sdk_t) {
 		C.sia_sdk_free(p)
 	}, ptr)
-	return s
+	return &SDK{h}
 }
 
 // Close releases the connection and its resources. It is safe to call more
@@ -403,15 +407,44 @@ func (s *SDK) Account(ctx context.Context) (Account, error) {
 	tok, release := cancelToken(ctx)
 	defer release()
 
-	var cJSON, cerr *C.char
-	code := C.sia_sdk_account(s.ptr, tok, &cJSON, &cerr)
+	var c *C.sia_account_t
+	var cerr *C.char
+	code := C.sia_sdk_account(s.ptr, tok, &c, &cerr)
 	runtime.KeepAlive(s)
 	if code != C.SIA_OK {
 		return Account{}, goError(ctx, code, cerr)
 	}
-	var a Account
-	if err := json.Unmarshal([]byte(goString(cJSON)), &a); err != nil {
-		return Account{}, fmt.Errorf("decode account: %w", err)
+	defer C.sia_account_free(c)
+
+	a := Account{
+		MaxPinnedData:    uint64(c.max_pinned_data),
+		RemainingStorage: uint64(c.remaining_storage),
+		PinnedData:       uint64(c.pinned_data),
+		PinnedSize:       uint64(c.pinned_size),
+		Ready:            bool(c.ready),
+		App: App{
+			Name:        C.GoString(c.app.name),
+			Description: C.GoString(c.app.description),
+			LogoURL:     optionalGoString(c.app.logo_url),
+			ServiceURL:  optionalGoString(c.app.service_url),
+		},
+		LastUsed: unixMicro(int64(c.last_used_unix_us)),
+	}
+	for i, b := range c.account_key {
+		a.AccountKey[i] = byte(b)
+	}
+	for i, b := range c.app.id {
+		a.App.ID[i] = byte(b)
 	}
 	return a, nil
+}
+
+// optionalGoString copies a string the C ABI may leave null, reading null as
+// absent rather than empty.
+func optionalGoString(s *C.char) *string {
+	if s == nil {
+		return nil
+	}
+	v := C.GoString(s)
+	return &v
 }

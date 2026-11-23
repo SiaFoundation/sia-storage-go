@@ -12,6 +12,11 @@
 //     sia_string_free.
 //   - Handles are opaque pointers owned by the caller and released with the
 //     matching *_free function.
+//   - Records holding strings or lists, such as sia_account_t and the
+//     sia_host_t array, are allocated by the library. Read their fields
+//     directly. The matching *_free releases the record and everything it
+//     points to, so copy a string to keep it longer. An optional string is
+//     null when absent.
 //   - Passing a null handle is reported rather than dereferenced. A fallible
 //     function returns SIA_ERR_INVALID_HANDLE without setting *err; a getter
 //     returns a zero value (0, false, or NULL); a void function does nothing.
@@ -44,6 +49,7 @@ typedef struct sia_shared_sdk sia_shared_sdk_t;
 typedef struct sia_object sia_object_t;
 typedef struct sia_cancel sia_cancel_t;
 typedef struct sia_sharing_key sia_sharing_key_t;
+typedef struct sia_pre_authorized_key sia_pre_authorized_key_t;
 
 
 #define SIA_OK 0
@@ -80,9 +86,18 @@ typedef struct sia_sharing_key sia_sharing_key_t;
 // An overwrite started past the end of the object it was rewriting.
 #define SIA_ERR_OUT_OF_RANGE 12
 
+// A host address that speaks SiaMux.
+#define SIA_PROTOCOL_SIAMUX 0
+
+// A host address that speaks QUIC.
+#define SIA_PROTOCOL_QUIC 1
+
 typedef struct sia_builder_t sia_builder_t;
 
 typedef struct sia_download_t sia_download_t;
+
+// A page of object events without their slabs, owning every summary in it.
+typedef struct sia_event_summaries_t sia_event_summaries_t;
 
 typedef struct sia_events_t sia_events_t;
 
@@ -98,6 +113,23 @@ typedef struct sia_object_summaries_t sia_object_summaries_t;
 typedef struct sia_packed_upload_t sia_packed_upload_t;
 
 typedef struct sia_upload_t sia_upload_t;
+
+// What `sia_builder_new` registers the application as. The strings are
+// copied, so they only need to outlive the call.
+typedef struct {
+    uint8_t id[32];
+    // At most 128 characters.
+    const char *name;
+    // At most 1024 characters.
+    const char *description;
+    // At most 1024 characters.
+    const char *service_url;
+    // Null for none.
+    const char *logo_url;
+    // Null for none. The indexer calls it once the user approves the
+    // connection.
+    const char *callback_url;
+} sia_app_metadata_t;
 
 typedef struct {
     uint8_t host_key[32];
@@ -135,6 +167,28 @@ typedef struct {
     const char *country;
 } sia_host_query_t;
 
+// One way to reach a host. `address` is owned by the array it came from.
+typedef struct {
+    // `SIA_PROTOCOL_SIAMUX` or `SIA_PROTOCOL_QUIC`.
+    uint8_t protocol;
+    // `host:port`.
+    const char *address;
+} sia_net_address_t;
+
+// A storage host. Every pointer in it is owned by the array it came from and
+// is valid until that array is freed with `sia_host_array_free`.
+typedef struct {
+    uint8_t public_key[32];
+    // Null when `addresses_len` is 0.
+    const sia_net_address_t *addresses;
+    uintptr_t addresses_len;
+    // ISO 3166-1 alpha-2.
+    const char *country_code;
+    double latitude;
+    double longitude;
+    bool good_for_upload;
+} sia_host_t;
+
 // The fixed part of a summary. Metadata is variable length, so it is read
 // separately with `sia_object_summaries_metadata`.
 typedef struct {
@@ -143,6 +197,47 @@ typedef struct {
     int64_t created_at_unix_us;
     int64_t updated_at_unix_us;
 } sia_object_summary_t;
+
+typedef struct {
+    const char *connect_key;
+    // Microseconds since the Unix epoch.
+    int64_t expiration_unix_us;
+    uint32_t total_uses;
+    // Null for any application, otherwise a pointer to the 32-byte app ID.
+    const uint8_t *allowed_app_id;
+} sia_pre_authorized_key_request_t;
+
+// The application an account is registered to. Every string is owned by the
+// account it came from.
+typedef struct {
+    uint8_t id[32];
+    const char *name;
+    const char *description;
+    // Null when the application has no logo.
+    const char *logo_url;
+    // Null when the application has no service URL.
+    const char *service_url;
+} sia_app_t;
+
+// The indexer's view of the account behind an app key.
+typedef struct {
+    uint8_t account_key[32];
+    // The pinning limit in bytes. An account with no limit reports
+    // 2^63 - 1.
+    uint64_t max_pinned_data;
+    // Bytes that can still be pinned under both the limit and the current
+    // quota.
+    uint64_t remaining_storage;
+    // Bytes pinned, which count towards `max_pinned_data`.
+    uint64_t pinned_data;
+    // Bytes pinned after erasure coding, which is what sits on the network.
+    uint64_t pinned_size;
+    // False while the indexer is still processing the registration.
+    bool ready;
+    sia_app_t app;
+    // -62135596800000000 (0001-01-01T00:00:00Z) for an account never used.
+    int64_t last_used_unix_us;
+} sia_account_t;
 
 // The indexer's snapshot of what a sharing key grants access to. Every field
 // is fixed width so the whole record crosses in one read rather than one call
@@ -222,6 +317,7 @@ char *sia_generate_recovery_phrase(void);
 // Estimates what `data_size` bytes will occupy on the network once erasure
 // coded, so a caller can price an upload before making it. The figure is the
 // one `sia_object_encoded_size` reports for an object that already exists.
+// Fails when the estimate does not fit in a `uint64_t`.
 //
 // # Safety
 // - `out` must be non null and writable. It receives the estimate on success.
@@ -257,18 +353,18 @@ void sia_cancel_cancel(const sia_cancel_t *c);
 //   not be used again after this returns.
 void sia_cancel_free(sia_cancel_t *c);
 
-// `app_meta_json` is `{"appID":"<hex>","name":...,"description":...,
-// "serviceURL":...,"logoURL":...|null,"callbackURL":...|null}`.
+// A required string in `meta` that is null is rejected with `SIA_ERR`.
 //
 // # Safety
 // - `indexer_url` must be non null and NUL terminated.
-// - `app_meta_json` must be non null and NUL terminated.
+// - `meta` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must point to an
+//   initialised struct whose strings are each null or NUL terminated.
 // - `out` must be non null and writable. On success it receives an owned handle that must be
 //   released with `sia_builder_free`.
 // - `err` may be null. Otherwise it receives an owned message on failure that must be released
 //   with `sia_string_free`.
 int32_t sia_builder_new(const char *indexer_url,
-                        const char *app_meta_json,
+                        const sia_app_metadata_t *meta,
                         sia_builder_t **out,
                         char **err);
 
@@ -330,7 +426,8 @@ int32_t sia_builder_wait_for_approval(sia_builder_t *b, sia_cancel_t *cancel, ch
 // # Safety
 // - `b` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
 //   from `sia_builder_new` that has not been freed.
-// - `pre_authorized_key` must be readable for 32 bytes.
+// - `pre_authorized_key` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must
+//   be a live handle from `sia_pre_authorized_key_new` or `sia_pre_authorized_key_import`.
 // - `mnemonic` must be non null and NUL terminated.
 // - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
 //   from `sia_cancel_new`.
@@ -339,7 +436,7 @@ int32_t sia_builder_wait_for_approval(sia_builder_t *b, sia_cancel_t *cancel, ch
 // - `err` may be null. Otherwise it receives an owned message on failure that must be released
 //   with `sia_string_free`.
 int32_t sia_builder_connect_pre_authorized(sia_builder_t *b,
-                                           const uint8_t *pre_authorized_key,
+                                           const sia_pre_authorized_key_t *pre_authorized_key,
                                            const char *mnemonic,
                                            sia_cancel_t *cancel,
                                            sia_sdk_t **out,
@@ -445,15 +542,12 @@ int32_t sia_download_read(sia_download_t *dl,
 //   after this returns.
 void sia_download_free(sia_download_t *dl);
 
-// Lists the usable hosts the indexer knows, as a JSON array.
+// Lists the usable hosts the indexer knows.
 //
 // Always scoped to SiaMux hosts, because that is the only protocol this
 // library's transport can dial.
 //
-// Each element carries `publicKey`, `addresses` (each with `protocol` and
-// `address`), `countryCode`, `latitude`, `longitude` and `goodForUpload`.
-// The array is JSON rather than a typed collection because a host's address
-// list is variable length, and this shape matches what the indexer returns.
+// An empty listing sets `*out_hosts` to null and `*out_len` to 0.
 //
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
@@ -462,17 +556,18 @@ void sia_download_free(sia_download_t *dl);
 //   terminated.
 // - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
 //   from `sia_cancel_new`.
-// - `out_json` must be non null and writable. On success it receives an owned string that must be
-//   released with `sia_string_free`.
+// - `out_hosts` and `out_len` must be non null and writable. On success they receive an owned
+//   array that must be released with `sia_host_array_free`.
 // - `err` may be null. Otherwise it receives an owned message on failure that must be released
 //   with `sia_string_free`.
 int32_t sia_sdk_hosts(const sia_sdk_t *sdk,
                       const sia_host_query_t *query,
                       sia_cancel_t *cancel,
-                      char **out_json,
+                      sia_host_t **out_hosts,
+                      uintptr_t *out_len,
                       char **err);
 
-// The hosts serving this sharing key's objects, in the same JSON shape as
+// The hosts serving this sharing key's objects, read the same way as
 // [`sia_sdk_hosts`]. Scoped to the key rather than the whole indexer.
 //
 // # Safety
@@ -482,15 +577,24 @@ int32_t sia_sdk_hosts(const sia_sdk_t *sdk,
 //   terminated.
 // - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
 //   from `sia_cancel_new`.
-// - `out_json` must be non null and writable. On success it receives an owned string that must be
-//   released with `sia_string_free`.
+// - `out_hosts` and `out_len` must be non null and writable. On success they receive an owned
+//   array that must be released with `sia_host_array_free`.
 // - `err` may be null. Otherwise it receives an owned message on failure that must be released
 //   with `sia_string_free`.
 int32_t sia_shared_sdk_hosts(const sia_shared_sdk_t *sdk,
                              const sia_host_query_t *query,
                              sia_cancel_t *cancel,
-                             char **out_json,
+                             sia_host_t **out_hosts,
+                             uintptr_t *out_len,
                              char **err);
+
+// Releases a host array along with every address and string it points to.
+//
+// # Safety
+// - `hosts` may be null, which does nothing. Otherwise it must be an unmodified array of `len`
+//   hosts from `sia_sdk_hosts` or `sia_shared_sdk_hosts`, and must not be used again after this
+//   returns.
+void sia_host_array_free(sia_host_t *hosts, uintptr_t len);
 
 #if defined(SIA_STORAGE_MOCK)
 // In-memory mock backend for tests. Real erasure coding, encryption and
@@ -697,12 +801,59 @@ bool sia_events_at(sia_events_t *evs,
 void sia_events_free(sia_events_t *evs);
 
 // # Safety
+// - `evs` may be null, which returns 0. Otherwise it must be a live handle from
+//   `sia_sdk_object_event_summaries` that has not been freed.
+uintptr_t sia_event_summaries_len(const sia_event_summaries_t *evs);
+
+// Copies the event at `i`. A deletion sets `has_object` to false and leaves
+// `object` untouched. Returns false when `i` is out of range, leaving every out
+// parameter untouched.
+//
+// Nothing is transferred out, so unlike `sia_events_at` an index may be read
+// any number of times.
+//
+// # Safety
+// - `evs` may be null, which returns false. Otherwise it must be a live handle from
+//   `sia_sdk_object_event_summaries` that has not been freed.
+// - `id_out` must be writable for 32 bytes.
+// - `deleted`, `updated_at_unix_us`, `has_object` and `object` must be non null and writable.
+bool sia_event_summaries_at(const sia_event_summaries_t *evs,
+                            uintptr_t i,
+                            uint8_t *id_out,
+                            bool *deleted,
+                            int64_t *updated_at_unix_us,
+                            bool *has_object,
+                            sia_object_summary_t *object);
+
+// Returns the metadata length of the summary in the event at `i`, whether or
+// not it was written, so a caller can size its buffer with a null `buf` and
+// call again. A deletion, or an `i` out of range, reports 0.
+//
+// # Safety
+// - `evs` may be null, which returns 0. Otherwise it must be a live handle from
+//   `sia_sdk_object_event_summaries` that has not been freed.
+// - `buf` may be null, which measures without writing. Otherwise it must be writable for `cap`
+//   bytes, and nothing is written unless `cap` covers the whole metadata.
+uintptr_t sia_event_summaries_metadata(const sia_event_summaries_t *evs,
+                                       uintptr_t i,
+                                       uint8_t *buf,
+                                       uintptr_t cap);
+
+// # Safety
+// - `evs` may be null. Otherwise it must come from `sia_sdk_object_event_summaries` and must not
+//   be used again after this returns.
+void sia_event_summaries_free(sia_event_summaries_t *evs);
+
+// # Safety
 // - `objs` may be null. Otherwise it must be an array of `len` objects from a call that produced
 //   one, and must not be used again.
 void sia_object_array_free(sia_object_t **objs, uintptr_t len);
 
 // Seals an object under the account's app key and encodes it as JSON.
 // Free the result with `sia_string_free`.
+//
+// The JSON is indexd's sealed object. Store it unchanged and pass it to
+// `sia_object_from_sealed_json` to get the object back.
 //
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
@@ -723,7 +874,8 @@ int32_t sia_object_seal_json(const sia_sdk_t *sdk,
 // unreachable, which is what a process restarting from a saved seed needs to
 // re-seal what it already has.
 //
-// Free the result with `sia_string_free`.
+// The JSON is the same as `sia_object_seal_json` produces. Free the result
+// with `sia_string_free`.
 //
 // # Safety
 // - `app_key` must be readable for 32 bytes.
@@ -740,7 +892,8 @@ int32_t sia_object_seal_json_with_key(const uint8_t *app_key,
 
 // Decodes a sealed object from JSON and opens it with the account's app key,
 // verifying its signatures. This is how a caller that persisted the sealed
-// form gets a usable object back.
+// form gets a usable object back. `json` is what `sia_object_seal_json`
+// produced, or indexd's sealed object from any other source.
 //
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
@@ -772,6 +925,89 @@ int32_t sia_object_from_sealed_json_with_key(const uint8_t *app_key,
                                              sia_object_t **out,
                                              char **err);
 
+// Creates a random pre-authorized key.
+//
+// # Safety
+// - Free the returned handle with `sia_pre_authorized_key_free`.
+sia_pre_authorized_key_t *sia_pre_authorized_key_new(void);
+
+// Imports a pre-authorized key from its 32-byte seed.
+//
+// # Safety
+// - `seed` may be null, which returns null. Otherwise it must be readable for 32 bytes.
+// - Free the returned handle with `sia_pre_authorized_key_free`.
+sia_pre_authorized_key_t *sia_pre_authorized_key_import(const uint8_t *seed);
+
+// Frees a pre-authorized key handle.
+//
+// # Safety
+// - `key` may be null. Otherwise it must be a live pre-authorized key handle and must not be
+//   used again after this returns.
+void sia_pre_authorized_key_free(sia_pre_authorized_key_t *key);
+
+// Writes the pre-authorized key's 32-byte secret seed.
+//
+// # Safety
+// - `key` may be null, which does nothing. Otherwise it must be a live pre-authorized key handle.
+// - `out` must be writable for the 32-byte secret seed.
+void sia_pre_authorized_key_export(const sia_pre_authorized_key_t *key, uint8_t *out);
+
+// Writes the pre-authorized key's 32-byte public key.
+//
+// # Safety
+// - `key` may be null, which does nothing. Otherwise it must be a live pre-authorized key handle.
+// - `out` must be writable for the 32-byte public key.
+void sia_pre_authorized_key_public_key(const sia_pre_authorized_key_t *key, uint8_t *out);
+
+// Signs a message and writes its 64-byte signature.
+//
+// # Safety
+// - `key` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live
+//   pre-authorized key handle.
+// - `message` must be readable for `message_len` bytes; it may be null when the length is zero.
+// - `out` must be writable for the 64-byte signature.
+// - `err` may be null. Otherwise, free its value on failure with `sia_string_free`.
+int32_t sia_pre_authorized_key_sign(const sia_pre_authorized_key_t *key,
+                                    const uint8_t *message,
+                                    uintptr_t message_len,
+                                    uint8_t *out,
+                                    char **err);
+
+// Verifies a 64-byte signature against a message and the pre-authorized key.
+//
+// # Safety
+// - `key` may be null, which returns false. Otherwise it must be a live pre-authorized key handle.
+// - `message` must be readable for `message_len` bytes; it may be null when the length is zero.
+// - `signature` must be readable for 64 bytes when non null.
+bool sia_pre_authorized_key_verify_signature(const sia_pre_authorized_key_t *key,
+                                             const uint8_t *message,
+                                             uintptr_t message_len,
+                                             const uint8_t *signature);
+
+// Returns the signed pre-authorized key registration request as JSON, the
+// body indexd's admin API takes to register the key, so it is sent as is
+// rather than read:
+//
+// - `publicKey`: `"ed25519:<hex>"`
+// - `signature`: hex
+// - `connectKey`: the connect key the request was signed with
+// - `expiration`: RFC 3339 in UTC, at microsecond precision
+// - `totalUses`: a number no larger than 2^32 - 1
+// - `allowedAppID`: hex, omitted when any application is allowed
+//
+// # Safety
+// - `key` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live
+//   pre-authorized key handle.
+// - `request` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must point to
+//   an initialized struct whose `connect_key` is NUL terminated when non null and whose
+//   `allowed_app_id` is null or readable for 32 bytes.
+// - `out_json` must be non null and writable. On success, free its value with `sia_string_free`.
+// - `err` may be null. Otherwise, free its value on failure with `sia_string_free`.
+int32_t sia_pre_authorized_key_sign_request_json(const sia_pre_authorized_key_t *key,
+                                                 const sia_pre_authorized_key_request_t *request,
+                                                 char **out_json,
+                                                 char **err);
+
 // # Safety
 // - `sdk` may be null. Otherwise it must come from `sia_builder_connect`, `sia_builder_register`
 //   or `sia_mock_sdk` and must not be used again after this returns.
@@ -783,18 +1019,26 @@ void sia_sdk_free(sia_sdk_t *sdk);
 // - `out` must be writable for 32 bytes.
 void sia_sdk_app_key(const sia_sdk_t *sdk, uint8_t *out);
 
-// `out_json` receives the account encoded as JSON.
-//
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
 //   from `sia_builder_connect`, `sia_builder_register` or `sia_mock_sdk` that has not been freed.
 // - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
 //   from `sia_cancel_new`.
-// - `out_json` must be non null and writable. On success it receives an owned string that must be
-//   released with `sia_string_free`.
+// - `out` must be non null and writable. On success it receives an owned account that must be
+//   released with `sia_account_free`.
 // - `err` may be null. Otherwise it receives an owned message on failure that must be released
 //   with `sia_string_free`.
-int32_t sia_sdk_account(const sia_sdk_t *sdk, sia_cancel_t *cancel, char **out_json, char **err);
+int32_t sia_sdk_account(const sia_sdk_t *sdk,
+                        sia_cancel_t *cancel,
+                        sia_account_t **out,
+                        char **err);
+
+// Releases an account along with every string it points to.
+//
+// # Safety
+// - `account` may be null, which does nothing. Otherwise it must be an unmodified account from
+//   `sia_sdk_account`, and must not be used again after this returns.
+void sia_account_free(sia_account_t *account);
 
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
@@ -830,6 +1074,30 @@ int32_t sia_sdk_object_events(const sia_sdk_t *sdk,
                               sia_cancel_t *cancel,
                               sia_events_t **out,
                               char **err);
+
+// Lists the same events as `sia_sdk_object_events` without the objects'
+// slabs, which makes the response a small fraction of the size. A summary is
+// enough to show an object but not to download it; fetch the full object with
+// `sia_sdk_object` for that. Pages with the same cursor.
+//
+// # Safety
+// - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
+//   from `sia_builder_connect`, `sia_builder_register` or `sia_mock_sdk` that has not been freed.
+// - `after_id` must be readable for 32 bytes.
+// - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
+//   from `sia_cancel_new`.
+// - `out` must be non null and writable. On success it receives an owned handle that must be
+//   released with `sia_event_summaries_free`.
+// - `err` may be null. Otherwise it receives an owned message on failure that must be released
+//   with `sia_string_free`.
+int32_t sia_sdk_object_event_summaries(const sia_sdk_t *sdk,
+                                       bool has_cursor,
+                                       int64_t after_unix_us,
+                                       const uint8_t *after_id,
+                                       uint64_t limit,
+                                       sia_cancel_t *cancel,
+                                       sia_event_summaries_t **out,
+                                       char **err);
 
 // # Safety
 // - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
@@ -967,7 +1235,8 @@ int32_t sia_shared_sdk_object_summaries(const sia_shared_sdk_t *sdk,
 
 // # Safety
 // - `s` may be null, which returns 0. Otherwise it must be a live collection from
-//   `sia_shared_sdk_object_summaries` that has not been freed.
+//   `sia_shared_sdk_object_summaries` or `sia_sdk_shared_object_summaries` that has not been
+//   freed.
 uintptr_t sia_object_summaries_len(const sia_object_summaries_t *s);
 
 // Copies the fixed part of the summary at `i`. Returns false when `i` is out
@@ -975,7 +1244,8 @@ uintptr_t sia_object_summaries_len(const sia_object_summaries_t *s);
 //
 // # Safety
 // - `s` may be null, which returns false. Otherwise it must be a live collection from
-//   `sia_shared_sdk_object_summaries` that has not been freed.
+//   `sia_shared_sdk_object_summaries` or `sia_sdk_shared_object_summaries` that has not been
+//   freed.
 // - `out` must be non null and writable.
 bool sia_object_summaries_at(const sia_object_summaries_t *s,
                              uintptr_t i,
@@ -987,7 +1257,8 @@ bool sia_object_summaries_at(const sia_object_summaries_t *s,
 //
 // # Safety
 // - `s` may be null, which returns 0. Otherwise it must be a live collection from
-//   `sia_shared_sdk_object_summaries` that has not been freed.
+//   `sia_shared_sdk_object_summaries` or `sia_sdk_shared_object_summaries` that has not been
+//   freed.
 // - `buf` may be null, which measures without writing. Otherwise it must be writable for `cap`
 //   bytes, and nothing is written unless `cap` covers the whole metadata.
 uintptr_t sia_object_summaries_metadata(const sia_object_summaries_t *s,
@@ -996,8 +1267,8 @@ uintptr_t sia_object_summaries_metadata(const sia_object_summaries_t *s,
                                         uintptr_t cap);
 
 // # Safety
-// - `s` may be null. Otherwise it must come from `sia_shared_sdk_object_summaries` and must not
-//   be used again after this returns.
+// - `s` may be null. Otherwise it must come from `sia_shared_sdk_object_summaries` or
+//   `sia_sdk_shared_object_summaries` and must not be used again after this returns.
 void sia_object_summaries_free(sia_object_summaries_t *s);
 
 // Releases a shared SDK handle.
@@ -1252,6 +1523,30 @@ int32_t sia_sdk_shared_objects(const sia_sdk_t *sdk,
                                sia_object_t ***out_objs,
                                uintptr_t *out_len,
                                char **err);
+
+// Lists the objects attached to a key without their slabs, read the same way
+// as `sia_shared_sdk_object_summaries`. A listing that only needs names and
+// sizes should use this rather than `sia_sdk_shared_objects`. Pass 0 for
+// offset or limit to use the indexer's default paging.
+//
+// # Safety
+// - `sdk` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
+//   from `sia_builder_connect`, `sia_builder_register` or `sia_mock_sdk` that has not been freed.
+// - `key` may be null, which returns `SIA_ERR_INVALID_HANDLE`. Otherwise it must be a live handle
+//   from `sia_sharing_key_import` or `sia_sdk_create_sharing_key` that has not been freed.
+// - `cancel` may be null, which makes the call uncancellable. Otherwise it must be a live token
+//   from `sia_cancel_new`.
+// - `out` must be non null and writable. On success it receives an owned collection that must be
+//   released with `sia_object_summaries_free`.
+// - `err` may be null. Otherwise it receives an owned message on failure that must be released
+//   with `sia_string_free`.
+int32_t sia_sdk_shared_object_summaries(const sia_sdk_t *sdk,
+                                        const sia_sharing_key_t *key,
+                                        uint64_t offset,
+                                        uint64_t limit,
+                                        sia_cancel_t *cancel,
+                                        sia_object_summaries_t **out,
+                                        char **err);
 
 // Detaches one object from a key. Returns `SIA_ERR_OBJECT_NOT_ATTACHED` when the
 // object was not attached to it.

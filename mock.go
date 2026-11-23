@@ -24,6 +24,10 @@ import (
 // points behind it exist only in an archive built with the mock cargo feature.
 // Build that archive with `make testlib`.
 type MockNetwork struct {
+	*mockNetworkHandle
+}
+
+type mockNetworkHandle struct {
 	ptr     *C.sia_mock_t
 	cleanup runtime.Cleanup
 
@@ -33,11 +37,11 @@ type MockNetwork struct {
 // NewMockNetwork starts numHosts in-process hosts.
 func NewMockNetwork(numHosts int) *MockNetwork {
 	ptr := C.sia_mock_new(C.size_t(numHosts))
-	m := &MockNetwork{ptr: ptr}
-	m.cleanup = runtime.AddCleanup(m, func(p *C.sia_mock_t) {
+	h := &mockNetworkHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_mock_t) {
 		C.sia_mock_free(p)
 	}, ptr)
-	return m
+	return &MockNetwork{h}
 }
 
 // SDK returns a connection to the mock network for the given 32 byte app key

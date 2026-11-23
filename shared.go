@@ -29,6 +29,10 @@ import (
 // Reads are paid for with account tokens drawn from the key owner's account,
 // refreshed in the background before they expire.
 type SharedSDK struct {
+	*sharedSDKHandle
+}
+
+type sharedSDKHandle struct {
 	ptr     *C.sia_shared_sdk_t
 	cleanup runtime.Cleanup
 
@@ -38,11 +42,11 @@ type SharedSDK struct {
 }
 
 func wrapSharedSDK(ptr *C.sia_shared_sdk_t) *SharedSDK {
-	s := &SharedSDK{ptr: ptr}
-	s.cleanup = runtime.AddCleanup(s, func(p *C.sia_shared_sdk_t) {
+	h := &sharedSDKHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_shared_sdk_t) {
 		C.sia_shared_sdk_free(p)
 	}, ptr)
-	return s
+	return &SharedSDK{h}
 }
 
 // ConnectShared connects to indexerURL as the recipient of the sharing key
@@ -206,7 +210,9 @@ func (s *SharedSDK) ObjectSummaries(ctx context.Context, offset, limit int) ([]O
 		if !bool(C.sia_object_summaries_at(sums, C.size_t(i), &c)) {
 			return nil, fmt.Errorf("summary %d of %d is out of range", i, n)
 		}
-		out = append(out, goObjectSummary(c, summaryMetadata(sums, i)))
+		out = append(out, goObjectSummary(c, readMetadata(func(buf *C.uint8_t, n C.size_t) C.size_t {
+			return C.sia_object_summaries_metadata(sums, C.size_t(i), buf, n)
+		})))
 	}
 	return out, nil
 }
@@ -224,18 +230,18 @@ func goObjectSummary(c C.sia_object_summary_t, metadata []byte) ObjectSummary {
 	return sum
 }
 
-// summaryMetadata copies the metadata of the summary at i. It is variable
-// length, so it does not travel in the flat struct.
-func summaryMetadata(sums *C.sia_object_summaries_t, i int) []byte {
-	n := C.sia_object_summaries_metadata(sums, C.size_t(i), nil, 0)
+// readMetadata copies a summary's metadata, which is variable length and so
+// does not travel in the flat struct. read reports the length, and writes only
+// when the buffer covers all of it.
+func readMetadata(read func(buf *C.uint8_t, n C.size_t) C.size_t) []byte {
+	n := read(nil, 0)
 	if n == 0 {
 		return nil
 	}
 	buf := make([]byte, int(n))
 	// Nothing is copied when the buffer is too small, which would otherwise
 	// hand back a silently zero filled slice.
-	if C.sia_object_summaries_metadata(sums, C.size_t(i),
-		(*C.uint8_t)(unsafe.Pointer(&buf[0])), n) != n {
+	if read((*C.uint8_t)(unsafe.Pointer(&buf[0])), n) != n {
 		return nil
 	}
 	return buf

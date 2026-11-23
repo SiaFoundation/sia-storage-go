@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"time"
@@ -26,6 +27,10 @@ import (
 // made. [SDK.RevokeSharingKey] detaches everything at once, which is the only
 // way to undo it.
 type SharingKey struct {
+	*sharingKeyHandle
+}
+
+type sharingKeyHandle struct {
 	ptr     *C.sia_sharing_key_t
 	cleanup runtime.Cleanup
 
@@ -34,24 +39,54 @@ type SharingKey struct {
 	mu sync.RWMutex
 }
 
+var errNilSharingKey = errors.New("sharing key is nil")
+
+// acquire read locks k for an FFI call, refusing a nil key or a zero value one
+// that holds no native key. Release it with release, which is only needed on
+// success.
+func (k *SharingKey) acquire() error {
+	if k == nil {
+		return errNilSharingKey
+	}
+	k.mu.RLock()
+	if k.ptr == nil {
+		k.mu.RUnlock()
+		return errNilSharingKey
+	}
+	return nil
+}
+
+// mustAcquire is acquire for the methods with no error to return, which panic
+// rather than hand back a zero seed or public key.
+func (k *SharingKey) mustAcquire() {
+	if err := k.acquire(); err != nil {
+		panic(err)
+	}
+}
+
+// release ends a successful acquire.
+func (k *SharingKey) release() {
+	k.mu.RUnlock()
+}
+
 // ImportSharingKey rebuilds a key from a seed handed out by its owner.
 func ImportSharingKey(seed [32]byte) *SharingKey {
 	return wrapSharingKey(C.sia_sharing_key_import(cBytes32(&seed)))
 }
 
 func wrapSharingKey(ptr *C.sia_sharing_key_t) *SharingKey {
-	k := &SharingKey{ptr: ptr}
-	k.cleanup = runtime.AddCleanup(k, func(p *C.sia_sharing_key_t) {
+	h := &sharingKeyHandle{ptr: ptr}
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_sharing_key_t) {
 		C.sia_sharing_key_free(p)
 	}, ptr)
-	return k
+	return &SharingKey{h}
 }
 
 // Export returns the seed, which is the whole credential. Treat it as a secret
 // and hand it out only over a channel you would send a password over.
 func (k *SharingKey) Export() (seed [32]byte) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	k.mustAcquire()
+	defer k.release()
 	C.sia_sharing_key_export(k.ptr, cBytes32(&seed))
 	runtime.KeepAlive(k)
 	return
@@ -59,8 +94,8 @@ func (k *SharingKey) Export() (seed [32]byte) {
 
 // PublicKey returns the half the indexer identifies the key by. Safe to log.
 func (k *SharingKey) PublicKey() (pk types.PublicKey) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	k.mustAcquire()
+	defer k.release()
 	C.sia_sharing_key_public_key(k.ptr, cBytes32((*[32]byte)(&pk)))
 	runtime.KeepAlive(k)
 	return
@@ -144,11 +179,13 @@ func (s *SDK) CreateSharingKey(ctx context.Context, description string, expiresA
 func (s *SDK) SharingKey(ctx context.Context, key *SharingKey) (KeyInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key.mu.RLock()
-	defer key.mu.RUnlock()
 	if s.closed {
 		return KeyInfo{}, errClosed
 	}
+	if err := key.acquire(); err != nil {
+		return KeyInfo{}, err
+	}
+	defer key.release()
 
 	tok, release := cancelToken(ctx)
 	defer release()
@@ -206,13 +243,15 @@ func (s *SDK) SharingKeys(ctx context.Context, offset, limit int) ([]KeyRecord, 
 func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key.mu.RLock()
-	defer key.mu.RUnlock()
-	obj.mu.RLock()
-	defer obj.mu.RUnlock()
 	if s.closed {
 		return errClosed
 	}
+	if err := key.acquire(); err != nil {
+		return err
+	}
+	defer key.release()
+	obj.mu.RLock()
+	defer obj.mu.RUnlock()
 
 	tok, release := cancelToken(ctx)
 	defer release()
@@ -230,11 +269,13 @@ func (s *SDK) ShareObject(ctx context.Context, key *SharingKey, obj *Object) err
 func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit int) ([]*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key.mu.RLock()
-	defer key.mu.RUnlock()
 	if s.closed {
 		return nil, errClosed
 	}
+	if err := key.acquire(); err != nil {
+		return nil, err
+	}
+	defer key.release()
 
 	tok, release := cancelToken(ctx)
 	defer release()
@@ -267,11 +308,13 @@ func (s *SDK) SharedObjects(ctx context.Context, key *SharingKey, offset, limit 
 func (s *SDK) UnshareObject(ctx context.Context, key *SharingKey, id types.Hash256) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key.mu.RLock()
-	defer key.mu.RUnlock()
 	if s.closed {
 		return errClosed
 	}
+	if err := key.acquire(); err != nil {
+		return err
+	}
+	defer key.release()
 
 	tok, release := cancelToken(ctx)
 	defer release()
@@ -291,11 +334,13 @@ func (s *SDK) UnshareObject(ctx context.Context, key *SharingKey, id types.Hash2
 func (s *SDK) RevokeSharingKey(ctx context.Context, key *SharingKey) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key.mu.RLock()
-	defer key.mu.RUnlock()
 	if s.closed {
 		return errClosed
 	}
+	if err := key.acquire(); err != nil {
+		return err
+	}
+	defer key.release()
 
 	tok, release := cancelToken(ctx)
 	defer release()

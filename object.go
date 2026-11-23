@@ -32,6 +32,14 @@ type SealedObject = slabs.SealedObject
 // It has no exported fields, since the data key it carries must not leak. Use
 // the accessors.
 type Object struct {
+	*objectHandle
+}
+
+// objectHandle is the state behind an Object. Every copy of an Object points
+// at the same objectHandle, and the cleanup that frees the native object is
+// attached here rather than to the Object, so a copy stays valid after the
+// original is collected.
+type objectHandle struct {
 	ptr     *C.sia_object_t
 	cleanup runtime.Cleanup
 
@@ -62,7 +70,7 @@ func wrapObject(ptr *C.sia_object_t) *Object {
 	if ptr == nil {
 		return nil
 	}
-	o := &Object{
+	h := &objectHandle{
 		ptr:         ptr,
 		size:        uint64(C.sia_object_size(ptr)),
 		encodedSize: uint64(C.sia_object_encoded_size(ptr)),
@@ -70,11 +78,11 @@ func wrapObject(ptr *C.sia_object_t) *Object {
 		updatedAt:   unixMicro(int64(C.sia_object_updated_at(ptr))),
 		metadata:    nativeMetadata(ptr),
 	}
-	C.sia_object_id(ptr, cBytes32((*[32]byte)(&o.id)))
-	o.cleanup = runtime.AddCleanup(o, func(p *C.sia_object_t) {
+	C.sia_object_id(ptr, cBytes32((*[32]byte)(&h.id)))
+	h.cleanup = runtime.AddCleanup(h, func(p *C.sia_object_t) {
 		C.sia_object_free(p)
 	}, ptr)
-	return o
+	return &Object{h}
 }
 
 // nativeMetadata copies an object's metadata out of a native handle.

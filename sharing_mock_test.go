@@ -234,5 +234,35 @@ func TestUnshareNotAttached(t *testing.T) {
 	}
 }
 
+// TestSharingKeyNilRefused proves the SDK methods refuse a nil key and a zero
+// value one rather than dereference it or hand C a null handle.
+func TestSharingKeyNilRefused(t *testing.T) {
+	_, sdk := testSDK(t)
+	ctx := context.Background()
+
+	for name, key := range map[string]*SharingKey{
+		"nil":        nil,
+		"zero value": new(SharingKey),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := sdk.SharingKey(ctx, key); !errors.Is(err, errNilSharingKey) {
+				t.Fatalf("sharing key: %v", err)
+			}
+			if err := sdk.ShareObject(ctx, key, new(Object)); !errors.Is(err, errNilSharingKey) {
+				t.Fatalf("share object: %v", err)
+			}
+			if _, err := sdk.SharedObjects(ctx, key, 0, 0); !errors.Is(err, errNilSharingKey) {
+				t.Fatalf("shared objects: %v", err)
+			}
+			if err := sdk.UnshareObject(ctx, key, types.Hash256{}); !errors.Is(err, errNilSharingKey) {
+				t.Fatalf("unshare object: %v", err)
+			}
+			if err := sdk.RevokeSharingKey(ctx, key); !errors.Is(err, errNilSharingKey) {
+				t.Fatalf("revoke: %v", err)
+			}
+		})
+	}
+}
+
 // TestSharingKeyCloseIsIdempotent proves the cleanup and an explicit Close
 // cannot both free the same key.
