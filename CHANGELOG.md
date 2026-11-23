@@ -1,3 +1,23 @@
+## 0.3.0 (2026-11-23)
+
+### Breaking Changes
+
+- Add pre-authorized key helpers
+- Replace the storage engine with sia-sdk-rs over cgo
+
+### Features
+
+- Add `SDK.ObjectEventSummaries`, which lists object events without their slabs
+
+### Fixes
+
+- Read the account, host listings and app metadata through C structs instead of JSON
+- Strip LLVM bitcode from the FFI archives
+
+#### Share native handles between copies of a handle type
+
+Copying an `Object`, `SDK`, `Builder`, `SharedSDK`, `SharingKey`, `Download`, `PackedUpload` or `MockNetwork` by value no longer leaves the copy pointing at freed memory once the original is collected, and closing two copies no longer frees the handle twice. Copies now share one native handle.
+
 ## 0.2.1 (2026-08-27)
 
 ### Features
