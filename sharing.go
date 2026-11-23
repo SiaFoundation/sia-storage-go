@@ -45,7 +45,7 @@ var errNilSharingKey = errors.New("sharing key is nil")
 // that holds no native key. Release it with release, which is only needed on
 // success.
 func (k *SharingKey) acquire() error {
-	if k == nil {
+	if k == nil || k.sharingKeyHandle == nil {
 		return errNilSharingKey
 	}
 	k.mu.RLock()
